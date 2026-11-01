@@ -1,19 +1,24 @@
-//! onyx TUI — an inline terminal UI modeled on the architecture extracted from
-//! the agy CLI (Bubble Tea MVU + Lip Gloss), reimplemented clean-room with raw
-//! ANSI so the workspace gains no new dependencies.
+//! onyx TUI — a bottom-anchored terminal interface written from scratch in raw
+//! ANSI, so the workspace gains no rendering dependencies.
 //!
-//! agy patterns reproduced here:
-//!   - inline viewport: finalized lines print into the native scrollback (agy's
-//!     cursedRenderer insertAbove); only the live tail (streaming text, spinner,
-//!     input card, hints) is redrawn in place;
-//!   - collapsible tool groups: `⏺ name(args)` + `(ctrl+o to expand)` and a
-//!     `<output +N lines>` truncation hint; ctrl+o toggles globally;
+//! Design goals:
+//!   - a live region pinned to the foot of the screen (streaming text, spinner,
+//!     input card, hint bar) is repainted in place; everything older than that
+//!     is transcript history that scrolls away naturally;
+//!   - tool activity renders as collapsible rows (`● name(args)` plus an
+//!     `<+N lines>` hint); ctrl+o toggles them globally;
 //!   - shift+tab cycles approval modes (normal → accept-edits → auto);
-//!   - "Thinking…" spinner while a model step runs, "(esc to cancel)" beside it;
-//!   - key-hint footer bar; Ctrl+D twice (or /exit) quits;
-//!   - slash autocomplete on ↑/↓/Tab as you type "/…";
-//!   - inline confirmation cards ("y run · a always · n/N refuse") wired into
-//!     the Gateway approver slot.
+//!   - a braille "Thinking…" indicator while a model step runs, esc cancels;
+//!   - key-hint footer; ctrl+d twice (or /exit) quits; alt+enter inserts a newline;
+//!   - slash autocomplete on ↑/↓/Tab while the draft starts with "/";
+//!   - inline permission cards ("y run · a always · n/N refuse") bound to the
+//!     Gateway approver slot.
+//!
+//! Repaint correctness: every rendered entry is hard-wrapped to the terminal's
+//! column count first, so one logical entry always occupies exactly one display
+//! row. The frame is then emitted between synchronized-update markers and drawn
+//! with absolute cursor positioning, which keeps it flicker-free and immune to
+//! soft-wrap desync across terminals.
 //!
 //! Threading: the agent loop runs on a worker thread and talks to the world
 //! through two objects shared with the main (drawing/approval) thread —
@@ -460,13 +465,54 @@ fn first_line(s: &str) -> &str {
     s.lines().next().unwrap_or("")
 }
 
-fn pretty_args(args: &str) -> String {
+/// Clean up LLM response text that may contain raw JSON fallback tool blocks
+/// (such as {"tool":"terminate","args":{...}}). If present, extracts the
+/// actual message content so raw JSON schema blobs don't leak into the UI.
+fn clean_model_text(text: &str) -> String {
+    let t = text.trim();
+    if t.starts_with('{') && t.contains("\"tool\"") {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(t) {
+            if v.get("tool").and_then(|s| s.as_str()) == Some("terminate") {
+                if let Some(args) = v.get("args") {
+                    if let Some(content) = args.get("content").and_then(|c| c.as_str()) {
+                        return content.to_string();
+                    }
+                    if let Some(answer) = args.get("answer").and_then(|a| a.as_str()) {
+                        return answer.to_string();
+                    }
+                }
+            }
+        }
+    }
+    text.to_string()
+}
+
+fn pretty_args(name: &str, args: &str) -> String {
     let v: serde_json::Value = serde_json::from_str(args).unwrap_or_else(|_| serde_json::json!(args));
     let obj = match v.as_object() {
         Some(o) => o,
         None => return clip_chars(&v.to_string(), 100),
     };
-    // bash/python/editor-style single-string args render bare, like agy does.
+    if name == "bash" || name == "shell" {
+        if let Some(cmd) = obj.get("command").or_else(|| obj.get("cmd")).and_then(|x| x.as_str()) {
+            return format!("$ {}", clip_chars(first_line(cmd), 90));
+        }
+    }
+    if name == "editor" || name == "file_write" || name == "file_read" || name == "view" {
+        let path = obj.get("path").or_else(|| obj.get("file_path")).and_then(|x| x.as_str()).unwrap_or("");
+        let cmd = obj.get("command").and_then(|x| x.as_str()).unwrap_or("");
+        if !cmd.is_empty() && !path.is_empty() {
+            return format!("{cmd} {path}");
+        }
+        if !path.is_empty() {
+            return path.to_string();
+        }
+    }
+    if name == "websearch" || name == "web_search" {
+        if let Some(q) = obj.get("query").and_then(|x| x.as_str()) {
+            return format!("query: {q}");
+        }
+    }
     for key in ["command", "code", "path", "text", "query", "url"] {
         if let Some(s) = obj.get(key).and_then(|x| x.as_str()) {
             if obj.len() == 1 {
@@ -646,7 +692,6 @@ impl<'a> Tui<'a> {
                             Ok(rep) => Ok((rep.answer, rep.steps)),
                             Err(e) => Err(e),
                         }));
-                        let _ = ut.send(UiOut::Audit(audit));
                     }
                     Ctl::Clear(system) => {
                         history = vec![Message::text("system", system)];
@@ -693,6 +738,10 @@ impl<'a> Tui<'a> {
         let lines = self.render_lines();
         let n = lines.len().min(self.height.max(2)); // frame never exceeds viewport
         let mut out = String::new();
+        // DEC private mode 2026: the terminal defers painting until the matching
+        // reset, so the whole frame lands in one atomic update instead of a
+        // visible clear-then-draw sweep. Terminals without it ignore both markers.
+        out.push_str("\x1b[?2026h");
         out.push_str("\x1b[H\x1b[J"); // home + clear entire visible screen
         for l in &lines[..n] {
             out.push_str(l);
@@ -703,6 +752,7 @@ impl<'a> Tui<'a> {
             let col = (3 + self.cursor_chars()).min(self.width.max(1));
             out.push_str(&format!("\x1b[{};{}H", n - 1, col));
         }
+        out.push_str("\x1b[?2026l");
         io::stdout().write_all(out.as_bytes()).ok();
         io::stdout().flush().ok();
     }
@@ -767,9 +817,10 @@ impl<'a> Tui<'a> {
 
     fn tail_lines(&self) -> Vec<String> {
         let vis: String = self.tail.chars().skip(self.tail_scrolled).collect();
+        let wrap_w = self.width.saturating_sub(4).max(20);
         let mut out = Vec::new();
         for para in vis.split('\n') {
-            let wrapped = wrap(para, 76);
+            let wrapped = wrap(para, wrap_w);
             for (i, w) in wrapped.iter().enumerate() {
                 let mark = if i == 0 { "◐ " } else { "  " };
                 out.push(format!("{FG_250}{mark}{t}{RESET}", t = w));
@@ -781,7 +832,7 @@ impl<'a> Tui<'a> {
     fn item_lines(&self, it: &Item) -> Vec<String> {
         match it {
             Item::Banner => vec![format!(
-                "{BOLD}{BLUE}◆ onyx{RESET} {BOLD}agentic coding CLI{RESET} {DIM}· agy-style TUI{RESET}"
+                "{BOLD}{CYAN}◆ onyx{RESET} {DIM}v0.1.0{RESET}"
             )],
             Item::User(t) => {
                 let mut out = Vec::new();
@@ -792,6 +843,9 @@ impl<'a> Tui<'a> {
                 out
             }
             Item::Tool { name, args, ok, denied, output } => {
+                if name == "terminate" {
+                    return Vec::new();
+                }
                 let marker = if *denied {
                     format!("{RED}✗{RESET}")
                 } else if *ok {
@@ -800,8 +854,8 @@ impl<'a> Tui<'a> {
                     format!("{YELLOW}⏺{RESET}")
                 };
                 let mut out = vec![format!(
-                    "{marker} {BOLD}{name}{RESET}{DIM}({a}){RESET}",
-                    a = pretty_args(args)
+                    "{marker} {BOLD}{name}{RESET} {DIM}{a}{RESET}",
+                    a = pretty_args(name, args)
                 )];
                 if self.expanded && !output.is_empty() {
                     let mut olines: Vec<String> = Vec::new();
@@ -825,9 +879,11 @@ impl<'a> Tui<'a> {
                 out
             }
             Item::Answer(t) => {
+                let clean = clean_model_text(t);
                 let mut out = vec![format!("{BOLD}◆ onyx{RESET}")];
-                for para in t.split('\n') {
-                    for w in wrap(para, 76) {
+                let wrap_w = self.width.saturating_sub(4).max(20);
+                for para in clean.split('\n') {
+                    for w in wrap(para, wrap_w) {
                         out.push(format!("{FG_250}  {w}{RESET}"));
                     }
                 }
@@ -851,8 +907,8 @@ impl<'a> Tui<'a> {
                 "{YELLOW}┌ permission needed ─────────────────────────────{RESET}"
             ));
             out.push(format!(
-                "{YELLOW}│{RESET} {BOLD}{tool}{RESET}{DIM}({a}){RESET}",
-                a = pretty_args(&args)
+                "{YELLOW}│{RESET} {BOLD}{tool}{RESET} {DIM}{a}{RESET}",
+                a = pretty_args(&tool, &args)
             ));
             out.push(format!("{YELLOW}│{RESET} {DIM}{reason}{RESET}"));
             out.push(format!(
@@ -1082,6 +1138,10 @@ impl<'a> Tui<'a> {
                 }
             }
             AgentEvent::ToolStart { name, args } => {
+                if name == "terminate" {
+                    // Do not print internal terminate control call as a tool card
+                    return;
+                }
                 self.finalize_tail();
                 self.thinking = false; // a card or the tool row is what's live now
                 self.items.push(Item::Tool {
@@ -1093,6 +1153,9 @@ impl<'a> Tui<'a> {
                 });
             }
             AgentEvent::ToolDone { name, ok, output } => {
+                if name == "terminate" {
+                    return;
+                }
                 let denied = output.starts_with("denied:") || output.contains("confirmation refused");
                 for it in self.items.iter_mut().rev() {
                     if let Item::Tool { name: n, ok: o, denied: d, output: out, .. } = it {
@@ -1112,7 +1175,10 @@ impl<'a> Tui<'a> {
     fn finalize_tail(&mut self) {
         if !self.tail.trim().is_empty() {
             let t = std::mem::take(&mut self.tail);
-            self.items.push(Item::Answer(t.trim().to_string()));
+            let clean = clean_model_text(&t);
+            if !clean.trim().is_empty() {
+                self.items.push(Item::Answer(clean.trim().to_string()));
+            }
         }
         self.tail_scrolled = 0;
     }
@@ -1122,12 +1188,12 @@ impl<'a> Tui<'a> {
         self.running = false;
         self.thinking = false;
         match res {
-            Ok((answer, steps)) => {
-                let dup = self.items.iter().rev().any(|i| matches!(i, Item::Answer(t) if *t == answer));
-                if !answer.trim().is_empty() && !dup {
-                    self.items.push(Item::Answer(answer));
+            Ok((answer, _steps)) => {
+                let clean = clean_model_text(&answer);
+                let dup = self.items.iter().rev().any(|i| matches!(i, Item::Answer(t) if t == &clean));
+                if !clean.trim().is_empty() && !dup {
+                    self.items.push(Item::Answer(clean));
                 }
-                self.items.push(Item::Info(format!("steps {steps}")));
             }
             Err(AgentError::MaxSteps) => {
                 self.items.push(Item::Error(format!(
