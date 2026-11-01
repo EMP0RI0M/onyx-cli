@@ -60,6 +60,9 @@ impl RawMode {
         }
         let mut raw = t;
         unsafe { libc::cfmakeraw(&mut raw) };
+        // Retain standard post-processing (OPOST and ONLCR) so \n translates
+        // to CR+LF (\r\n) on output and doesn't stair-step across the screen.
+        raw.c_oflag |= libc::OPOST | libc::ONLCR;
         // Keep signals we want delivered as BYTES off the signal path: ISIG
         // would turn ctrl+c into SIGINT and kill us before the reader sees it.
         raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
@@ -80,8 +83,8 @@ impl Drop for RawMode {
 
 fn term_size() -> (u16, u16) {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    if unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_row > 4 {
-        (ws.ws_row - 4, ws.ws_col)
+    if unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_row > 0 && ws.ws_col > 0 {
+        (ws.ws_row, ws.ws_col)
     } else {
         (24, 80)
     }
@@ -145,22 +148,41 @@ fn ansi_width(s: &str) -> usize {
     w
 }
 
-/// Hard-wrap one plain-text line at exactly `width` CELLS, breaking wide glyphs
-/// rather than letting the terminal soft-wrap (which would desync our cursor
-/// rewind from the rows actually consumed). Returns at least one line.
+/// Hard-wrap one line at exactly `width` visible cells, preserving embedded ANSI escape sequences.
 fn hard_wrap_line(text: &str, width: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut used = 0usize;
-    for c in text.chars() {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    let n = chars.len();
+
+    while i < n {
+        let c = chars[i];
+        if c == '\x1b' {
+            cur.push(c);
+            i += 1;
+            while i < n {
+                let ec = chars[i];
+                cur.push(ec);
+                i += 1;
+                if ec.is_ascii_alphabetic() || ec == 'm' {
+                    break;
+                }
+            }
+            continue;
+        }
+
         let cw = char_width(c).min(width);
-        if used + cw > width {
+        if used + cw > width && !cur.is_empty() {
             out.push(std::mem::take(&mut cur));
             used = 0;
         }
         cur.push(c);
         used += cw;
+        i += 1;
     }
+
     if !cur.is_empty() || out.is_empty() {
         out.push(cur);
     }
@@ -549,16 +571,16 @@ impl<'a> Tui<'a> {
             worker: None,
             last_ctrl_d: None,
             quit: false,
-            height: term_size().0 as usize,
-            width: 80.max(term_size().1 as usize - 1),
+            height: term_size().0.max(4) as usize,
+            width: term_size().1.max(20) as usize,
         }
     }
 
     /// Refresh the viewport geometry (the user may have resized the window).
     fn sync_size(&mut self) {
         let (rows, cols) = term_size();
-        self.height = rows as usize;
-        self.width = 80.max(cols as usize - 1);
+        self.height = rows.max(4) as usize;
+        self.width = cols.max(20) as usize;
     }
 
     /// Install the TUI's own approver into the gateway and start the worker.
@@ -1320,15 +1342,19 @@ pub fn tui_session(
         }
     };
     let pump = InputPump::start();
-    write!(io::stdout(), "\x1b[?25l").ok(); // hide cursor while painting
+    // Switch to alternate screen buffer, clear screen, and hide cursor while painting
+    write!(io::stdout(), "\x1b[?1049h\x1b[H\x1b[2J\x1b[?25l").ok();
+    io::stdout().flush().ok();
     {
         let mut tui = Tui::new(gw, hm, opts);
         tui.start_worker();
         tui.run(&pump);
-        write!(io::stdout(), "\x1b[?25h").ok(); // restore cursor
         tui.finish();
     }
     pump.shutdown();
+    // Restore cursor and switch back to normal screen buffer
+    write!(io::stdout(), "\x1b[?25h\x1b[?1049l").ok();
+    io::stdout().flush().ok();
     // Final newline so the shell prompt starts clean.
     println!();
 }
