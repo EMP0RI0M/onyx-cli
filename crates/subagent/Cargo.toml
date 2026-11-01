@@ -1,0 +1,14 @@
+[package]
+name = "subagent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "subagent"
+path = "src/lib.rs"
+
+[dependencies]
+agent = { path = "../agent" }
+tools = { workspace = true }
+serde_json = { workspace = true }

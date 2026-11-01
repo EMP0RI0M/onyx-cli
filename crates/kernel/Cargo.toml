@@ -1,0 +1,9 @@
+[package]
+name = "kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "kernel"
+path = "src/lib.rs"

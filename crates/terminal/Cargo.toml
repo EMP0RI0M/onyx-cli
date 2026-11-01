@@ -1,0 +1,15 @@
+[package]
+name = "terminal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tektile-term"
+path = "src/main.rs"
+
+[dependencies]
+libc = { workspace = true }
+kernel = { workspace = true }
+tungstenite = { workspace = true }
+serde_json = { workspace = true }

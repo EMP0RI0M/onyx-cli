@@ -1,0 +1,13 @@
+[package]
+name = "mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "mcp"
+path = "src/lib.rs"
+
+[dependencies]
+tools = { workspace = true }
+serde_json = { workspace = true }

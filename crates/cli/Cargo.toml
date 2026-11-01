@@ -1,0 +1,20 @@
+[package]
+name = "onyx-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "onyx"
+path = "src/main.rs"
+
+[dependencies]
+agent = { path = "../agent" }
+guardian = { path = "../guardian" }
+sandbox = { path = "../sandbox" }
+subagent = { path = "../subagent" }
+mcp = { path = "../mcp" }
+skills = { path = "../skills" }
+tools = { workspace = true }
+serde_json = { workspace = true }
+libc = { workspace = true }

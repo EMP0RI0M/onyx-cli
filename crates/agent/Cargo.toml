@@ -1,0 +1,21 @@
+[package]
+name = "agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tektile-agent"
+path = "src/main.rs"
+
+[[bin]]
+name = "tektile-agentd"
+path = "src/agentd.rs"
+
+[dependencies]
+tools = { workspace = true }
+serde_json = { workspace = true }

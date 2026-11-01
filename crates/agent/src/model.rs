@@ -1,0 +1,713 @@
+//! A live `Model` backed by an OpenAI-compatible HTTP endpoint (OmniRoute on
+//! loopback :20128), with zero external crates: just `std::net` + `serde_json`.
+//! Loopback is plain HTTP (no TLS), which keeps the whole agent offline-capable
+//! and card-free.
+//!
+//! Tool-use is negotiated natively via the OpenAI `tools` array when the backend
+//! supports function-calling, with a TEXT protocol fallback (the model replies
+//! with a bare or fenced JSON object `{"tool":"name","args":{...}}`) for weaker
+//! auto-fallback models. Both paths feed the same Gateway/policy/audit chain.
+
+use crate::{Message, Step, ToolCall};
+use serde_json::{json, Value};
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::time::Duration;
+
+/// Where the model gateway lives. Loaded from ONYX_* env by `omniroute_config`.
+#[derive(Debug, Clone)]
+pub struct GatewayCfg {
+    pub host: String,
+    pub port: u16,
+    pub base: String, // e.g. http://127.0.0.1:20128/v1
+    pub key: String,
+    pub model: String,
+}
+
+/// Minimal HTTP/1.1 request over a blocking socket. Returns the response body.
+/// Handles `Transfer-Encoding: chunked` and surfaces non-2xx as an error string.
+pub fn http_request(
+    method: &str,
+    host: &str,
+    port: u16,
+    path: &str,
+    auth: Option<&str>,
+    body: Option<&str>,
+) -> Result<String, String> {
+    let addr = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("resolve {host}:{port}: {e}"))?
+        .next()
+        .ok_or_else(|| "no address".to_string())?;
+    let mut sock = TcpStream::connect_timeout(&addr, Duration::from_secs(15))
+        .map_err(|e| format!("connect {host}:{port}: {e}"))?;
+    sock.set_write_timeout(Some(Duration::from_secs(30))).ok();
+    sock.set_read_timeout(Some(Duration::from_secs(120))).ok();
+
+    let mut req = String::new();
+    req.push_str(&format!("{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nAccept: application/json\r\n"));
+    if let Some(a) = auth {
+        req.push_str(&format!("Authorization: Bearer {a}\r\n"));
+    }
+    match body {
+        Some(b) => {
+            req.push_str("Content-Type: application/json\r\n");
+            req.push_str(&format!("Content-Length: {}\r\n", b.as_bytes().len()));
+        }
+        None => {
+            req.push_str("Content-Length: 0\r\n");
+        }
+    }
+    req.push_str("Connection: close\r\n\r\n");
+
+    sock.write_all(req.as_bytes()).map_err(|e| format!("write hdr: {e}"))?;
+    if let Some(b) = body {
+        sock.write_all(b.as_bytes()).map_err(|e| format!("write body: {e}"))?;
+    }
+    sock.flush().ok();
+
+    let mut raw = Vec::new();
+    let mut tmp = [0u8; 8192];
+    loop {
+        match sock.read(&mut tmp) {
+            Ok(0) => break,
+            Ok(n) => raw.extend_from_slice(&tmp[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break, // timeout: parse what arrived
+        }
+    }
+    parse_response(&raw)
+}
+
+fn parse_response(raw: &[u8]) -> Result<String, String> {
+    let sep = b"\r\n\r\n";
+    let idx = find_subslice(raw, sep).ok_or_else(|| "malformed response (no header/body split)".to_string())?;
+    let head = String::from_utf8_lossy(&raw[..idx]).to_string();
+    let body = &raw[idx + sep.len()..];
+
+    let status_line = head.lines().next().unwrap_or("");
+    let code: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    let lower = head.to_ascii_lowercase();
+    let decoded_bytes = if lower.contains("transfer-encoding: chunked") {
+        decode_chunked(body)
+    } else {
+        body.to_vec()
+    };
+    let decoded = String::from_utf8_lossy(&decoded_bytes).into_owned();
+    if !(200..300).contains(&code) {
+        return Err(format!("http {code}: {}", decoded.chars().take(200).collect::<String>()));
+    }
+    Ok(decoded)
+}
+
+fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Byte-safe chunked transfer decoding (chunk sizes are byte counts).
+fn decode_chunked(mut body: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        let nl = match find_subslice(body, b"\r\n") {
+            Some(i) => i,
+            None => break,
+        };
+        let line = String::from_utf8_lossy(&body[..nl]);
+        let size = match usize::from_str_radix(line.trim(), 16) {
+            Ok(s) => s,
+            Err(_) => break,
+        };
+        if size == 0 {
+            break;
+        }
+        let start = nl + 2;
+        let end = start + size;
+        if body.len() < end {
+            out.extend_from_slice(&body[start..]);
+            break;
+        }
+        out.extend_from_slice(&body[start..end]);
+        // advance past chunk data + its trailing CRLF
+        body = &body[end..];
+        if let Some(stripped) = strip_prefix_bytes(body, b"\r\n") {
+            body = stripped;
+        }
+    }
+    out
+}
+
+fn strip_prefix_bytes<'a>(hay: &'a [u8], pre: &[u8]) -> Option<&'a [u8]> {
+    if hay.len() >= pre.len() && &hay[..pre.len()] == pre {
+        Some(&hay[pre.len()..])
+    } else {
+        None
+    }
+}
+
+/// Discover the model gateway coordinates from ONYX_* env (OmniRoute defaults).
+/// `ONYX_BASE_URL` (default `http://127.0.0.1:20128/v1`), `ONYX_API_KEY`
+/// (optional; a loopback OmniRoute may accept none), `ONYX_MODEL` (default
+/// `"auto"` — OmniRoute's quota-aware fallback channel, passed verbatim).
+pub fn omniroute_config() -> GatewayCfg {
+    let base = std::env::var("ONYX_BASE_URL")
+        .or_else(|_| std::env::var("TEK_BASE_URL"))
+        .unwrap_or_else(|_| "http://127.0.0.1:20128/v1".to_string());
+    let key = std::env::var("ONYX_API_KEY")
+        .or_else(|_| std::env::var("TEK_API_KEY"))
+        .unwrap_or_default();
+    let model = std::env::var("ONYX_MODEL")
+        .or_else(|_| std::env::var("TEK_MODEL"))
+        .unwrap_or_else(|_| "auto".to_string());
+    let (host, port) = parse_host_port(&base);
+    GatewayCfg { host, port, base, key, model }
+}
+
+fn parse_host_port(base: &str) -> (String, u16) {
+    let after = base.split("://").nth(1).unwrap_or(base);
+    let authority = after.split('/').next().unwrap_or(after);
+    let mut parts = authority.rsplitn(2, ':');
+    match (parts.next(), parts.next()) {
+        (Some(p), Some(h)) if !p.is_empty() => (h.to_string(), p.parse().unwrap_or(20128)),
+        _ => (authority.to_string(), 20128),
+    }
+}
+
+/// The live model. Constructed with the gateway coordinates + a rendered tool
+/// catalog (name: description lines) used to teach the model what it may call.
+#[derive(Clone)]
+pub struct HttpModel {
+    pub host: String,
+    pub port: u16,
+    pub path: String,
+    pub model: String,
+    pub key: String,
+    pub temperature: f32,
+    pub system: String,
+    pub catalog: String,
+    /// OpenAI-style `tools` array (from tools::tool_schemas); empty = text protocol only.
+    pub tool_defs: Vec<Value>,
+}
+
+impl HttpModel {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(host: String, port: u16, model: String, key: String, catalog: String) -> Self {
+        Self {
+            host,
+            port,
+            path: "/v1/chat/completions".to_string(),
+            model,
+            key,
+            temperature: 0.1,
+            system: "You are onyx, a precise agent that acts through tools.".to_string(),
+            catalog,
+            tool_defs: Vec::new(),
+        }
+    }
+
+    /// Build from GatewayCfg; the chat path is derived from the base URL's path.
+    pub fn from_cfg(cfg: &GatewayCfg, catalog: String, tool_defs: Vec<Value>) -> Self {
+        let after = cfg.base.split("://").nth(1).unwrap_or(&cfg.base);
+        let path_part = after.splitn(2, '/').nth(1).unwrap_or("v1");
+        let path = format!("/{}/chat/completions", path_part.trim_end_matches('/'));
+        Self {
+            host: cfg.host.clone(),
+            port: cfg.port,
+            path,
+            model: cfg.model.clone(),
+            key: cfg.key.clone(),
+            temperature: 0.1,
+            system: "You are onyx, a precise agent that acts through tools.".to_string(),
+            catalog,
+            tool_defs,
+        }
+    }
+
+    /// One-shot completion for non-agent callers (e.g. the guardian judge):
+    /// post a ready-made chat-completions body, return `choices[0].message.content`.
+    pub fn chat_raw(&self, body_json: &str) -> Result<String, String> {
+        let auth = if self.key.is_empty() { None } else { Some(self.key.as_str()) };
+        let raw = http_request("POST", &self.host, self.port, &self.path, auth, Some(body_json))?;
+        let v: Value = serde_json::from_str(&raw).map_err(|e| format!("parse reply: {e}"))?;
+        Ok(v
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string())
+    }
+
+    fn build_messages(&self, history: &[Message]) -> Vec<Value> {
+        let protocol = if self.tool_defs.is_empty() {
+            "\n\nTo call a tool, reply with ONLY a JSON object, no prose:\n  {\"tool\":\"<name>\",\"args\":{...}}\nUse args exactly as the tool needs. When you are finished, call the terminate tool:\n  {\"tool\":\"terminate\",\"args\":{\"status\":\"success\",\"content\":\"<final answer for the user>\"}}\nDo not invent tools. Do not emit more than one JSON object per turn.\nIf the request needs SEVERAL tools, call them one per turn and keep going until you have run EVERY tool the request asks for and gathered each result. Do NOT call terminate until all requested tool work is done; the terminate content must report every result."
+                .to_string()
+        } else {
+            "\n\nCall tools via function calling. Batch independent calls in one turn when possible. When finished, call `terminate` with status and the final answer. If a backend ignores function calling, fall back to the JSON object form {\"tool\":\"<name>\",\"args\":{...}}.".to_string()
+        };
+        let sys = format!("{base}\n\nAvailable tools:\n{catalog}{protocol}", base = self.system, catalog = self.catalog);
+        let mut msgs = vec![json!({ "role": "system", "content": sys })];
+        for m in history {
+            match m.role.as_str() {
+                "system" => {} // we inject our own system
+                "user" => msgs.push(json!({ "role": "user", "content": m.content })),
+                "assistant" => {
+                    let c = if m.content.is_empty() { "(calling a tool)" } else { &m.content };
+                    msgs.push(json!({ "role": "assistant", "content": c }));
+                }
+                "tool" => msgs.push(json!({ "role": "user", "content": format!("OBSERVATION (tool result): {}", m.content) })),
+                _ => msgs.push(json!({ "role": "user", "content": m.content })),
+            }
+        }
+        msgs
+    }
+
+    // Pull the FIRST well-formed JSON object out of a possibly chatty or
+    // multi-object reply. Brace-matched and string/escape aware, so a model that
+    // emits several `{"tool":...}` objects (or wraps one in prose) still yields
+    // one parseable call — the loop runs it, feeds the result back, and the model
+    // emits the next. The old first-`{`-to-last-`}` slice broke on this.
+    fn extract_json(text: &str) -> Option<Value> {
+        let trimmed = text.trim();
+        if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+            return Some(v);
+        }
+        let bytes = trimmed.as_bytes();
+        let mut depth = 0usize;
+        let mut in_str = false;
+        let mut esc = false;
+        let mut start: Option<usize> = None;
+        for i in 0..bytes.len() {
+            let c = bytes[i];
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if c == b'\\' {
+                    esc = true;
+                } else if c == b'"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            match c {
+                b'"' => in_str = true,
+                b'{' => {
+                    if depth == 0 {
+                        start = Some(i);
+                    }
+                    depth += 1;
+                }
+                b'}' if depth > 0 => {
+                    depth -= 1;
+                    if depth == 0 {
+                        if let Some(s) = start {
+                            // s..i are ASCII structural boundaries → byte slice is safe
+                            if let Ok(v) = serde_json::from_str::<Value>(&trimmed[s..=i]) {
+                                return Some(v);
+                            }
+                            start = None;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn to_step(&self, content: &str, native_tools: Vec<ToolCall>) -> Step {
+        if !native_tools.is_empty() {
+            return Step::Calls(native_tools);
+        }
+        match Self::extract_json(content) {
+            Some(v) => {
+                let name = v.get("tool").and_then(|s| s.as_str()).unwrap_or("");
+                if !name.is_empty() {
+                    let args = v.get("args").cloned().unwrap_or_else(|| json!({}));
+                    return Step::Calls(vec![ToolCall { name: name.to_string(), args }]);
+                }
+                if let Some(f) = v.get("final").and_then(|s| s.as_str()) {
+                    return Step::Final(f.to_string());
+                }
+                // JSON without a recognizable shape → treat whole text as answer
+                Step::Final(content.trim().to_string())
+            }
+            None => Step::Final(content.trim().to_string()),
+        }
+    }
+
+    /// Parse a full (non-streaming) chat-completions reply into a Step.
+    fn step_from_reply(&self, raw: &str) -> Step {
+        let v: Value = match serde_json::from_str(raw) {
+            Ok(v) => v,
+            Err(e) => return Step::Final(format!("[model parse error: {e}]")),
+        };
+        self.step_from_value(&v)
+    }
+
+    fn step_from_value(&self, v: &Value) -> Step {
+        let choice = v.get("choices").and_then(|c| c.get(0));
+        let msg = choice.and_then(|c| c.get("message"));
+
+        // ALL native tool_calls this turn, not just the first
+        let native: Vec<ToolCall> = msg
+            .and_then(|m| m.get("tool_calls"))
+            .and_then(|t| t.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|tc| tc.get("function"))
+                    .filter_map(|f| {
+                        let name = f.get("name").and_then(|n| n.as_str())?.to_string();
+                        let argstr = f.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}");
+                        let args = serde_json::from_str::<Value>(argstr).unwrap_or_else(|_| json!({}));
+                        Some(ToolCall { name, args })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let content = msg
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        if native.is_empty() && content.trim().is_empty() {
+            return Step::Final("[model returned empty content]".to_string());
+        }
+        self.to_step(&content, native)
+    }
+}
+
+impl crate::Model for HttpModel {
+    fn next_step(&mut self, history: &[Message], _tools: &[&str]) -> Step {
+        let msgs = self.build_messages(history);
+        // Thinking models spend most of the budget on reasoning_content and, left
+        // uncapped, can return an empty `content`, which ends the tool loop before
+        // any tool runs. Give every step room for reasoning + a tool call.
+        let max_tokens: u32 = std::env::var("ONYX_MAX_TOKENS")
+            .or_else(|_| std::env::var("TEK_MAX_TOKENS"))
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4096);
+        let mut body = json!({
+            "model": self.model,
+            "messages": msgs,
+            "temperature": self.temperature,
+            "max_tokens": max_tokens,
+            "stream": false,
+        });
+        if !self.tool_defs.is_empty() {
+            body["tools"] = json!(self.tool_defs);
+            body["tool_choice"] = json!("auto");
+        }
+        let body_str = body.to_string();
+        let auth = if self.key.is_empty() { None } else { Some(self.key.as_str()) };
+        match http_request("POST", &self.host, self.port, &self.path, auth, Some(&body_str)) {
+            Ok(raw) => self.step_from_reply(&raw),
+            Err(e) => Step::Final(format!("[model http error: {e}]")),
+        }
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+/// Streaming variant: yields text deltas to `on_delta` while accumulating
+/// native tool-call fragments (stitched by index), then returns the final Step.
+impl HttpModel {
+    pub fn next_step_streaming(
+        &mut self,
+        history: &[Message],
+        _tools: &[&str],
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Step {
+        let msgs = self.build_messages(history);
+        let max_tokens: u32 = std::env::var("ONYX_MAX_TOKENS")
+            .or_else(|_| std::env::var("TEK_MAX_TOKENS"))
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4096);
+        let mut body = json!({
+            "model": self.model,
+            "messages": msgs,
+            "temperature": self.temperature,
+            "max_tokens": max_tokens,
+            "stream": true,
+        });
+        if !self.tool_defs.is_empty() {
+            body["tools"] = json!(self.tool_defs);
+            body["tool_choice"] = json!("auto");
+        }
+        let body_str = body.to_string();
+        let auth = if self.key.is_empty() { None } else { Some(self.key.as_str()) };
+
+        let mut content = String::new();
+        // index → (name, arguments-so-far)
+        let mut calls: std::collections::BTreeMap<usize, (String, String)> =
+            std::collections::BTreeMap::new();
+
+        let result = http_sse(
+            "POST",
+            &self.host,
+            self.port,
+            &self.path,
+            auth,
+            Some(&body_str),
+            &mut |data| {
+                if data == "[DONE]" {
+                    return false;
+                }
+                let Ok(v) = serde_json::from_str::<Value>(data) else { return true };
+                let Some(choice) = v.get("choices").and_then(|c| c.get(0)).map(|c| c.clone())
+                else { return true };
+                let delta = choice.get("delta").cloned().unwrap_or(json!({}));
+                if let Some(txt) = delta.get("content").and_then(|c| c.as_str()) {
+                    if !txt.is_empty() {
+                        on_delta(txt);
+                        content.push_str(txt);
+                    }
+                }
+                if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                    for tc in tcs {
+                        let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                        let e = calls.entry(idx).or_insert_with(|| (String::new(), String::new()));
+                        if let Some(f) = tc.get("function") {
+                            if let Some(n) = f.get("name").and_then(|n| n.as_str()) {
+                                e.0.push_str(n);
+                            }
+                            if let Some(a) = f.get("arguments").and_then(|a| a.as_str()) {
+                                e.1.push_str(a);
+                            }
+                        }
+                    }
+                }
+                true
+            },
+        );
+
+        if let Err(e) = result {
+            return Step::Final(format!("[model stream error: {e}]"));
+        }
+        let native: Vec<ToolCall> = calls
+            .into_values()
+            .filter(|(name, _)| !name.is_empty())
+            .map(|(name, args)| {
+                let args = serde_json::from_str::<Value>(&args).unwrap_or_else(|_| json!({}));
+                ToolCall { name, args }
+            })
+            .collect();
+        if native.is_empty() && content.trim().is_empty() {
+            return Step::Final("[model returned empty content]".to_string());
+        }
+        self.to_step(&content, native)
+    }
+}
+
+/// Minimal SSE-over-HTTP: streams `data:` payload strings to `on_data` until it
+/// returns false or `[DONE]`. Blocking socket, no crates. Handles both chunked
+/// transfer encoding and raw (connection-close) framing.
+pub fn http_sse(
+    method: &str,
+    host: &str,
+    port: u16,
+    path: &str,
+    auth: Option<&str>,
+    body: Option<&str>,
+    on_data: &mut dyn FnMut(&str) -> bool,
+) -> Result<(), String> {
+    let addr = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("resolve {host}:{port}: {e}"))?
+        .next()
+        .ok_or_else(|| "no address".to_string())?;
+    let mut sock = TcpStream::connect_timeout(&addr, Duration::from_secs(15))
+        .map_err(|e| format!("connect {host}:{port}: {e}"))?;
+    sock.set_write_timeout(Some(Duration::from_secs(30))).ok();
+    sock.set_read_timeout(Some(Duration::from_secs(220))).ok();
+
+    let mut req = String::new();
+    req.push_str(&format!("{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nAccept: text/event-stream\r\n"));
+    if let Some(a) = auth {
+        req.push_str(&format!("Authorization: Bearer {a}\r\n"));
+    }
+    match body {
+        Some(b) => {
+            req.push_str("Content-Type: application/json\r\n");
+            req.push_str(&format!("Content-Length: {}\r\n", b.as_bytes().len()));
+        }
+        None => req.push_str("Content-Length: 0\r\n"),
+    }
+    req.push_str("Connection: close\r\n\r\n");
+    sock.write_all(req.as_bytes()).map_err(|e| format!("write hdr: {e}"))?;
+    if let Some(b) = body {
+        sock.write_all(b.as_bytes()).map_err(|e| format!("write body: {e}"))?;
+    }
+    sock.flush().ok();
+
+    // Read through the header block once.
+    let mut buf: Vec<u8> = Vec::with_capacity(8192);
+    let mut tmp = [0u8; 8192];
+    loop {
+        if let Some(split) = find_subslice(&buf, b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&buf[..split]).to_string();
+            buf.drain(..split + 4);
+            let code: u16 = head
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|c| c.parse().ok())
+                .unwrap_or(0);
+            if !(200..300).contains(&code) {
+                return Err(format!("http {code}"));
+            }
+            let chunked = head.to_ascii_lowercase().contains("transfer-encoding: chunked");
+            return sse_pump(&mut sock, &mut buf, chunked, on_data);
+        }
+        let n = sock.read(&mut tmp).map_err(|e| format!("read hdr: {e}"))?;
+        if n == 0 {
+            return Err("eof before headers".to_string());
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+}
+
+fn sse_pump(
+    sock: &mut TcpStream,
+    buf: &mut Vec<u8>,
+    chunked: bool,
+    on_data: &mut dyn FnMut(&str) -> bool,
+) -> Result<(), String> {
+    let mut pending: Vec<u8> = Vec::new(); // partial line across reads
+    let mut eof = false;
+
+    loop {
+        while !eof {
+            let payload: Option<Vec<u8>> = if chunked {
+                match next_chunk(buf) {
+                    Chunk::Data(bytes) => Some(bytes),
+                    Chunk::NeedMore => None,
+                    Chunk::End => {
+                        eof = true;
+                        None
+                    }
+                }
+            } else {
+                if buf.is_empty() {
+                    None
+                } else {
+                    Some(std::mem::take(buf))
+                }
+            };
+            let Some(payload) = payload else { break };
+            if !feed_lines(&payload, &mut pending, on_data) {
+                return Ok(());
+            }
+            if eof {
+                break;
+            }
+        }
+
+        if eof {
+            if !pending.is_empty() {
+                let rest = std::mem::take(&mut pending);
+                if !finish_line(&rest, on_data) {
+                    return Ok(());
+                }
+            }
+            return Ok(());
+        }
+        match read_into(sock, buf) {
+            Ok(0) => eof = true,
+            Ok(_) => {}
+            Err(e) => return Err(format!("read: {e}")),
+        }
+    }
+}
+
+/// Split payload into complete `\n`-terminated lines (carrying `pending` across
+/// socket reads so JSON is never cut mid-line). Returns false to stop the pump.
+fn feed_lines(payload: &[u8], pending: &mut Vec<u8>, on_data: &mut dyn FnMut(&str) -> bool) -> bool {
+    for &b in payload {
+        if b == b'\n' {
+            let line = std::mem::take(pending);
+            if !finish_line(&line, on_data) {
+                return false;
+            }
+        } else if b != b'\r' {
+            pending.push(b);
+        }
+    }
+    true
+}
+
+fn finish_line(bytes: &[u8], on_data: &mut dyn FnMut(&str) -> bool) -> bool {
+    let s = String::from_utf8_lossy(bytes).trim().to_string();
+    match sse_data(&s) {
+        Some(data) => {
+            if data == "[DONE]" {
+                return false;
+            }
+            on_data(&data)
+        }
+        None => true,
+    }
+}
+
+fn read_into(sock: &mut TcpStream, buf: &mut Vec<u8>) -> std::io::Result<usize> {
+    let start = buf.len();
+    buf.resize(start + 8192, 0);
+    let n = sock.read(&mut buf[start..])?;
+    buf.truncate(start + n);
+    Ok(n)
+}
+
+enum Chunk {
+    Data(Vec<u8>),
+    NeedMore,
+    End,
+}
+
+/// Consume one complete chunk from the front of `buf`, returning its payload.
+fn next_chunk(buf: &mut Vec<u8>) -> Chunk {
+    let nl = match find_subslice(buf, b"\r\n") {
+        Some(i) => i,
+        None => return Chunk::NeedMore,
+    };
+    let size_line = String::from_utf8_lossy(&buf[..nl]).trim().to_string();
+    let size = match usize::from_str_radix(size_line.split(';').next().unwrap_or("").trim(), 16) {
+        Ok(s) => s,
+        Err(_) => return Chunk::End,
+    };
+    if size == 0 {
+        return Chunk::End;
+    }
+    let start = nl + 2;
+    let end = start + size;
+    if buf.len() < end + 2 {
+        return Chunk::NeedMore;
+    }
+    let data = buf[start..end].to_vec();
+    buf.drain(..end + 2); // skip chunk data + trailing CRLF
+    Chunk::Data(data)
+}
+
+fn sse_data(line: &str) -> Option<String> {
+    if let Some(rest) = line.strip_prefix("data:") {
+        let d = rest.trim();
+        if !d.is_empty() {
+            return Some(d.to_string());
+        }
+    }
+    None
+}
