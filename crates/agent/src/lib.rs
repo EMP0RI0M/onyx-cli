@@ -66,6 +66,15 @@ pub enum AgentError {
     Tool(ToolError),
 }
 
+/// Token usage returned from the model API.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub total_tokens: usize,
+    pub cached_prompt_tokens: usize,
+}
+
 /// Observational events emitted while a turn runs. A UI (the onyx TUI) renders
 /// these; `run_turn` stays silent so tests, agentd and subagents are unaffected.
 #[derive(Debug, Clone)]
@@ -78,6 +87,8 @@ pub enum AgentEvent {
     ToolStart { name: String, args: Value },
     /// The gateway returned for this call (Err arm = denied or failed).
     ToolDone { name: String, ok: bool, output: String },
+    /// Real token usage reported from the model endpoint.
+    Usage(TokenUsage),
 }
 
 /// Result of a full run: the final answer and the total steps taken.
@@ -149,11 +160,15 @@ impl<'a, P: Policy + ?Sized> ToolCallAgent<'a, P> {
             on_event(AgentEvent::Thinking { step });
             let action = if stream {
                 let mut sink = |d: &str| on_event(AgentEvent::TextDelta(d.to_string()));
-                model
+                let hm = model
                     .as_any_mut()
                     .downcast_mut::<crate::model::HttpModel>()
-                    .unwrap()
-                    .next_step_streaming(history, &tools, &mut sink)
+                    .unwrap();
+                let res = hm.next_step_streaming(history, &tools, &mut sink);
+                if let Some(u) = &hm.last_usage {
+                    on_event(AgentEvent::Usage(u.clone()));
+                }
+                res
             } else {
                 model.next_step(history, &tools)
             };

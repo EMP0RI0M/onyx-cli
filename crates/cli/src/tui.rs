@@ -417,6 +417,7 @@ enum Ctl {
     Clear(String),
     Resume(Vec<Message>),
     SetModel(String),
+    SetEffort(String),
     SystemAppend(String),
     Audit,
     DropTranscript,
@@ -481,6 +482,14 @@ impl AskCtl {
 }
 
 // ------------------------------------------------------------- view helpers ----
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        None => String::new(),
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+    }
+}
 
 fn clip_chars(s: &str, n: usize) -> String {
     let mut out = String::new();
@@ -613,15 +622,17 @@ const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "commands + keys"),
     ("/model", "[name] show/set model"),
+    ("/effort", "<low|med|high|max|none> reasoning level"),
+    ("/settings", "view system configurations & modes"),
     ("/steps", "N set max steps"),
     ("/clear", "new conversation"),
-    ("/usage", "token estimate + audit summary"),
+    ("/usage", "real token metrics + tool calls"),
     ("/audit", "gateway audit log"),
     ("/tools", "list connected tools"),
-    ("/skill", "<name> load a skill"),
+    ("/skill", "<name> load a skill from ~/.onyx/skills"),
     ("/sessions", "list saved transcripts"),
     ("/resume", "<id|prefix> replay a transcript"),
-    ("/mode", "cycle approval mode"),
+    ("/mode", "cycle approval mode (Normal, Edits, YOLO)"),
     ("/exit", "quit"),
 ];
 
@@ -669,6 +680,12 @@ pub struct Tui<'a> {
     workspace_dir: String,
     slash_selected: usize,
     cached_models: Vec<String>,
+    mcp_count: usize,
+    skill_count: usize,
+    real_prompt_tokens: usize,
+    real_completion_tokens: usize,
+    real_total_tokens: usize,
+    real_cached_tokens: usize,
 }
 
 
@@ -679,6 +696,21 @@ impl<'a> Tui<'a> {
         opts: &'a mut Opts,
     ) -> Self {
         let cached_models = hm.list_models().unwrap_or_default();
+        let mcp_count = if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            let mcp_cfg = home.join(".onyx/mcp.json");
+            if let Ok(content) = std::fs::read_to_string(mcp_cfg) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                    val.get("mcpServers").and_then(|s| s.as_object()).map(|o| o.len()).unwrap_or(0)
+                } else { 0 }
+            } else { 0 }
+        } else { 0 };
+
+        let skill_count = if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            let mut cat = skills::SkillCatalog::new();
+            cat.scan_dir(&home.join(".onyx/skills"));
+            cat.skills.len()
+        } else { 0 };
+
         Self {
             gw,
             hm,
@@ -708,6 +740,12 @@ impl<'a> Tui<'a> {
             active_tool_start: None,
             slash_selected: 0,
             cached_models,
+            mcp_count,
+            skill_count,
+            real_prompt_tokens: 0,
+            real_completion_tokens: 0,
+            real_total_tokens: 0,
+            real_cached_tokens: 0,
             workspace_dir: std::env::current_dir()
                 .map(|p| {
                     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
@@ -856,6 +894,9 @@ impl<'a> Tui<'a> {
                     }                    Ctl::SetModel(m) => {
                         hm.model = m;
                         let _ = ut.send(UiOut::ModelName(hm.model.clone()));
+                    }
+                    Ctl::SetEffort(eff) => {
+                        hm.effort = eff;
                     }
                     Ctl::SystemAppend(s) => {
                         hm.system.push_str(&s);
@@ -1059,17 +1100,18 @@ impl<'a> Tui<'a> {
         let w = self.width.max(20);
         match it {
             Item::Banner => {
-                let logo_l1 = format!("{CYAN}  ██████{RESET}");
-                let logo_l2 = format!("{CYAN}██      ██{RESET}");
-                let logo_l3 = format!("{CYAN}██  ██  ██{RESET}  {BOLD}ONYX CLI{RESET} {DIM}v0.1.0{RESET}");
-                let logo_l4 = format!("{CYAN}██    ██{RESET}    {DIM}Signed in Local Engine · session: {}{RESET}", self.session_label());
-                let logo_l5 = format!("{CYAN}  ████  ██{RESET}  {DIM}dir: {FG_245}{}{RESET}", self.workspace_dir);
+                let logo_l1 = format!("{CYAN}  ██████{RESET}                              {BOLD}ONYX{RESET} {DIM}v0.1.0{RESET}");
+                let logo_l2 = format!("{CYAN}██      ██{RESET}                            {DIM}Signed in Local Engine{RESET}");
+                let logo_l3 = format!("{CYAN}██  ██  ██{RESET}  {BOLD}ONYX CLI{RESET} {DIM}v0.1.0{RESET}           {DIM}session: {}{RESET}", self.session_label());
+                let logo_l4 = format!("{CYAN}██    ██{RESET}    {DIM}dir: {FG_245}{}{RESET}", self.workspace_dir);
+                let logo_l5 = format!("{CYAN}  ████  ██{RESET}  {DIM}tools: {}{RESET}", self.gw.tools.names().len());
 
                 let _card_w = 40;
                 let c_top = format!("{FG_240}╭─ What's new (v0.1.0): ──────────╮{RESET}");
                 let c_l1  = format!("{FG_240}│{RESET} - Full Grok Tools architecture  {FG_240}│{RESET}");
                 let c_l2  = format!("{FG_240}│{RESET} - Interactive dropdowns & resume {FG_240}│{RESET}");
-                let c_l3  = format!("{FG_240}│{RESET} - Subagents & Plan Mode integrated {FG_240}│{RESET}");
+                let c_l3  = format!("{FG_240}│{RESET} - Subagents & Plan Mode          {FG_240}│{RESET}");
+                let c_l4  = format!("{FG_240}│{RESET} - /effort, /usage, /settings     {FG_240}│{RESET}");
                 let c_bot = format!("{FG_240}╰─────────────────────────────────╯{RESET}");
 
                 if w >= 78 {
@@ -1084,13 +1126,14 @@ impl<'a> Tui<'a> {
                         format!("{} {}", pad(&logo_l2, col1_w), c_l1),
                         format!("{} {}", pad(&logo_l3, col1_w), c_l2),
                         format!("{} {}", pad(&logo_l4, col1_w), c_l3),
-                        format!("{} {}", pad(&logo_l5, col1_w), c_bot),
+                        format!("{} {}", pad(&logo_l5, col1_w), c_l4),
+                        format!("{} {}", pad("", col1_w), c_bot),
                         format!("{FG_240}{}{RESET}", "─".repeat(w)),
                     ]
                 } else {
                     vec![
                         logo_l3,
-                        logo_l5,
+                        logo_l4,
                         format!("{FG_240}{}{RESET}", "─".repeat(w)),
                     ]
                 }
@@ -1296,6 +1339,51 @@ impl<'a> Tui<'a> {
             return (" Switch Model (↑/↓ to choose, tab/enter to select) ".into(), items);
         }
 
+        // Subcommand dropdown for /effort
+        if input.starts_with("/effort") {
+            let arg = if let Some((_, rest)) = input.split_once(' ') {
+                rest.trim()
+            } else {
+                ""
+            };
+            let levels = vec![
+                ("low", "Low reasoning effort for faster turns"),
+                ("medium", "Balanced reasoning and latency"),
+                ("high", "High reasoning effort for complex engineering tasks"),
+                ("max", "Maximum reasoning budget allowed by model"),
+                ("none", "Disable reasoning effort entirely"),
+            ];
+            let mut items = Vec::new();
+            for (lvl, desc) in levels {
+                let active = if lvl == self.hm.effort { " [active]" } else { "" };
+                let full_desc = format!("{desc}{active}");
+                if arg.is_empty() || lvl.starts_with(&arg.to_lowercase()) {
+                    items.push((lvl.to_string(), lvl.to_string(), full_desc));
+                }
+            }
+            return (" Reasoning Effort (↑/↓ to choose, tab/enter to select) ".into(), items);
+        }
+
+        // Subcommand dropdown for /skill
+        if input.starts_with("/skill") {
+            let arg = if let Some((_, rest)) = input.split_once(' ') {
+                rest.trim()
+            } else {
+                ""
+            };
+            let mut items = Vec::new();
+            if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+                let mut cat = skills::SkillCatalog::new();
+                cat.scan_dir(&home.join(".onyx/skills"));
+                for (_, sk) in &cat.skills {
+                    if arg.is_empty() || sk.name.to_lowercase().contains(&arg.to_lowercase()) {
+                        items.push((sk.name.clone(), sk.name.clone(), sk.description.clone()));
+                    }
+                }
+            }
+            return (" Load Skill (↑/↓ to choose, tab/enter to select) ".into(), items);
+        }
+
         // Top-level slash commands
         if !input.contains(' ') {
             let lower = input.to_lowercase();
@@ -1423,18 +1511,30 @@ impl<'a> Tui<'a> {
             format!("{YELLOW}Shift+Tab to Auto Mode{RESET}")
         };
 
-        // Context progress calculation
-        let max_ctx = 200_000;
-        let used_tokens = (self.history_bytes / 4).max(self.history_len * 40);
+        // Context budget and actual usage
+        let max_ctx = if self.hm.context_budget > 0 { self.hm.context_budget } else { 128_000 };
+        let used_tokens = if self.real_total_tokens > 0 {
+            self.real_total_tokens
+        } else {
+            (self.history_bytes / 4).max(self.history_len * 40)
+        };
         let pct = ((used_tokens as f64 / max_ctx as f64) * 100.0).clamp(0.0, 100.0) as usize;
         let filled_bars = (pct / 10).min(10);
         let empty_bars = 10 - filled_bars;
         let ctx_bar = format!("ctx {CYAN}{}{RESET}{DIM}{}{RESET} {:>2}%", "▓".repeat(filled_bars), "░".repeat(empty_bars), pct);
 
         let sep = format!("{FG_240}{}{RESET}", "─".repeat(self.width.max(20)));
-        let line1 = format!("{mode_label}  {DIM}·  1 MCP server · 42 skills{RESET}");
+        let mcp_label = if self.mcp_count == 1 { "1 MCP server" } else { &format!("{} MCP servers", self.mcp_count) };
+        let skill_label = if self.skill_count == 1 { "1 skill" } else { &format!("{} skills", self.skill_count) };
+        let line1 = format!("{mode_label}  {DIM}·  {mcp_label} · {skill_label}{RESET}");
+        let effort_str = if self.hm.effort.is_empty() {
+            "Disabled Effort"
+        } else {
+            &format!("{} Effort", capitalize(&self.hm.effort))
+        };
+        let ctx_k = max_ctx / 1000;
         let line2 = format!(
-            "{DIM}{model} · Normal Effort · 200K context · {ctx_bar}{RESET}",
+            "{DIM}{model} · {effort_str} · {ctx_k}K context · {ctx_bar}{RESET}",
             model = self.hm.model
         );
 
@@ -1502,12 +1602,47 @@ impl<'a> Tui<'a> {
                 self.items.push(Item::Info(format!("max steps: {}", self.opts.max_steps)));
             }
             "/usage" => {
-                let est = self.history_bytes / 4;
                 let calls = self.gw.audit.snapshot().len();
-                self.items.push(Item::Info(format!(
-                    "~{est} tokens in context · {} message(s) · {calls} audited call(s)",
-                    self.history_len
-                )));
+                if self.real_total_tokens > 0 {
+                    self.items.push(Item::Info(format!(
+                        "{} prompt tokens (cached: {}) · {} completion tokens · {} total tokens · {} message(s) · {calls} tool call(s)",
+                        self.real_prompt_tokens,
+                        self.real_cached_tokens,
+                        self.real_completion_tokens,
+                        self.real_total_tokens,
+                        self.history_len
+                    )));
+                } else {
+                    let est = (self.history_bytes / 4).max(self.history_len * 40);
+                    self.items.push(Item::Info(format!(
+                        "~{est} tokens estimated in context · {} message(s) · {calls} tool call(s)",
+                        self.history_len
+                    )));
+                }
+            }
+            "/effort" => {
+                if let Some(eff) = arg {
+                    let eff_clean = eff.to_lowercase();
+                    if let Some(tx) = &self.ctl_tx {
+                        let _ = tx.send(Ctl::SetEffort(eff_clean.clone()));
+                    }
+                    self.hm.effort = eff_clean.clone();
+                    self.items.push(Item::Info(format!("reasoning effort set to: {eff_clean}")));
+                } else {
+                    self.items.push(Item::Info(format!("current reasoning effort: {} (options: low, medium, high, max, none)", self.hm.effort)));
+                }
+            }
+            "/settings" => {
+                let auto = matches!(*self.gw.mode.lock().unwrap(), ApprovalMode::Auto);
+                self.items.push(Item::Info("╭── ONYX SETTINGS ──────────────────────────────────────╮".into()));
+                self.items.push(Item::Info(format!("│ Model:            {:<36} │", self.hm.model)));
+                self.items.push(Item::Info(format!("│ Reasoning Effort: {:<36} │", self.hm.effort)));
+                self.items.push(Item::Info(format!("│ Mode:             {:<36} │", if auto { "YOLO (Auto-approve all)" } else { "Interactive Approval" })));
+                self.items.push(Item::Info(format!("│ Context Budget:   {:<36} │", format!("{} tokens", self.hm.context_budget))));
+                self.items.push(Item::Info(format!("│ MCP Servers:      {:<36} │", format!("{} active", self.mcp_count))));
+                self.items.push(Item::Info(format!("│ Installed Skills: {:<36} │", format!("{} available", self.skill_count))));
+                self.items.push(Item::Info(format!("│ Max Steps:        {:<36} │", self.opts.max_steps)));
+                self.items.push(Item::Info("╰───────────────────────────────────────────────────────╯".into()));
             }
             "/audit" => {
                 if let Some(tx) = &self.ctl_tx {
@@ -1707,6 +1842,12 @@ impl<'a> Tui<'a> {
                 }
                 self.thinking = true;
             }
+            AgentEvent::Usage(u) => {
+                self.real_prompt_tokens = u.prompt_tokens;
+                self.real_completion_tokens = u.completion_tokens;
+                self.real_total_tokens = u.total_tokens;
+                self.real_cached_tokens = u.cached_prompt_tokens;
+            }
         }
     }
 
@@ -1862,6 +2003,10 @@ impl<'a> Tui<'a> {
                                 self.input = format!("/resume {target}");
                             } else if title.contains("Model") {
                                 self.input = format!("/model {target}");
+                            } else if title.contains("Effort") {
+                                self.input = format!("/effort {target}");
+                            } else if title.contains("Skill") {
+                                self.input = format!("/skill {target}");
                             } else {
                                 self.input = format!("{target} ");
                             }
@@ -1893,9 +2038,21 @@ impl<'a> Tui<'a> {
                                 self.cursor = self.input.len();
                                 self.slash_selected = 0;
                                 self.submit();
+                            } else if title.contains("Effort") {
+                                // Set effort immediately!
+                                self.input = format!("/effort {target}");
+                                self.cursor = self.input.len();
+                                self.slash_selected = 0;
+                                self.submit();
+                            } else if title.contains("Skill") {
+                                // Load skill immediately!
+                                self.input = format!("/skill {target}");
+                                self.cursor = self.input.len();
+                                self.slash_selected = 0;
+                                self.submit();
                             } else if !self.input.contains(' ') && self.input != *target {
                                 let cmd = target;
-                                if cmd == "/clear" || cmd == "/tools" || cmd == "/exit" || cmd == "/mode" || cmd == "/help" || cmd == "/usage" || cmd == "/audit" || cmd == "/sessions" {
+                                if cmd == "/clear" || cmd == "/tools" || cmd == "/exit" || cmd == "/mode" || cmd == "/help" || cmd == "/usage" || cmd == "/audit" || cmd == "/sessions" || cmd == "/settings" {
                                     self.input = cmd.to_string();
                                     self.cursor = self.input.len();
                                     self.slash_selected = 0;

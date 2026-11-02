@@ -207,6 +207,10 @@ pub struct HttpModel {
     pub context_budget: usize,
     /// OpenAI-style `tools` array (from tools::tool_schemas); empty = text protocol only.
     pub tool_defs: Vec<Value>,
+    /// Reasoning effort ("low", "medium", "high", or "" for disabled)
+    pub effort: String,
+    /// Last reported token usage from the server
+    pub last_usage: Option<crate::TokenUsage>,
 }
 
 impl HttpModel {
@@ -223,6 +227,8 @@ impl HttpModel {
             catalog,
             context_budget: default_context_budget(),
             tool_defs: Vec::new(),
+            effort: "medium".to_string(),
+            last_usage: None,
         }
     }
 
@@ -242,6 +248,8 @@ impl HttpModel {
             catalog,
             context_budget: default_context_budget(),
             tool_defs,
+            effort: "medium".to_string(),
+            last_usage: None,
         }
     }
 
@@ -392,7 +400,7 @@ impl HttpModel {
     }
 
     /// Parse a full (non-streaming) chat-completions reply into a Step.
-    fn step_from_reply(&self, raw: &str) -> Step {
+    fn step_from_reply(&mut self, raw: &str) -> Step {
         let v: Value = match serde_json::from_str(raw) {
             Ok(v) => v,
             Err(e) => return Step::Final(format!("[model parse error: {e}]")),
@@ -400,7 +408,7 @@ impl HttpModel {
         self.step_from_value(&v)
     }
 
-    fn step_from_value(&self, v: &Value) -> Step {
+    fn step_from_value(&mut self, v: &Value) -> Step {
         let choice = v.get("choices").and_then(|c| c.get(0));
         let msg = choice.and_then(|c| c.get("message"));
 
@@ -427,6 +435,21 @@ impl HttpModel {
             .unwrap_or("")
             .to_string();
 
+        if let Some(u) = v.get("usage") {
+            let prompt_tokens = u.get("prompt_tokens").and_then(|p| p.as_u64()).unwrap_or(0) as usize;
+            let completion_tokens = u.get("completion_tokens").and_then(|p| p.as_u64()).unwrap_or(0) as usize;
+            let total_tokens = u.get("total_tokens").and_then(|p| p.as_u64()).unwrap_or(0) as usize;
+            let cached_prompt_tokens = u.get("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(|c| c.as_u64())
+                .unwrap_or(0) as usize;
+            self.last_usage = Some(crate::TokenUsage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                cached_prompt_tokens,
+            });
+        }
         if native.is_empty() && content.trim().is_empty() {
             return Step::Final("[model returned empty content]".to_string());
         }
@@ -492,7 +515,11 @@ impl HttpModel {
             "temperature": self.temperature,
             "max_tokens": max_tokens,
             "stream": true,
+            "stream_options": { "include_usage": true },
         });
+        if !self.effort.is_empty() {
+            body["reasoning_effort"] = json!(self.effort);
+        }
         if !self.tool_defs.is_empty() {
             body["tools"] = json!(self.tool_defs);
             body["tool_choice"] = json!("auto");
@@ -504,6 +531,7 @@ impl HttpModel {
         // index → (name, arguments-so-far)
         let mut calls: std::collections::BTreeMap<usize, (String, String)> =
             std::collections::BTreeMap::new();
+        let mut reported_usage: Option<crate::TokenUsage> = None;
 
         let result = http_sse(
             "POST",
@@ -517,6 +545,21 @@ impl HttpModel {
                     return false;
                 }
                 let Ok(v) = serde_json::from_str::<Value>(data) else { return true };
+                if let Some(u) = v.get("usage") {
+                    let prompt_tokens = u.get("prompt_tokens").and_then(|p| p.as_u64()).unwrap_or(0) as usize;
+                    let completion_tokens = u.get("completion_tokens").and_then(|p| p.as_u64()).unwrap_or(0) as usize;
+                    let total_tokens = u.get("total_tokens").and_then(|p| p.as_u64()).unwrap_or(0) as usize;
+                    let cached_prompt_tokens = u.get("prompt_tokens_details")
+                        .and_then(|d| d.get("cached_tokens"))
+                        .and_then(|c| c.as_u64())
+                        .unwrap_or(0) as usize;
+                    reported_usage = Some(crate::TokenUsage {
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens,
+                        cached_prompt_tokens,
+                    });
+                }
                 let Some(choice) = v.get("choices").and_then(|c| c.get(0)).map(|c| c.clone())
                 else { return true };
                 let delta = choice.get("delta").cloned().unwrap_or(json!({}));
@@ -555,6 +598,9 @@ impl HttpModel {
                 ToolCall { name, args }
             })
             .collect();
+        if let Some(u) = reported_usage {
+            self.last_usage = Some(u);
+        }
         if native.is_empty() && content.trim().is_empty() {
             return Step::Final("[model returned empty content]".to_string());
         }
