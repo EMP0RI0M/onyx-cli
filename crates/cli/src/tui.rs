@@ -503,11 +503,11 @@ fn first_line(s: &str) -> &str {
 fn clean_model_text(text: &str) -> String {
     let t = text.trim();
     // Case 1: `→ tool_name({"question":"..."})` or `→ tool_name({...})` from agent loop tool calls
-    if t.starts_with("→ ") {
-        if let Some(open_paren) = t.find('(') {
-            let tool_name = t[2..open_paren].trim();
-            if let Some(close_paren) = t.rfind(')') {
-                let inside = &t[open_paren + 1..close_paren];
+    if let Some(rest) = t.strip_prefix("→ ") {
+        if let Some(open_paren) = rest.find('(') {
+            let tool_name = rest[..open_paren].trim();
+            if let Some(close_paren) = rest.rfind(')') {
+                let inside = &rest[open_paren + 1..close_paren];
                 if tool_name == "ask_human" || tool_name == "terminate" {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(inside) {
                         if let Some(q) = v.get("question").or_else(|| v.get("content")).or_else(|| v.get("answer")).and_then(|s| s.as_str()) {
@@ -1035,9 +1035,10 @@ impl<'a> Tui<'a> {
 
     fn tail_lines(&self) -> Vec<String> {
         let vis: String = self.tail.chars().skip(self.tail_scrolled).collect();
+        let clean = clean_model_text(&vis);
         let wrap_w = self.width.saturating_sub(4).max(20);
         let mut out = Vec::new();
-        for para in vis.split('\n') {
+        for para in clean.split('\n') {
             let wrapped = wrap(para, wrap_w);
             for (i, w) in wrapped.iter().enumerate() {
                 let mark = if i == 0 { "◐ " } else { "  " };
