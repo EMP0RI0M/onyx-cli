@@ -184,7 +184,18 @@ impl<'a, P: Policy + ?Sized> ToolCallAgent<'a, P> {
                             }),
                         }
                         let output = outcome.map_err(AgentError::Tool)?;
-                        history.push(Message::text("tool", output.content.clone()));
+                        // Context window protection: if a tool output exceeds 24,000 chars
+                        // (~6,000 tokens), truncate the middle so enormous outputs (e.g. `ls -R`
+                        // or large dumps) don't trigger context length exceeded HTTP 400 errors.
+                        let content = if output.content.chars().count() > 24000 {
+                            let head: String = output.content.chars().take(12000).collect();
+                            let tail: String = output.content.chars().skip(output.content.chars().count().saturating_sub(12000)).collect();
+                            let total = output.content.chars().count();
+                            format!("{head}\n\n[... truncated {} characters to fit context window ...]\n\n{tail}", total - 24000)
+                        } else {
+                            output.content.clone()
+                        };
+                        history.push(Message::text("tool", content));
                         if call.name == "terminate" {
                             terminate_answer = Some(output.content);
                             break; // terminate ends the turn

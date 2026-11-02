@@ -327,7 +327,11 @@ fn main() {
     } else {
         Gateway::<dyn Policy>::from_boxed_with_approver(
             tool_col,
-            Box::new(BashGuard::default()),
+            DynChained::new(Chained::new(
+                tools::taxonomy::Sandbox::standard(),
+                BashGuard::default(),
+            ))
+            .as_dyn(),
             interactive_approve,
         )
     };

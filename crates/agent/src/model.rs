@@ -569,7 +569,8 @@ pub fn http_sse(
                 .and_then(|c| c.parse().ok())
                 .unwrap_or(0);
             if !(200..300).contains(&code) {
-                return Err(format!("http {code}"));
+                let err_peek = String::from_utf8_lossy(&buf[..buf.len().min(500)]);
+                return Err(format!("http {code}: {}", err_peek.trim()));
             }
             let chunked = head.to_ascii_lowercase().contains("transfer-encoding: chunked");
             return sse_pump(&mut sock, &mut buf, chunked, on_data);

@@ -13,6 +13,7 @@ pub mod editor;
 pub mod planning;
 pub mod policy;
 pub mod python;
+pub mod taxonomy;
 pub mod vecmath;
 pub mod websearch;
 

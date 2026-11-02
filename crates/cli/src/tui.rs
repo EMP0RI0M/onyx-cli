@@ -773,25 +773,32 @@ impl<'a> Tui<'a> {
                     Ctl::Prompt(prompt, max_steps) => {
                         *cancel.lock().unwrap() = false;
                         let cut = history.len();
-                        if let Some(t) = &transcript {
-                            if !t.last_is_user(&prompt) {
-                                t.push(&Message::text("user", &prompt));
-                            }
-                        }
+                        // run_turn_observed appends the user message itself, so we
+                        // do NOT pre-push it — that was the double-write. We persist
+                        // the whole turn from the returned report instead, which
+                        // carries the user+assistant+tool messages even when the
+                        // live history is later truncated (cancel) or errored.
                         let mut agent = ToolCallAgent::new(gw);
                         agent.max_steps = max_steps;
                         let mut sink = |ev: AgentEvent| {
                             let _ = ut.send(UiOut::Ev(ev));
                         };
                         let res = agent.run_turn_observed(hm, &prompt, &mut history, &mut sink);
-                        if *cancel.lock().unwrap() {
-                            // Drop everything this cancelled turn appended.
-                            history.truncate(cut);
-                        } else if let Some(t) = &transcript {
-                            // Persist the assistant/tool messages this turn added.
-                            for m in &history[cut..] {
+                        if let Some(t) = &transcript {
+                            // Persist exactly the messages this turn added. On cancel
+                            // or error the live history is rolled back below, but the
+                            // report still holds the full turn, so nothing is lost.
+                            let src: &[Message] = match &res {
+                                Ok(rep) => &rep.history[cut..],
+                                Err(_) => &history[cut..],
+                            };
+                            for m in src {
                                 t.push(m);
                             }
+                        }
+                        if *cancel.lock().unwrap() {
+                            // Drop everything this cancelled turn appended to memory.
+                            history.truncate(cut);
                         }
                         let _ = ut.send(UiOut::TurnDone(match res {
                             Ok(rep) => Ok((rep.answer, rep.steps)),
@@ -1242,7 +1249,8 @@ impl<'a> Tui<'a> {
             }
             "/tools" => {
                 for n in self.gw.tools.names() {
-                    self.items.push(Item::Info(format!("  • {n}")));
+                    let cap = tools::taxonomy::capability_of(&n).label();
+                    self.items.push(Item::Info(format!("  • {n}  {DIM}[{cap}]{RESET}")));
                 }
             }
             "/mode" => {
