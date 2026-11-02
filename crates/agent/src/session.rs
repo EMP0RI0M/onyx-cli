@@ -207,6 +207,20 @@ mod tests {
         let listed = list_sessions(5);
         assert!(listed.iter().any(|s| s.id == id && s.preview == "hello"));
 
+        // Tool calls survive the round trip.
+        let tc_id = new_session_id();
+        {
+            let t = Transcript::open(&tc_id, "test-model").expect("open");
+            let mut m = Message::text("assistant", "");
+            m.tool_call = Some(ToolCall { name: "bash".into(), args: json!({"cmd": "ls"}) });
+            t.push(&m);
+        }
+        let restored = load_messages(&dir.join("sessions").join(format!("{tc_id}.jsonl")));
+        assert_eq!(restored.len(), 1);
+        let tc = restored[0].tool_call.as_ref().expect("tool call restored");
+        assert_eq!(tc.name, "bash");
+        assert_eq!(tc.args["cmd"], "ls");
+
         let _ = fs::remove_dir_all(&dir);
         std::env::remove_var("ONYX_HOME");
     }

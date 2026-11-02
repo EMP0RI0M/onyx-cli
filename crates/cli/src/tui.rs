@@ -38,6 +38,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use tools::audit::{ApprovalMode, AuditEntry, Gateway};
+use crate::markdown::render_markdown;
 
 // ---------------------------------------------------------------- ANSI/TTY ----
 
@@ -53,6 +54,8 @@ const YELLOW: &str = "\x1b[33m";
 const BLUE: &str = "\x1b[34m";
 const MAGENTA: &str = "\x1b[35m";
 const CYAN: &str = "\x1b[36m";
+const FG_240: &str = "\x1b[38;5;240m";
+const FG_242: &str = "\x1b[38;5;242m";
 
 /// Raw-mode guard: restores termios on drop, including panic unwind.
 struct RawMode(libc::termios);
@@ -98,7 +101,7 @@ fn term_size() -> (u16, u16) {
 /// Terminal cells a char occupies: CJK/fullwidth blocks are 2, combining marks
 /// and control-ish codepoints are 0, everything else 1. Approximate wcwidth —
 /// enough for the box-drawing, braille spinner and CJK we can actually print.
-fn char_width(c: char) -> usize {
+pub(crate) fn char_width(c: char) -> usize {
     let cp = c as u32;
     if cp == 0 {
         return 0;
@@ -381,6 +384,7 @@ enum Item {
         args: String,
         ok: bool,
         denied: bool,
+        duration: Option<Duration>,
         output: String,
     },
     Answer(String),
@@ -398,11 +402,13 @@ enum Ctl {
     SetModel(String),
     SystemAppend(String),
     Audit,
+    DropTranscript,
 }
 
 /// Events the worker thread sends to the UI thread.
 enum UiOut {
     Ev(AgentEvent),
+    Info(String),
     TurnDone(Result<(String, usize), AgentError>),
     Audit(Vec<AuditEntry>),
     ModelName(String),
@@ -598,6 +604,9 @@ pub struct Tui<'a> {
     height: usize,
     width: usize,
     session: Option<agent::session::Transcript>,
+    scroll_offset: usize,
+    active_tool_start: Option<std::time::Instant>,
+    workspace_dir: String,
 }
 
 
@@ -632,6 +641,18 @@ impl<'a> Tui<'a> {
             height: term_size().0.max(4) as usize,
             width: term_size().1.max(20) as usize,
             session: None,
+            scroll_offset: 0,
+            active_tool_start: None,
+            workspace_dir: std::env::current_dir()
+                .map(|p| {
+                    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+                        if let Ok(rel) = p.strip_prefix(&home) {
+                            return format!("~/{}", rel.display());
+                        }
+                    }
+                    p.display().to_string()
+                })
+                .unwrap_or_else(|_| ".".into()),
         }
     }
 
@@ -640,6 +661,14 @@ impl<'a> Tui<'a> {
         let (rows, cols) = term_size();
         self.height = rows.max(4) as usize;
         self.width = cols.max(20) as usize;
+    }
+
+    fn session_label(&self) -> String {
+        self.session
+            .as_ref()
+            .and_then(|t| t.path().file_stem().and_then(|s| s.to_str()))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "ready".to_string())
     }
 
     /// Install the TUI's own approver into the gateway and start the worker.
@@ -687,7 +716,7 @@ impl<'a> Tui<'a> {
             let hm: &mut HttpModel = unsafe { &mut *job.hm };
             let mut history: Vec<Message> = *job.history;
             let _opts: &Opts = unsafe { &*job.opts };
-            let transcript = transcript;
+            let mut transcript = transcript;
 
             // Approver runs ON the worker thread (it blocks on AskCtl). It may
             // only touch Sync state — AskCtl is enough: the main thread renders
@@ -719,7 +748,6 @@ impl<'a> Tui<'a> {
                                 t.push(m);
                             }
                         }
-                        let audit = gw.audit.snapshot();
                         let _ = ut.send(UiOut::TurnDone(match res {
                             Ok(rep) => Ok((rep.answer, rep.steps)),
                             Err(e) => Err(e),
@@ -727,11 +755,31 @@ impl<'a> Tui<'a> {
                     }
                     Ctl::Clear(system) => {
                         history = vec![Message::text("system", system)];
+                        // Fresh conversation: seal the old transcript, start a new one.
+                        if let Some(t) = &transcript {
+                            let _ = ut.send(UiOut::Info(format!(
+                                "archived session {}",
+                                t.path().file_stem().and_then(|s| s.to_str()).unwrap_or("?")
+                            )));
+                        }
+                        transcript = None;
+                        let sid = agent::session::new_session_id();
+                        if let Some(t) = agent::session::Transcript::open(&sid, &hm.model) {
+                            let _ = ut.send(UiOut::Info(format!(
+                                "session {sid} · {}",
+                                t.path().display()
+                            )));
+                            transcript = Some(t);
+                        }
                     }
                     Ctl::Resume(msgs) => {
-                        history = msgs;
-                    }
-                    Ctl::SetModel(m) => {
+                        history = if msgs.is_empty() {
+                            vec![Message::text("system", hm.system.clone())]
+                        } else {
+                            msgs
+                        };
+                        transcript = None; // main thread already opened the replay transcript
+                    }                    Ctl::SetModel(m) => {
                         hm.model = m;
                         let _ = ut.send(UiOut::ModelName(hm.model.clone()));
                     }
@@ -740,6 +788,9 @@ impl<'a> Tui<'a> {
                     }
                     Ctl::Audit => {
                         let _ = ut.send(UiOut::Audit(gw.audit.snapshot()));
+                    }
+                    Ctl::DropTranscript => {
+                        transcript = None; // main thread owns the replacement
                     }
                 }
                 // Cheap copy for /usage-style reads; the worker owns history.
@@ -771,21 +822,21 @@ impl<'a> Tui<'a> {
     fn draw(&mut self) {
         self.sync_size();
         let lines = self.render_lines();
-        let n = lines.len().min(self.height.max(2)); // frame never exceeds viewport
         let mut out = String::new();
-        // DEC private mode 2026: the terminal defers painting until the matching
-        // reset, so the whole frame lands in one atomic update instead of a
-        // visible clear-then-draw sweep. Terminals without it ignore both markers.
+        // DEC private mode 2026: deferred painting for flicker-free frame sync
         out.push_str("\x1b[?2026h");
-        out.push_str("\x1b[H\x1b[J"); // home + clear entire visible screen
-        for l in &lines[..n] {
+        out.push_str("\x1b[H\x1b[2J"); // home + clear entire screen
+
+        for l in &lines {
             out.push_str(l);
             out.push('\n');
         }
-        if n >= 2 {
-            // Park on the input line: 2nd from the bottom of the frame.
+
+        // Always park cursor at the persistent input composer line (self.height - 1)
+        if self.height >= 2 {
+            let cursor_row = self.height - 1;
             let col = (3 + self.cursor_chars()).min(self.width.max(1));
-            out.push_str(&format!("\x1b[{};{}H", n - 1, col));
+            out.push_str(&format!("\x1b[{};{}H", cursor_row, col));
         }
         out.push_str("\x1b[?2026l");
         io::stdout().write_all(out.as_bytes()).ok();
@@ -793,57 +844,80 @@ impl<'a> Tui<'a> {
     }
 
     fn render_lines(&self) -> Vec<String> {
-        let mut lines: Vec<String> = Vec::new();
-        // finalized transcript window (bottom-aligned within the reserved area)
-        let mut fin: Vec<String> = Vec::new();
-        for it in &self.items {
-            fin.extend(self.item_lines(it));
-        }
-        if self.tail_visible() {
-            fin.extend(self.tail_lines());
-        }
-        // Pre-wrap every entry to one display row each, then size the window.
         let w = self.width.max(20);
-        let fin: Vec<String> = fin.iter().flat_map(|l| fit_lines(l, w)).collect();
-        let status: Vec<String> = self.status_lines_v().iter().flat_map(|l| fit_lines(l, w)).collect();
-        let input: Vec<String> = self.input_lines().iter().flat_map(|l| fit_lines(l, w)).collect();
-        let hints: Vec<String> = fit_lines(&self.hints(), w);
-        let reserve = status.len() + input.len() + hints.len() + 1; // +1 spinner slot
-        let avail = self.height.saturating_sub(reserve).max(1);
-        // Keep a whole-line suffix of `fin`: the finalized transcript must end
-        // with its LAST line (the just-finished answer/tool row), so trim from
-        // the front instead of letting a tail slice drop it.
-        let mut keep: &[String] = &fin;
-        if keep.len() > avail {
-            keep = &keep[keep.len() - avail..];
-        }
-        let dropped = fin.len() - keep.len();
-        // The spinner may add a row; if the frame would exceed the viewport,
-        // give it that row by dropping one more transcript line.
-        let spin_row = if self.thinking && keep.len() + reserve > self.height {
-            if !keep.is_empty() {
-                keep = &keep[1..];
-            }
-            true
-        } else {
-            self.thinking
-        };
-        if dropped > 0 {
-            lines.push(format!("{FG_245}  … {} earlier line(s){RESET}", fin.len() - keep.len()));
-        }
-        lines.extend_from_slice(keep);
+        let mut out = Vec::with_capacity(self.height);
 
-        if spin_row {
+        // 1. Header (fixed at top: 2 lines)
+        let header_lines = self.item_lines(&Item::Banner);
+        let header_count = header_lines.len();
+        out.extend(header_lines);
+
+        // 2. Footer lines (fixed at bottom)
+        let status = self.status_lines_v().into_iter().flat_map(|l| fit_lines(&l, w)).collect::<Vec<_>>();
+        let input = self.input_lines().into_iter().flat_map(|l| fit_lines(&l, w)).collect::<Vec<_>>();
+        let hints = fit_lines(&self.hints(), w);
+
+        let spin_row = if self.thinking {
             let spin = format!(
                 "{DIM}{spin} Thinking… {RESET}{DIM}(esc to cancel){RESET}",
                 spin = SPINNER[self.tick % SPINNER.len()]
             );
-            lines.extend(fit_lines(&spin, w));
+            fit_lines(&spin, w)
+        } else {
+            Vec::new()
+        };
+
+        let footer_count = spin_row.len() + status.len() + input.len() + hints.len();
+        let avail_content = self.height.saturating_sub(header_count + footer_count).max(1);
+
+        // 3. Transcript lines (all non-banner items + tail)
+        let mut content: Vec<String> = Vec::new();
+        for it in &self.items {
+            if matches!(it, Item::Banner) {
+                continue;
+            }
+            content.extend(self.item_lines(it));
         }
-        lines.extend(status);
-        lines.extend(input);
-        lines.extend(hints);
-        lines
+        if self.tail_visible() {
+            content.extend(self.tail_lines());
+        }
+        let all_content: Vec<String> = content.into_iter().flat_map(|l| fit_lines(&l, w)).collect();
+
+        // Calculate scroll window
+        let total_content = all_content.len();
+        let scroll = self.scroll_offset.min(total_content.saturating_sub(avail_content));
+        let visible_end = total_content.saturating_sub(scroll);
+        let visible_start = visible_end.saturating_sub(avail_content);
+
+        let slice = if visible_end > visible_start {
+            &all_content[visible_start..visible_end]
+        } else {
+            &[]
+        };
+
+        // Fill content area
+        for line in slice {
+            out.push(line.clone());
+        }
+
+        // Pad blank lines between transcript and footer to eliminate blank gap jumping
+        // and keep the input composer permanently pinned to the bottom of the screen.
+        let rendered_content_lines = slice.len();
+        if rendered_content_lines < avail_content {
+            for _ in 0..(avail_content - rendered_content_lines) {
+                out.push(String::new());
+            }
+        }
+
+        // 4. Render Footer
+        out.extend(spin_row);
+        out.extend(status);
+        out.extend(input);
+        out.extend(hints);
+
+        // Truncate to exact terminal height to avoid unexpected terminal line wraps
+        out.truncate(self.height);
+        out
     }
 
     fn tail_visible(&self) -> bool {
@@ -867,9 +941,17 @@ impl<'a> Tui<'a> {
     fn item_lines(&self, it: &Item) -> Vec<String> {
         let w = self.width.max(20);
         match it {
-            Item::Banner => vec![
-                frame_header(&format!("{BOLD}onyx{RESET} {DIM}v0.1.0{RESET}"), w, CYAN),
-            ],
+            Item::Banner => {
+                let left = format!("{BOLD}{CYAN}◆ ONYX{RESET} {DIM}v0.1.0{RESET}  {FG_245}{}{RESET}", self.workspace_dir);
+                let right = format!("{DIM}{} · {}{RESET}", self.hm.model, self.session_label());
+                let left_w = ansi_width(&left);
+                let right_w = ansi_width(&right);
+                let pad = w.saturating_sub(left_w + right_w);
+                vec![
+                    format!("{left}{}{right}", " ".repeat(pad)),
+                    format!("{FG_240}{}{RESET}", "─".repeat(w)),
+                ]
+            }
             Item::User(t) => {
                 let mut out = Vec::new();
                 for (i, l) in fit_lines(t, w).into_iter().enumerate() {
@@ -878,7 +960,7 @@ impl<'a> Tui<'a> {
                 }
                 out
             }
-            Item::Tool { name, args, ok, denied, output } => {
+            Item::Tool { name, args, ok, denied, duration, output } => {
                 if name == "terminate" {
                     return Vec::new();
                 }
@@ -889,7 +971,11 @@ impl<'a> Tui<'a> {
                 } else {
                     (format!("{YELLOW}⠋{RESET}"), YELLOW)
                 };
-                let title = format!("{marker} {BOLD}{name}{RESET} {DIM}{a}{RESET}", a = pretty_args(name, args));
+                let dur_str = match duration {
+                    Some(d) => format!(" {DIM}({:.1}s){RESET}", d.as_secs_f32()),
+                    None => String::new(),
+                };
+                let title = format!("{marker} {BOLD}{name}{RESET} {DIM}{a}{RESET}{dur_str}", a = pretty_args(name, args));
                 let mut out = vec![title];
                 if self.expanded && !output.is_empty() {
                     let mut olines: Vec<String> = Vec::new();
@@ -916,12 +1002,7 @@ impl<'a> Tui<'a> {
             Item::Answer(t) => {
                 let clean = clean_model_text(t);
                 let mut out = vec![format!("{CYAN}◆{RESET} {BOLD}onyx{RESET}")];
-                let wrap_w = w.saturating_sub(4).max(20);
-                for para in clean.split('\n') {
-                    for pw in wrap(para, wrap_w) {
-                        out.push(format!("  {FG_250}{pw}{RESET}"));
-                    }
-                }
+                out.extend(render_markdown(&clean, w));
                 out
             }
             Item::Info(t) => fit_lines(t, w)
@@ -939,16 +1020,21 @@ impl<'a> Tui<'a> {
         let mut out = Vec::new();
         let w = self.width.max(20);
         if let Some((tool, args, reason)) = self.ask.pending() {
-            out.push(frame_header(&format!("{YELLOW}⚠ permission needed{RESET}"), w, YELLOW));
+            let risk = match tool.as_str() {
+                "bash" | "shell" => format!("{RED}[HIGH RISK]{RESET}"),
+                "editor" | "file_write" => format!("{YELLOW}[MODERATE RISK]{RESET}"),
+                _ => format!("{CYAN}[STANDARD]{RESET}"),
+            };
+            out.push(frame_header(&format!("{YELLOW}⚠ APPROVAL REQUIRED{RESET} {risk}"), w, YELLOW));
             out.push(format!(
                 "{YELLOW}│{RESET} {BOLD}{tool}{RESET} {DIM}{a}{RESET}",
                 a = pretty_args(&tool, &args)
             ));
             if !reason.is_empty() {
-                out.push(format!("{YELLOW}│{RESET} {DIM}{reason}{RESET}"));
+                out.push(format!("{YELLOW}│{RESET} {DIM}reason: {reason}{RESET}"));
             }
             out.push(format!(
-                "{YELLOW}└{RESET} {BOLD}y{RESET} run · {BOLD}a{RESET} always · {BOLD}n{RESET}/{BOLD}N{RESET} refuse"
+                "{YELLOW}└{RESET}  {BOLD}[y]{RESET} Approve once   {BOLD}[a]{RESET} Always approve   {BOLD}[n]{RESET} Deny"
             ));
         }
         out
@@ -1023,8 +1109,13 @@ impl<'a> Tui<'a> {
             ApprovalMode::AcceptEdits => YELLOW,
             ApprovalMode::Auto => RED,
         };
+        let scroll_hint = if self.scroll_offset > 0 {
+            format!(" · {CYAN}scroll -{offset}{RESET}", offset = self.scroll_offset)
+        } else {
+            String::new()
+        };
         format!(
-            "{DIM}╰─ {RESET}{mode_color}[{mode}]{RESET}{DIM} shift+tab cycle · ctrl+o {exp} · esc cancel · ctrl+d×2 exit · /help{RESET}",
+            "{DIM}╰─ {RESET}{mode_color}[{mode}]{RESET}{DIM} shift+tab mode · ctrl+o {exp} · pgup/pgdn scroll{scroll_hint} · esc cancel · ctrl+d×2 exit · /help{RESET}",
             exp = if self.expanded { "collapse" } else { "expand" }
         )
     }
@@ -1035,6 +1126,7 @@ impl<'a> Tui<'a> {
         let text = self.input.clone();
         self.input.clear();
         self.cursor = 0;
+        self.scroll_offset = 0;
         if text.is_empty() {
             return;
         }
@@ -1139,11 +1231,38 @@ impl<'a> Tui<'a> {
                     Some(q) => match agent::session::resolve_session(q) {
                         None => self.items.push(Item::Error(format!("no session matches `{q}` (try /sessions)"))),
                         Some((path, msgs)) => {
+                            // Replay is a fork: the resumed transcript becomes a NEW
+                            // session file so the original stays untouched. Tell the
+                            // worker to drop its handle before installing ours, so it
+                            // can't append to the sealed file after this point.
+                            if let Some(tx) = &self.ctl_tx {
+                                let _ = tx.send(Ctl::DropTranscript);
+                            }
+                            let sid = agent::session::new_session_id();
+                            let transcript = agent::session::Transcript::open(&sid, &self.hm.model);
+                            if let Some(t) = &transcript {
+                                for m in &msgs {
+                                    t.push(m);
+                                }
+                            }
+                            self.session = transcript;
                             if let Some(tx) = &self.ctl_tx {
                                 let _ = tx.send(Ctl::Resume(msgs.clone()));
                             }
+                            // Mirror the replayed conversation into the visible scrollback.
+                            for m in &msgs {
+                                match m.role.as_str() {
+                                    "user" => self.items.push(Item::User(m.content.clone())),
+                                    "assistant" => {
+                                        if !m.content.is_empty() {
+                                            self.items.push(Item::Answer(m.content.clone()));
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
                             self.items.push(Item::Info(format!(
-                                "resumed {} message(s) from {}",
+                                "resumed {} message(s) from {} · new session {sid}",
                                 msgs.len(),
                                 path.file_stem().and_then(|s| s.to_str()).unwrap_or("?")
                             )));
@@ -1214,11 +1333,13 @@ impl<'a> Tui<'a> {
                 }
                 self.finalize_tail();
                 self.thinking = false; // a card or the tool row is what's live now
+                self.active_tool_start = Some(std::time::Instant::now());
                 self.items.push(Item::Tool {
                     name,
                     args: args.to_string(),
                     ok: false,
                     denied: false,
+                    duration: None,
                     output: String::new(),
                 });
             }
@@ -1226,12 +1347,14 @@ impl<'a> Tui<'a> {
                 if name == "terminate" {
                     return;
                 }
+                let dur = self.active_tool_start.take().map(|t| t.elapsed());
                 let denied = output.starts_with("denied:") || output.contains("confirmation refused");
                 for it in self.items.iter_mut().rev() {
-                    if let Item::Tool { name: n, ok: o, denied: d, output: out, .. } = it {
+                    if let Item::Tool { name: n, ok: o, denied: d, duration: du, output: out, .. } = it {
                         if n == &name && out.is_empty() {
                             *o = ok;
                             *d = denied;
+                            *du = dur;
                             *out = output;
                             break;
                         }
@@ -1293,6 +1416,7 @@ impl<'a> Tui<'a> {
             for msg in drained {
                 match msg {
                     UiOut::Ev(ev) => self.on_event(ev),
+                    UiOut::Info(s) => self.items.push(Item::Info(s)),
                     UiOut::TurnDone(res) => self.on_turn_done(res),
                     UiOut::Audit(entries) => {
                         for a in entries {
@@ -1407,10 +1531,26 @@ impl<'a> Tui<'a> {
                             self.input.replace_range(self.cursor..self.cursor + next, "");
                         }
                     }
-                    ('\0', 1000) => {
-                        // up: nothing yet (history recall could go here)
+                    ('\0', 1008) => {
+                        // Page Up: scroll conversation back
+                        self.scroll_offset = self.scroll_offset.saturating_add(5);
                     }
-                    ('\0', 1001) => {}
+                    ('\0', 1009) => {
+                        // Page Down: scroll conversation forward towards live
+                        self.scroll_offset = self.scroll_offset.saturating_sub(5);
+                    }
+                    ('\0', 1000) => {
+                        // up arrow: scroll back 1 line if not multiline input
+                        if !self.input.contains('\n') && self.input.is_empty() {
+                            self.scroll_offset = self.scroll_offset.saturating_add(1);
+                        }
+                    }
+                    ('\0', 1001) => {
+                        // down arrow: scroll forward 1 line if not multiline input
+                        if !self.input.contains('\n') && self.input.is_empty() {
+                            self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                        }
+                    }
                     ('\0', 1002) => {
                         if self.cursor < self.input.len() {
                             let next = self.input[self.cursor..].chars().next().map(|c| c.len_utf8()).unwrap_or(0);

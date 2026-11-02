@@ -9,6 +9,7 @@
 //! same chain the offline ScriptedModel tests exercise. Model backend is an
 //! OpenAI-compatible gateway (OmniRoute on loopback by default; ONYX_BASE_URL).
 
+mod markdown;
 mod tui;
 
 use agent::model::{omniroute_config, HttpModel};
