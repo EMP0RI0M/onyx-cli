@@ -697,6 +697,89 @@ fn pretty_args(name: &str, args: &str) -> String {
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+// ------------------------------------------------------ number/base radii ----
+// Clean-room byte encoders for the /hex converter. No external crate: hex,
+// binary and base64 are each a few lines of bit-shuffling over &[u8].
+
+/// Uppercase hex bytes separated by single spaces — `b"ONYX"` → `"4F 4E 59 58"`.
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    const D: &[u8; 16] = b"0123456789ABCDEF";
+    let mut s = String::with_capacity(bytes.len() * 3);
+    for (i, &b) in bytes.iter().enumerate() {
+        if i > 0 {
+            s.push(' ');
+        }
+        s.push(D[(b >> 4) as usize] as char);
+        s.push(D[(b & 0xF) as usize] as char);
+    }
+    s
+}
+
+/// Eight-bit binary strings separated by spaces — `b'O'` → `"01001111"`.
+fn bytes_to_bin(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| format!("{b:08b}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Space-separated decimal byte values — `b"ONYX"` → `"79 78 89 88"`.
+fn bytes_to_dec(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| b.to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Standard base64 with `=` padding.
+fn bytes_to_b64(bytes: &[u8]) -> String {
+    const TBL: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TBL[(n >> 18) as usize & 63] as char);
+        out.push(TBL[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { TBL[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TBL[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+/// Decode a whitespace-separated list of radix numbers into bytes. `radix` is
+/// 2 or 16; an optional `0x`/`0b` prefix per token is tolerated. Errors name the
+/// offending token so the caller can report it.
+fn parse_bytes(text: &str, radix: u32) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    for tok in text.split_whitespace() {
+        let cleaned = match radix {
+            16 => tok.strip_prefix("0x").or_else(|| tok.strip_prefix("0X")).unwrap_or(tok),
+            2 => tok.strip_prefix("0b").or_else(|| tok.strip_prefix("0B")).unwrap_or(tok),
+            _ => tok,
+        };
+        let v = u32::from_str_radix(cleaned, radix)
+            .map_err(|_| format!("invalid {radix}-radix byte `{tok}`"))?;
+        if v > 255 {
+            return Err(format!("byte `{tok}` exceeds 0xFF"));
+        }
+        out.push(v as u8);
+    }
+    if out.is_empty() {
+        return Err("no bytes to decode".into());
+    }
+    Ok(out)
+}
+
+/// Render one labelled line inside the framed transcript, dimming the label.
+fn conv_line(label: &str, value: &str) -> String {
+    format!("{FG_245}{label:>8}{RESET}  {value}")
+}
+
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "commands + keys"),
     ("/model", "[name] show/set model"),
@@ -708,6 +791,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/audit", "gateway audit log"),
     ("/tools", "list connected tools"),
     ("/skill", "<name> load a skill from ~/.onyx/skills"),
+    ("/hex", "<text|-d hex|-b bin|-n dec> base converter"),
     ("/sessions", "list saved transcripts"),
     ("/resume", "<id|prefix> replay a transcript"),
     ("/mode", "cycle approval mode (Normal, Edits, YOLO)"),
@@ -1874,6 +1958,20 @@ impl<'a> Tui<'a> {
         }
     }
 
+    /// Render a byte slice as the full ASCII/hex/binary/decimal/base64 card.
+    fn emit_conversion(&mut self, bytes: &[u8]) {
+        let ascii = String::from_utf8_lossy(bytes);
+        let printable = bytes.iter().all(|&b| b.is_ascii_graphic() || b == b' ');
+        let sum: u16 = bytes.iter().fold(0u16, |a, &b| a + b as u16) & 0xFF;
+        self.items.push(Item::Info(conv_line("ASCII", if printable { &ascii } else { "(non-printable)" })));
+        self.items.push(Item::Info(conv_line("HEX", &bytes_to_hex(bytes))));
+        self.items.push(Item::Info(conv_line("BINARY", &bytes_to_bin(bytes))));
+        self.items.push(Item::Info(conv_line("DECIMAL", &bytes_to_dec(bytes))));
+        self.items.push(Item::Info(conv_line("BASE64", &bytes_to_b64(bytes))));
+        self.items.push(Item::Info(conv_line("LEN", &format!("{} byte(s)", bytes.len()))));
+        self.items.push(Item::Info(conv_line("SUM", &format!("{sum:02X}"))));
+    }
+
     fn slash(&mut self, line: &str) {
         let mut it = line.split_whitespace();
         let cmd = it.next().unwrap_or("");
@@ -2053,9 +2151,45 @@ impl<'a> Tui<'a> {
                     },
                 }
             }
+            "/hex" => {
+                // Rest of the line is the payload (may contain spaces).
+                let rest = line.trim_start_matches("/hex").trim();
+                if rest.is_empty() {
+                    self.items.push(Item::Info(
+                        "usage: /hex <text>          → hex/binary/decimal/base64".into(),
+                    ));
+                    self.items.push(Item::Info(
+                        "       /hex -d <hex bytes>   → ascii  (-b/-n for binary/decimal)".into(),
+                    ));
+                } else if let Some(payload) =
+                    rest.strip_prefix("-d ").or_else(|| rest.strip_prefix("--decode ")).map(|s| s.trim())
+                {
+                    match parse_bytes(payload, 16) {
+                        Ok(bytes) => self.emit_conversion(&bytes),
+                        Err(e) => self.items.push(Item::Error(format!("hex decode: {e}"))),
+                    }
+                } else if let Some(payload) =
+                    rest.strip_prefix("-b ").or_else(|| rest.strip_prefix("--bits ")).map(|s| s.trim())
+                {
+                    match parse_bytes(payload, 2) {
+                        Ok(bytes) => self.emit_conversion(&bytes),
+                        Err(e) => self.items.push(Item::Error(format!("binary decode: {e}"))),
+                    }
+                } else if let Some(payload) =
+                    rest.strip_prefix("-n ").or_else(|| rest.strip_prefix("--dec ")).map(|s| s.trim())
+                {
+                    match payload.split_whitespace().map(|t| t.parse::<u8>()).collect::<Result<Vec<_>, _>>()
+                    {
+                        Ok(bytes) => self.emit_conversion(&bytes),
+                        Err(_) => self.items.push(Item::Error("decimal decode: expected byte values 0-255".into())),
+                    }
+                } else {
+                    self.emit_conversion(rest.as_bytes());
+                }
+            }
             "/help" => {
                 self.items.push(Item::Info(
-                    "commands: /model /steps /clear /usage /audit /tools /skill /sessions /resume /mode /exit".into(),
+                    "commands: /model /steps /clear /usage /audit /tools /skill /hex /sessions /resume /mode /exit".into(),
                 ));
                 self.items.push(Item::Info(
                     "keys: enter send · alt+enter newline · shift+tab mode · ctrl+o expand · esc cancel · ctrl+d×2 exit".into(),
