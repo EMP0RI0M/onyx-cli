@@ -139,7 +139,7 @@ fn ansi_width(s: &str) -> usize {
     let mut esc = false;
     for c in s.chars() {
         if esc {
-            if c.is_ascii_alphabetic() {
+            if c.is_ascii_alphabetic() || c == 'm' {
                 esc = false;
             }
             continue;
@@ -151,6 +151,14 @@ fn ansi_width(s: &str) -> usize {
         w += char_width(c);
     }
     w
+}
+
+/// Shopify cli-ui style horizontal framing rule:
+/// `── title ────────────────────────────────────`
+fn frame_header(title: &str, width: usize, border_color: &str) -> String {
+    let vis = ansi_width(title);
+    let rem = width.saturating_sub(vis + 4).max(2);
+    format!("{border_color}──{RESET} {title} {border_color}{}{RESET}", "─".repeat(rem))
 }
 
 /// Hard-wrap one line at exactly `width` visible cells, preserving embedded ANSI escape sequences.
@@ -386,6 +394,7 @@ enum Item {
 enum Ctl {
     Prompt(String, usize),
     Clear(String),
+    Resume(Vec<Message>),
     SetModel(String),
     SystemAppend(String),
     Audit,
@@ -544,6 +553,8 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/audit", "gateway audit log"),
     ("/tools", "list connected tools"),
     ("/skill", "<name> load a skill"),
+    ("/sessions", "list saved transcripts"),
+    ("/resume", "<id|prefix> replay a transcript"),
     ("/mode", "cycle approval mode"),
     ("/exit", "quit"),
 ];
@@ -586,6 +597,7 @@ pub struct Tui<'a> {
     quit: bool,
     height: usize,
     width: usize,
+    session: Option<agent::session::Transcript>,
 }
 
 
@@ -619,6 +631,7 @@ impl<'a> Tui<'a> {
             quit: false,
             height: term_size().0.max(4) as usize,
             width: term_size().1.max(20) as usize,
+            session: None,
         }
     }
 
@@ -644,6 +657,16 @@ impl<'a> Tui<'a> {
         self.ui_rx = Some(ur);
         self.ctl_tx = Some(ct);
 
+        // Open a durable transcript for this run so `/resume` can replay it later.
+        // Best-effort: if persistence fails we simply run without it.
+        let sid = agent::session::new_session_id();
+        let transcript = agent::session::Transcript::open(&sid, &self.hm.model);
+        if let Some(t) = &transcript {
+            self.items.push(Item::Info(format!("session {sid} · {}", t.path().display())));
+        }
+        self.session = transcript;
+        let transcript = self.session.take(); // move into the worker below
+
         // The loop needs &Gateway + &mut HttpModel + history + opts together;
         // they live in tui_session's frame for the whole session and the worker
         // is joined before anything can touch them again. Bundle them behind a
@@ -664,6 +687,7 @@ impl<'a> Tui<'a> {
             let hm: &mut HttpModel = unsafe { &mut *job.hm };
             let mut history: Vec<Message> = *job.history;
             let _opts: &Opts = unsafe { &*job.opts };
+            let transcript = transcript;
 
             // Approver runs ON the worker thread (it blocks on AskCtl). It may
             // only touch Sync state — AskCtl is enough: the main thread renders
@@ -677,6 +701,9 @@ impl<'a> Tui<'a> {
                     Ctl::Prompt(prompt, max_steps) => {
                         *cancel.lock().unwrap() = false;
                         let cut = history.len();
+                        if let Some(t) = &transcript {
+                            t.push(&Message::text("user", &prompt));
+                        }
                         let mut agent = ToolCallAgent::new(gw);
                         agent.max_steps = max_steps;
                         let mut sink = |ev: AgentEvent| {
@@ -686,6 +713,11 @@ impl<'a> Tui<'a> {
                         if *cancel.lock().unwrap() {
                             // Drop everything this cancelled turn appended.
                             history.truncate(cut);
+                        } else if let Some(t) = &transcript {
+                            // Persist the assistant/tool messages this turn added.
+                            for m in &history[cut..] {
+                                t.push(m);
+                            }
                         }
                         let audit = gw.audit.snapshot();
                         let _ = ut.send(UiOut::TurnDone(match res {
@@ -695,6 +727,9 @@ impl<'a> Tui<'a> {
                     }
                     Ctl::Clear(system) => {
                         history = vec![Message::text("system", system)];
+                    }
+                    Ctl::Resume(msgs) => {
+                        history = msgs;
                     }
                     Ctl::SetModel(m) => {
                         hm.model = m;
@@ -830,13 +865,14 @@ impl<'a> Tui<'a> {
     }
 
     fn item_lines(&self, it: &Item) -> Vec<String> {
+        let w = self.width.max(20);
         match it {
-            Item::Banner => vec![format!(
-                "{BOLD}{CYAN}◆ onyx{RESET} {DIM}v0.1.0{RESET}"
-            )],
+            Item::Banner => vec![
+                frame_header(&format!("{BOLD}onyx{RESET} {DIM}v0.1.0{RESET}"), w, CYAN),
+            ],
             Item::User(t) => {
                 let mut out = Vec::new();
-                for (i, l) in fit_lines(t, self.width.max(20)).into_iter().enumerate() {
+                for (i, l) in fit_lines(t, w).into_iter().enumerate() {
                     let mark = if i == 0 { "❯" } else { " " };
                     out.push(format!("{CYAN}{mark} {l}{RESET}"));
                 }
@@ -846,71 +882,71 @@ impl<'a> Tui<'a> {
                 if name == "terminate" {
                     return Vec::new();
                 }
-                let marker = if *denied {
-                    format!("{RED}✗{RESET}")
+                let (marker, border) = if *denied {
+                    (format!("{RED}✗{RESET}"), RED)
                 } else if *ok {
-                    format!("{GREEN}⏺{RESET}")
+                    (format!("{GREEN}✓{RESET}"), FG_245)
                 } else {
-                    format!("{YELLOW}⏺{RESET}")
+                    (format!("{YELLOW}⠋{RESET}"), YELLOW)
                 };
-                let mut out = vec![format!(
-                    "{marker} {BOLD}{name}{RESET} {DIM}{a}{RESET}",
-                    a = pretty_args(name, args)
-                )];
+                let title = format!("{marker} {BOLD}{name}{RESET} {DIM}{a}{RESET}", a = pretty_args(name, args));
+                let mut out = vec![title];
                 if self.expanded && !output.is_empty() {
                     let mut olines: Vec<String> = Vec::new();
                     for ol in output.lines().take(24) {
-                        olines.extend(fit_lines(ol, self.width.max(20)));
+                        olines.extend(fit_lines(ol, w.saturating_sub(4).max(10)));
                     }
                     if output.lines().count() > 24 {
                         olines.push("…".into());
                     }
                     for ol in olines {
-                        out.push(format!("{FG_245}  │ {ol}{RESET}"));
+                        out.push(format!("{border}  │{RESET} {FG_250}{ol}{RESET}"));
                     }
+                    out.push(format!("{border}  └────{RESET}"));
                 } else if !self.expanded && !output.is_empty() {
                     let extra = output.lines().count().saturating_sub(1);
                     if extra > 0 {
-                        out.push(format!("{DIM}<output +{extra} lines> {FG_245}(ctrl+o to expand){RESET}"));
+                        out.push(format!("{DIM}  └ <output +{extra} lines> (ctrl+o to expand){RESET}"));
                     } else {
-                        out.push(format!("{DIM}│ {} {FG_245}(ctrl+o to expand){RESET}", clip_chars(first_line(output), 70)));
+                        out.push(format!("{DIM}  └ {} (ctrl+o to expand){RESET}", clip_chars(first_line(output), 70)));
                     }
                 }
                 out
             }
             Item::Answer(t) => {
                 let clean = clean_model_text(t);
-                let mut out = vec![format!("{BOLD}◆ onyx{RESET}")];
-                let wrap_w = self.width.saturating_sub(4).max(20);
+                let mut out = vec![format!("{CYAN}◆{RESET} {BOLD}onyx{RESET}")];
+                let wrap_w = w.saturating_sub(4).max(20);
                 for para in clean.split('\n') {
-                    for w in wrap(para, wrap_w) {
-                        out.push(format!("{FG_250}  {w}{RESET}"));
+                    for pw in wrap(para, wrap_w) {
+                        out.push(format!("  {FG_250}{pw}{RESET}"));
                     }
                 }
                 out
             }
-            Item::Info(t) => fit_lines(t, self.width.max(20))
+            Item::Info(t) => fit_lines(t, w)
                 .into_iter()
-                .map(|l| format!("{FG_245}{l}{RESET}"))
+                .map(|l| format!("{BLUE}ℹ{RESET} {FG_245}{l}{RESET}"))
                 .collect(),
-            Item::Error(t) => fit_lines(t, self.width.max(20))
+            Item::Error(t) => fit_lines(t, w)
                 .into_iter()
-                .map(|l| format!("{RED}{l}{RESET}"))
+                .map(|l| format!("{RED}✗{RESET} {RED}{l}{RESET}"))
                 .collect(),
         }
     }
 
     fn status_lines_v(&self) -> Vec<String> {
         let mut out = Vec::new();
+        let w = self.width.max(20);
         if let Some((tool, args, reason)) = self.ask.pending() {
-            out.push(format!(
-                "{YELLOW}┌ permission needed ─────────────────────────────{RESET}"
-            ));
+            out.push(frame_header(&format!("{YELLOW}⚠ permission needed{RESET}"), w, YELLOW));
             out.push(format!(
                 "{YELLOW}│{RESET} {BOLD}{tool}{RESET} {DIM}{a}{RESET}",
                 a = pretty_args(&tool, &args)
             ));
-            out.push(format!("{YELLOW}│{RESET} {DIM}{reason}{RESET}"));
+            if !reason.is_empty() {
+                out.push(format!("{YELLOW}│{RESET} {DIM}{reason}{RESET}"));
+            }
             out.push(format!(
                 "{YELLOW}└{RESET} {BOLD}y{RESET} run · {BOLD}a{RESET} always · {BOLD}n{RESET}/{BOLD}N{RESET} refuse"
             ));
@@ -1081,9 +1117,43 @@ impl<'a> Tui<'a> {
                     self.items.push(Item::Info("usage: /skill <name>".into()));
                 }
             }
+            "/sessions" => {
+                let list = agent::session::list_sessions(12);
+                if list.is_empty() {
+                    self.items.push(Item::Info("no saved sessions yet".into()));
+                }
+                for s in list {
+                    let pv = if s.preview.is_empty() { "(no prompt)".to_string() } else { s.preview };
+                    self.items.push(Item::Info(format!(
+                        "  {} · {} msg · {}",
+                        s.id,
+                        s.messages,
+                        pv
+                    )));
+                }
+                self.items.push(Item::Info("/resume <id|prefix> to replay one".into()));
+            }
+            "/resume" => {
+                match arg {
+                    None => self.items.push(Item::Info("usage: /resume <id|prefix>  (see /sessions)".into())),
+                    Some(q) => match agent::session::resolve_session(q) {
+                        None => self.items.push(Item::Error(format!("no session matches `{q}` (try /sessions)"))),
+                        Some((path, msgs)) => {
+                            if let Some(tx) = &self.ctl_tx {
+                                let _ = tx.send(Ctl::Resume(msgs.clone()));
+                            }
+                            self.items.push(Item::Info(format!(
+                                "resumed {} message(s) from {}",
+                                msgs.len(),
+                                path.file_stem().and_then(|s| s.to_str()).unwrap_or("?")
+                            )));
+                        }
+                    },
+                }
+            }
             "/help" => {
                 self.items.push(Item::Info(
-                    "commands: /model /steps /clear /usage /audit /tools /skill /mode /exit".into(),
+                    "commands: /model /steps /clear /usage /audit /tools /skill /sessions /resume /mode /exit".into(),
                 ));
                 self.items.push(Item::Info(
                     "keys: enter send · alt+enter newline · shift+tab mode · ctrl+o expand · esc cancel · ctrl+d×2 exit".into(),

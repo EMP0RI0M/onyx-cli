@@ -7,6 +7,7 @@
 //! loop is testable with zero network and zero secrets.
 
 pub mod model;
+pub mod session;
 
 use serde_json::Value;
 use std::collections::VecDeque;
