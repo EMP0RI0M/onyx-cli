@@ -40,21 +40,27 @@ use std::time::Duration;
 use tools::audit::{Approval, ApprovalMode, AuditEntry, Gateway};
 use crate::markdown::render_markdown;
 
-// ---------------------------------------------------------------- ANSI/TTY & Ratatui Theme ----
+// ---------------------------------------------------------------- Premium Dark Theme (Hex/TrueColor with ANSI fallback) ----
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
-const FG_240: &str = "\x1b[38;5;240m";
-const FG_245: &str = "\x1b[38;5;245m";
-const FG_250: &str = "\x1b[38;5;250m";
-const GREEN: &str = "\x1b[38;5;42m";     // Clean jade green for success
-const RED: &str = "\x1b[38;5;196m";      // Crisp crimson for errors/denials
-const YELLOW: &str = "\x1b[38;5;214m";   // Amber for warnings/approval
-const BLUE: &str = "\x1b[38;5;75m";      // Subtle slate blue for info
-const CYAN: &str = "\x1b[38;5;51m";      // Electric cyan for primary accents
-const TRACK_COLOR: &str = "\x1b[38;5;237m"; // Unicode scrollbar track
-const THUMB_COLOR: &str = "\x1b[38;5;246m"; // Unicode scrollbar thumb
+
+// Premium Dark Workstation Colors (#00E5FF, #F1F5F9, #89939F, #252B35, #20D99A, #FF647C, #FFCA68)
+const CYAN: &str = "\x1b[38;2;0;229;255m";       // Primary cyan #00E5FF
+const FG_MAIN: &str = "\x1b[38;2;241;245;249m";  // Main text #F1F5F9
+const FG_SEC: &str = "\x1b[38;2;137;147;159m";   // Secondary text #89939F
+const BORDER: &str = "\x1b[38;2;37;43;53m";      // Borders #252B35
+const GREEN: &str = "\x1b[38;2;32;217;154m";     // Success #20D99A
+const RED: &str = "\x1b[38;2;255;100;124m";      // Error #FF647C
+const YELLOW: &str = "\x1b[38;2;255;202;104m";   // Warning #FFCA68
+const BLUE: &str = "\x1b[38;2;56;189;248m";      // Sky blue for informational highlights
+
+const FG_240: &str = "\x1b[38;2;37;43;53m";      // Map legacy border references to #252B35
+const FG_245: &str = "\x1b[38;2;137;147;159m";   // Map legacy secondary text to #89939F
+const FG_250: &str = "\x1b[38;2;241;245;249m";   // Map legacy main text to #F1F5F9
+const TRACK_COLOR: &str = "\x1b[38;2;37;43;53m"; // Scrollbar track #252B35
+const THUMB_COLOR: &str = "\x1b[38;2;0;229;255m"; // Scrollbar thumb Cyan #00E5FF
 
 // Unicode glyphs modelled directly on Grok Build's ratatui-pager glyph engine
 #[allow(dead_code)]
@@ -1084,7 +1090,7 @@ impl<'a> Tui<'a> {
     /// regardless of where the previous frame landed.
     fn draw(&mut self) {
         self.sync_size();
-        let (lines, framed_row) = self.render_lines();
+        let (lines, _framed_row) = self.render_lines();
         let mut out = String::new();
         // Hide cursor during paint, home to (1,1) without clearing, overwrite every row to eliminate flicker
         out.push_str("\x1b[?25l");
@@ -1096,14 +1102,12 @@ impl<'a> Tui<'a> {
         }
         out.push_str("\x1b[J"); // clear any remaining rows below frame
 
-        // Park the caret on the composer's text row. The framed layout reports the
-        // exact row; the compact fallback pins it to the second-from-last line.
+        // Park the caret on the composer's input text row (❯ ...)
         if self.height >= 4 {
-            let cursor_row = framed_row.unwrap_or(self.height.saturating_sub(2));
-            // Framed: `│ ❯ ` = 4 cells before the glyph → col 5. Compact: "*  " → col 4.
-            let lead = if framed_row.is_some() { 5 } else { 4 };
-            let col = (lead + self.cursor_chars()).min(self.width.max(1));
-            out.push_str(&format!("\x1b[{};{}H", cursor_row + 1, col));
+            let slash_len = self.slash_dropdown_lines().len();
+            let cursor_row = self.height.saturating_sub(2 + slash_len);
+            let col = (5 + self.cursor_chars()).min(self.width.max(1));
+            out.push_str(&format!("\x1b[{};{}H", cursor_row, col));
         }
         out.push_str("\x1b[?25h"); // unhide cursor
         io::stdout().write_all(out.as_bytes()).ok();
@@ -1111,12 +1115,7 @@ impl<'a> Tui<'a> {
     }
 
     fn render_lines(&self) -> (Vec<String>, Option<usize>) {
-        if self.frame_fits() {
-            let (lines, row) = self.render_framed();
-            (lines, Some(row))
-        } else {
-            (self.render_compact(), None)
-        }
+        (self.render_compact(), None)
     }
 
     /// Compact fallback for small terminals: banner header + scrolling transcript
@@ -1426,106 +1425,156 @@ impl<'a> Tui<'a> {
         match it {
             Item::Banner => {
                 let logo_rows = [
-                    "██████╗ ███╗   ██╗██╗   ██╗██╗  ██╗",
-                    "██╔═══██╗████╗  ██║╚██╗ ██╔╝╚██╗██╔╝",
-                    "██║   ██║██╔██╗ ██║ ╚████╔╝  ╚███╔╝ ",
-                    "██║   ██║██║╚██╗██║  ╚██╔╝   ██╔██╗ ",
-                    "╚██████╔╝██║ ╚████║   ██║   ██╔╝ ██╗",
-                    " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝  ╚═╝",
+                    "███╗   ██╗ ██████╗ ███╗   ██╗",
+                    "████╗  ██║██╔═══██╗████╗  ██║",
+                    "██╔██╗ ██║██║   ██║██╔██╗ ██║",
+                    "██║╚██╗██║██║   ██║██║╚██╗██║",
+                    "██║ ╚████║╚██████╔╝██║ ╚████║",
+                    "╚═╝  ╚═══╝ ╚═════╝ ╚═╝  ╚═══╝",
                 ];
 
-                let _card_w = 37;
-                let c_top = format!("{FG_240}╭─ What's new (v0.1.0): ────────────╮{RESET}");
-                let c_l1  = format!("{FG_240}│{RESET} - Full Grok Tools architecture    {FG_240}│{RESET}");
-                let c_l2  = format!("{FG_240}│{RESET} - Interactive dropdowns & resume   {FG_240}│{RESET}");
-                let c_l3  = format!("{FG_240}│{RESET} - Subagents & Plan Mode            {FG_240}│{RESET}");
-                let c_l4  = format!("{FG_240}│{RESET} - /effort, /usage, /settings       {FG_240}│{RESET}");
-                let c_bot = format!("{FG_240}╰───────────────────────────────────╯{RESET}");
-                let cards = [&c_top, &c_l1, &c_l2, &c_l3, &c_l4, &c_bot];
+                let (filled, empty, pct) = self.ctx_meter(18);
+                let ctx_bar = format!("{CYAN}{}{RESET}{DIM}{}{RESET} {:>3}%", "█".repeat(filled), "░".repeat(empty), pct);
 
-                if w >= 76 {
-                    let pad = |left: &str, target: usize| {
-                        let vis = ansi_width(left);
-                        let sp = target.saturating_sub(vis);
-                        format!("{left}{}", " ".repeat(sp))
-                    };
-                    let col1_w = 38;
-                    let mut lines = Vec::new();
-                    for (i, row) in logo_rows.iter().enumerate() {
-                        let styled_logo = format!("{CYAN}{row}{RESET}");
-                        lines.push(format!("{} {}", pad(&styled_logo, col1_w), cards[i]));
-                    }
-                    lines.push(format!("{DIM}{arrow} model: {BOLD}{}{RESET}{DIM} · session: {} · dir: {FG_245}{}{RESET}", self.hm.model, self.session_label(), self.workspace_dir, arrow = glyphs::CHEVRON));
-                    lines.push(format!("{FG_240}{}{RESET}", "─".repeat(w)));
-                    lines
+                let id_str = if self.session_label().len() > 16 {
+                    format!("…{}", &self.session_label()[self.session_label().len().saturating_sub(14)..])
                 } else {
-                    let mut lines: Vec<String> = logo_rows.iter().map(|r| format!("{CYAN}{r}{RESET}")).collect();
-                    lines.push(format!("{DIM}model: {}{RESET}", self.hm.model));
-                    lines.push(format!("{FG_240}{}{RESET}", "─".repeat(w)));
-                    lines
+                    self.session_label()
+                };
+
+                let mut lines = Vec::new();
+
+                // Centered ONYX Header
+                for row in logo_rows {
+                    lines.push(center_pad(&format!("{CYAN}{row}{RESET}"), w));
                 }
+                lines.push(center_pad(&format!("{BOLD}{FG_MAIN}INTELLIGENCE ENGINE{RESET}"), w));
+                lines.push(center_pad(&format!("{BORDER}━━━━━━━━━━━━━━━━━━━━━━━{RESET}"), w));
+                lines.push(String::new());
+
+                // SESSION Card
+                let card_w = w.saturating_sub(6).min(46).max(28);
+                let inner_c = card_w.saturating_sub(2);
+                lines.push(format!("  {CYAN}◈{RESET} {BOLD}{FG_MAIN}ONYX{RESET}  {DIM}/{RESET}  {BOLD}{FG_SEC}SESSION{RESET}"));
+                lines.push(format!("  {BORDER}┌{}┐{RESET}", "─".repeat(inner_c)));
+                
+                let row_fmt = |label: &str, val: &str| {
+                    let text = format!("  {BORDER}│{RESET} {BOLD}{FG_MAIN}{:<8}{RESET} {val}", label);
+                    let pad = (card_w + 2).saturating_sub(ansi_width(&text) + 1);
+                    format!("{}{BORDER}│{RESET}", text + &" ".repeat(pad))
+                };
+
+                lines.push(row_fmt("ID", &format!("{FG_SEC}{id_str}{RESET}")));
+                lines.push(row_fmt("DIR", &format!("{FG_SEC}{}{RESET}", self.workspace_dir)));
+                lines.push(row_fmt("MODEL", &format!("{CYAN}{}{RESET}", self.hm.model)));
+                lines.push(row_fmt("STATUS", &format!("{GREEN}●{RESET} {BOLD}{GREEN}ONLINE{RESET}")));
+                lines.push(row_fmt("CONTEXT", &ctx_bar));
+                lines.push(format!("  {BORDER}└{}┘{RESET}", "─".repeat(inner_c)));
+                lines.push(String::new());
+
+                // CONVERSATION Divider
+                let conv_sep = format!("  {BORDER}── {BOLD}{FG_SEC}CONVERSATION{RESET} {BORDER}{}{RESET}", "─".repeat(w.saturating_sub(20).max(4)));
+                lines.push(conv_sep);
+                lines
             }
             Item::User(t) => {
                 let mut out = Vec::new();
-                for (i, l) in fit_lines(t, w).into_iter().enumerate() {
-                    let mark = if i == 0 { glyphs::PROMPT_ARROW.trim_end() } else { " " };
-                    out.push(format!("{CYAN}{mark} {l}{RESET}"));
+                out.push(String::new());
+                for (i, l) in fit_lines(t, w.saturating_sub(4)).into_iter().enumerate() {
+                    let mark = if i == 0 { format!("{CYAN}❯{RESET}") } else { " ".to_string() };
+                    out.push(format!("  {mark} {BOLD}{FG_MAIN}{l}{RESET}"));
                 }
+                out.push(String::new());
                 out
             }
             Item::Tool { name, args, ok, denied, duration, output } => {
                 if name == "terminate" || name == "ask_human" {
                     return Vec::new();
                 }
-                let (marker, border) = if *denied {
-                    (format!("{RED}{}{RESET}", glyphs::BALLOT_X), RED)
+                let mut out = Vec::new();
+                out.push(format!("  {CYAN}◈{RESET} {BOLD}{FG_MAIN}ONYX{RESET}"));
+
+                let card_w = w.saturating_sub(6).min(58).max(30);
+                let inner_c = card_w.saturating_sub(2);
+                let (border_color, status_icon, status_label) = if *denied {
+                    (RED, format!("{RED}✗{RESET}"), "Denied by policy")
                 } else if *ok {
-                    (format!("{GREEN}{}{RESET}", glyphs::CHECK_MARK), FG_245)
+                    (GREEN, format!("{GREEN}✓{RESET}"), "Executed successfully")
                 } else {
-                    (format!("{YELLOW}⠋{RESET}"), YELLOW)
+                    (YELLOW, format!("{YELLOW}⠋{RESET}"), "Executing your request...")
                 };
+
                 let dur_str = match duration {
-                    Some(d) => format!(" {DIM}({:.1}s){RESET}", d.as_secs_f32()),
+                    Some(d) => format!(" ({:.2}s)", d.as_secs_f32()),
                     None => String::new(),
                 };
-                let title = format!("{marker} {BOLD}{name}{RESET} {DIM}{a}{RESET}{dur_str}", a = pretty_args(name, args));
-                let mut out = vec![title];
-                if self.expanded && !output.is_empty() {
-                    let mut olines: Vec<String> = Vec::new();
-                    for ol in output.lines().take(24) {
-                        olines.extend(fit_lines(ol, w.saturating_sub(4).max(10)));
-                    }
-                    if output.lines().count() > 24 {
-                        olines.push("…".into());
-                    }
-                    for ol in olines {
-                        out.push(format!("{border}  {} {FG_250}{ol}{RESET}", glyphs::TRACK_CHAR));
-                    }
-                    out.push(format!("{border}  └────{RESET}"));
-                } else if !self.expanded && !output.is_empty() {
-                    let extra = output.lines().count().saturating_sub(1);
-                    if extra > 0 {
-                        out.push(format!("{DIM}  └ <output +{extra} lines> (ctrl+o to expand){RESET}"));
+
+                out.push(format!("  {border_color}┌{}┐{RESET}", "─".repeat(inner_c)));
+                
+                let line_in_card = |content: &str, border_c: &str| {
+                    let vis = ansi_width(content);
+                    let pad = inner_c.saturating_sub(vis + 1);
+                    format!("  {border_c}│{RESET} {content}{}{border_c}│{RESET}", " ".repeat(pad))
+                };
+
+                out.push(line_in_card(&format!("{BOLD}{status_label}{dur_str}{RESET}"), border_color));
+                out.push(line_in_card("", border_color));
+                out.push(line_in_card(&format!("{status_icon} {BOLD}{name}{RESET} {DIM}{}{RESET}", pretty_args(name, args)), border_color));
+
+                if !output.is_empty() {
+                    if self.expanded {
+                        out.push(line_in_card("", border_color));
+                        out.push(line_in_card(&format!("{DIM}Output:{RESET}"), border_color));
+                        for ol in output.lines().take(12) {
+                            let clipped = clip_chars(ol, inner_c.saturating_sub(4));
+                            out.push(line_in_card(&format!("{FG_SEC}{clipped}{RESET}"), border_color));
+                        }
+                        if output.lines().count() > 12 {
+                            out.push(line_in_card(&format!("{DIM}… (more lines hidden){RESET}"), border_color));
+                        }
                     } else {
-                        out.push(format!("{DIM}  └ {} (ctrl+o to expand){RESET}", clip_chars(first_line(output), 70)));
+                        let lines_cnt = output.lines().count();
+                        out.push(line_in_card(&format!("{DIM}└ <{lines_cnt} lines output · ctrl+o to toggle>{RESET}"), border_color));
                     }
                 }
+
+                out.push(format!("  {border_color}└{}┘{RESET}", "─".repeat(inner_c)));
                 out
             }
             Item::Answer(t) => {
                 let clean = clean_model_text(t);
-                let mut out = vec![format!("{CYAN}{}{RESET} {BOLD}onyx{RESET}", glyphs::DIAMOND_FILLED)];
-                out.extend(render_markdown(&clean, w));
+                let mut out = vec![format!("  {CYAN}◈{RESET} {BOLD}{FG_MAIN}ONYX{RESET}")];
+                for l in render_markdown(&clean, w.saturating_sub(6)) {
+                    out.push(format!("  {l}"));
+                }
                 out
             }
-            Item::Info(t) => fit_lines(t, w)
+            Item::Info(t) => fit_lines(t, w.saturating_sub(4))
                 .into_iter()
-                .map(|l| format!("{BLUE}ℹ{RESET} {FG_245}{l}{RESET}"))
+                .map(|l| format!("  {BLUE}ℹ{RESET} {FG_SEC}{l}{RESET}"))
                 .collect(),
-            Item::Error(t) => fit_lines(t, w)
-                .into_iter()
-                .map(|l| format!("{RED}✗{RESET} {RED}{l}{RESET}"))
-                .collect(),
+            Item::Error(t) => {
+                let mut out = Vec::new();
+                let card_w = w.saturating_sub(6).min(64).max(30);
+                let inner_c = card_w.saturating_sub(2);
+                out.push(format!("  {RED}┌{}┐{RESET}", "─".repeat(inner_c)));
+                
+                let line_in_err = |content: &str| {
+                    let vis = ansi_width(content);
+                    let pad = inner_c.saturating_sub(vis + 1);
+                    format!("  {RED}│{RESET} {content}{}{RED}│{RESET}", " ".repeat(pad))
+                };
+
+                out.push(line_in_err(&format!("{BOLD}{RED}✗ ERROR ENCOUNTERED{RESET}")));
+                out.push(line_in_err(""));
+                for l in fit_lines(t, inner_c.saturating_sub(3)) {
+                    out.push(line_in_err(&format!("{FG_MAIN}{l}{RESET}")));
+                }
+                out.push(line_in_err(""));
+                out.push(line_in_err(&format!("{YELLOW}Recovery suggestion:{RESET} {FG_SEC}Check permissions, network, or /help{RESET}")));
+                out.push(format!("  {RED}└{}┘{RESET}", "─".repeat(inner_c)));
+                out
+            }
         }
     }
 
@@ -1555,24 +1604,27 @@ impl<'a> Tui<'a> {
 
     fn input_lines(&self) -> Vec<String> {
         let mut out = Vec::new();
+        let w = self.width.max(20);
         let sug = self.suggestion();
+
+        // ── COMPOSER divider ──
+        out.push(format!("  {BORDER}── {BOLD}{FG_SEC}COMPOSER{RESET} {BORDER}{}{RESET}", "─".repeat(w.saturating_sub(16).max(4))));
+
         if !sug.is_empty() && self.input.starts_with('/') {
-            // Suggestions can be long; keep the row inside the viewport so it
-            // never soft-wraps (caret column math assumes one row per line).
-            out.push(format!("{DIM}{sug}{RESET}"));
+            out.push(format!("    {DIM}{sug}{RESET}"));
         }
         let body = if self.input.is_empty() && sug.is_empty() {
-            format!("{DIM}Type your message or @path/to/file{RESET}")
-        } else if self.cursor_chars() + 2 >= self.width || self.input.contains('\n') {
-            // Long input scrolls a one-row window around the caret instead of
-            // wrapping (a wrapped row would break the fixed "input line is
-            // 2nd from bottom" rewind contract).
+            format!("{DIM}Type a command or ask Onyx...{RESET}")
+        } else if self.cursor_chars() + 4 >= self.width || self.input.contains('\n') {
             let win = self.input_window();
-            return vec![format!("{BOLD}{CYAN}*  {RESET}{win}")];
+            return vec![
+                format!("  {BORDER}── {BOLD}{FG_SEC}COMPOSER{RESET} {BORDER}{}{RESET}", "─".repeat(w.saturating_sub(16).max(4))),
+                format!("  {CYAN}❯{RESET} {BOLD}{FG_MAIN}{win}{RESET}"),
+            ];
         } else {
-            format!("{}", self.input)
+            format!("{BOLD}{FG_MAIN}{}{RESET}", self.input)
         };
-        out.push(format!("{BOLD}{CYAN}*  {RESET}{body}"));
+        out.push(format!("  {CYAN}❯{RESET} {body}"));
         out
     }
 
@@ -1883,39 +1935,21 @@ impl<'a> Tui<'a> {
     fn hints(&self) -> String {
         let is_auto = matches!(*self.gw.mode.lock().unwrap(), ApprovalMode::Auto);
         let mode_label = if is_auto {
-            format!("{RED}{BOLD}YOLO{RESET} {DIM}Auto Mode active{RESET}")
+            format!("{RED}{BOLD}⇧⇥ AUTO (Active){RESET}")
         } else {
-            format!("{YELLOW}Shift+Tab to Auto Mode{RESET}")
+            format!("{FG_SEC}⇧↹ Auto{RESET}")
         };
 
-        // Context budget and actual usage
-        let max_ctx = if self.hm.context_budget > 0 { self.hm.context_budget } else { 128_000 };
-        let used_tokens = if self.real_total_tokens > 0 {
-            self.real_total_tokens
-        } else {
-            (self.history_bytes / 4).max(self.history_len * 40)
-        };
-        let pct = ((used_tokens as f64 / max_ctx as f64) * 100.0).clamp(0.0, 100.0) as usize;
-        let filled_bars = (pct / 10).min(10);
-        let empty_bars = 10 - filled_bars;
-        let ctx_bar = format!("ctx {CYAN}{}{RESET}{DIM}{}{RESET} {:>2}%", "▓".repeat(filled_bars), "░".repeat(empty_bars), pct);
+        let row1 = format!("  {FG_SEC}↵ Send     {mode_label}     {FG_SEC}/ Commands     ? Help{RESET}");
 
-        let sep = format!("{FG_240}{}{RESET}", "─".repeat(self.width.max(20)));
-        let mcp_label = if self.mcp_count == 1 { "1 MCP server" } else { &format!("{} MCP servers", self.mcp_count) };
-        let skill_label = if self.skill_count == 1 { "1 skill" } else { &format!("{} skills", self.skill_count) };
-        let line1 = format!("{mode_label}  {DIM}·  {mcp_label} · {skill_label}{RESET}");
-        let effort_str = if self.hm.effort.is_empty() {
-            "Disabled Effort"
-        } else {
-            &format!("{} Effort", capitalize(&self.hm.effort))
-        };
-        let ctx_k = max_ctx / 1000;
-        let line2 = format!(
-            "{DIM}{model} · {effort_str} · {ctx_k}K context · {ctx_bar}{RESET}",
-            model = self.hm.model
+        let mcp_n = self.mcp_count;
+        let sk_n = self.skill_count;
+        let model_upper = self.hm.model.to_uppercase();
+        let row2 = format!(
+            "  {CYAN}◈{RESET} {BOLD}{FG_MAIN}ONYX{RESET}    {GREEN}●{RESET} {BOLD}{FG_MAIN}{mcp_n}{RESET} {FG_SEC}MCP{RESET}    {YELLOW}◇{RESET} {BOLD}{FG_MAIN}{sk_n}{RESET} {FG_SEC}SKILLS{RESET}    {DIM}{model_upper}{RESET}"
         );
 
-        format!("{sep}\n{line1}\n{sep}\n{line2}")
+        format!("{row1}\n{row2}")
     }
 
     // ------------------------------------------------------------ turn flow ----
