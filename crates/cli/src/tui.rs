@@ -667,6 +667,7 @@ pub struct Tui<'a> {
     scroll_offset: usize,
     active_tool_start: Option<std::time::Instant>,
     workspace_dir: String,
+    slash_selected: usize,
 }
 
 
@@ -703,6 +704,7 @@ impl<'a> Tui<'a> {
             session: None,
             scroll_offset: 0,
             active_tool_start: None,
+            slash_selected: 0,
             workspace_dir: std::env::current_dir()
                 .map(|p| {
                     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
@@ -923,6 +925,7 @@ impl<'a> Tui<'a> {
 
         // 2. Footer lines (fixed at bottom)
         let status = self.status_lines_v().into_iter().flat_map(|l| fit_lines(&l, w)).collect::<Vec<_>>();
+        let slash_popup = self.slash_dropdown_lines().into_iter().flat_map(|l| fit_lines(&l, w)).collect::<Vec<_>>();
         let input = self.input_lines().into_iter().flat_map(|l| fit_lines(&l, w)).collect::<Vec<_>>();
         let hints = fit_lines(&self.hints(), w);
 
@@ -936,7 +939,7 @@ impl<'a> Tui<'a> {
             Vec::new()
         };
 
-        let footer_count = spin_row.len() + status.len() + input.len() + hints.len();
+        let footer_count = spin_row.len() + status.len() + slash_popup.len() + input.len() + hints.len();
         let avail_content = self.height.saturating_sub(header_count + footer_count).max(1);
 
         // 3. Transcript lines (all non-banner items + tail)
@@ -1021,6 +1024,7 @@ impl<'a> Tui<'a> {
         // 4. Render Footer
         out.extend(spin_row);
         out.extend(status);
+        out.extend(slash_popup);
         out.extend(input);
         out.extend(hints);
 
@@ -1208,6 +1212,104 @@ impl<'a> Tui<'a> {
 
     fn cursor_chars(&self) -> usize {
         self.input[..self.cursor].chars().count()
+    }
+
+    fn matching_slash_commands(&self) -> Vec<(&'static str, &'static str)> {
+        if !self.input.starts_with('/') || self.input.contains(' ') {
+            return Vec::new();
+        }
+        let lower = self.input.to_lowercase();
+        SLASH_COMMANDS
+            .iter()
+            .copied()
+            .filter(|(c, _)| c.to_lowercase().starts_with(&lower))
+            .collect()
+    }
+
+    /// Renders an interactive slash command popup card above the input composer
+    /// modelled after Grok Build's slash dropdown.
+    fn slash_dropdown_lines(&self) -> Vec<String> {
+        let matches = self.matching_slash_commands();
+        if matches.is_empty() {
+            return Vec::new();
+        }
+
+        let w = self.width.max(24);
+        let inner_w = w.saturating_sub(4).max(18);
+
+        // Max visible items in dropdown popup
+        let max_visible = 6;
+        let total = matches.len();
+        let selected = self.slash_selected.min(total.saturating_sub(1));
+
+        // Windowing around selected item
+        let start_idx = if total <= max_visible {
+            0
+        } else if selected < max_visible / 2 {
+            0
+        } else if selected + (max_visible / 2) >= total {
+            total.saturating_sub(max_visible)
+        } else {
+            selected.saturating_sub(max_visible / 2)
+        };
+        let end_idx = (start_idx + max_visible).min(total);
+
+        let mut out = Vec::new();
+        // Top border with title & key hint
+        let title = format!(" Commands (↑/↓ to select, tab/enter to apply) ");
+        let right_pad = inner_w.saturating_sub(title.chars().count() + 2);
+        out.push(format!(
+            "{FG_240}╭─{RESET}{BOLD}{CYAN}{title}{RESET}{FG_240}{}{RESET}",
+            "─".repeat(right_pad.max(2))
+        ));
+
+        let cmd_col_w = 14;
+
+        for (idx, (cmd, desc)) in matches[start_idx..end_idx].iter().enumerate() {
+            let actual_idx = start_idx + idx;
+            let is_sel = actual_idx == selected;
+
+            let prefix = if is_sel {
+                format!("{CYAN}{}{RESET}", glyphs::PROMPT_ARROW)
+            } else {
+                "  ".to_string()
+            };
+
+            let cmd_formatted = if is_sel {
+                format!("{BOLD}{CYAN}{:<width$}{RESET}", cmd, width = cmd_col_w)
+            } else {
+                format!("{FG_250}{:<width$}{RESET}", cmd, width = cmd_col_w)
+            };
+
+            let desc_w = inner_w.saturating_sub(cmd_col_w + 3).max(8);
+            let clipped_desc = clip_chars(desc, desc_w);
+
+            let desc_formatted = if is_sel {
+                format!("{BOLD}{FG_250}{:<width$}{RESET}", clipped_desc, width = desc_w)
+            } else {
+                format!("{DIM}{:<width$}{RESET}", clipped_desc, width = desc_w)
+            };
+
+            let row_content = format!("{prefix}{cmd_formatted} {desc_formatted}");
+            let vis_len = ansi_width(&row_content);
+            let pad = inner_w.saturating_sub(vis_len);
+
+            if is_sel {
+                out.push(format!(
+                    "{FG_240}│{RESET} \x1b[48;5;236m{row_content}{}\x1b[0m {FG_240}│{RESET}",
+                    " ".repeat(pad)
+                ));
+            } else {
+                out.push(format!(
+                    "{FG_240}│{RESET} {row_content}{} {FG_240}│{RESET}",
+                    " ".repeat(pad)
+                ));
+            }
+        }
+
+        // Bottom border
+        out.push(format!("{FG_240}╰{RESET}{}{FG_240}╯{RESET}", "─".repeat(inner_w + 2)));
+        out
     }
 
     /// Tab-completion hint: the first slash command matching what's typed, with
@@ -1640,6 +1742,11 @@ impl<'a> Tui<'a> {
                         if self.running {
                             *self.cancel.lock().unwrap() = true;
                             self.items.push(Item::Info("cancelling after the current step…".into()));
+                        } else if self.input.starts_with('/') {
+                            // Dismiss slash command popup and clear input
+                            self.input.clear();
+                            self.cursor = 0;
+                            self.slash_selected = 0;
                         }
                     }
                     ('\x0f', _) => {
@@ -1651,14 +1758,44 @@ impl<'a> Tui<'a> {
                     }
                     ('\0', 10) => self.cycle_mode(), // shift+tab
                     ('\t', _) => {
-                        let sug = self.suggestion();
-                        if !sug.is_empty() {
-                            let clean: String = sug.chars().take_while(|c| *c != ' ').collect();
-                            self.input = clean;
+                        let matches = self.matching_slash_commands();
+                        if !matches.is_empty() {
+                            let idx = self.slash_selected.min(matches.len() - 1);
+                            self.input = format!("{} ", matches[idx].0);
                             self.cursor = self.input.len();
+                            self.slash_selected = 0;
+                        } else {
+                            let sug = self.suggestion();
+                            if !sug.is_empty() {
+                                let clean: String = sug.chars().take_while(|c| *c != ' ').collect();
+                                self.input = format!("{clean} ");
+                                self.cursor = self.input.len();
+                            }
                         }
                     }
-                    ('\r', _) => self.submit(),
+                    ('\r', _) => {
+                        let matches = self.matching_slash_commands();
+                        // If user opened dropdown by typing "/" or "/part" and hasn't typed arguments,
+                        // hitting Enter selects the highlighted command into the composer!
+                        if !matches.is_empty() && (!self.input.contains(' ') && self.input != matches[self.slash_selected.min(matches.len() - 1)].0) {
+                            let idx = self.slash_selected.min(matches.len() - 1);
+                            let cmd = matches[idx].0;
+                            // If command takes arguments, fill it with a trailing space so user can type args.
+                            // If it's a zero-arg command (like /clear, /tools, /exit, /mode), submit directly!
+                            if cmd == "/clear" || cmd == "/tools" || cmd == "/exit" || cmd == "/mode" || cmd == "/help" || cmd == "/usage" || cmd == "/audit" || cmd == "/sessions" {
+                                self.input = cmd.to_string();
+                                self.cursor = self.input.len();
+                                self.slash_selected = 0;
+                                self.submit();
+                            } else {
+                                self.input = format!("{cmd} ");
+                                self.cursor = self.input.len();
+                                self.slash_selected = 0;
+                            }
+                        } else {
+                            self.submit();
+                        }
+                    }
                     ('\n', 1) => {
                         // alt+enter inserts a newline
                         self.input.insert(self.cursor, '\n');
@@ -1669,6 +1806,7 @@ impl<'a> Tui<'a> {
                             let prev = self.input[..self.cursor].chars().next_back().map(|c| c.len_utf8()).unwrap_or(0);
                             self.cursor -= prev;
                             self.input.remove(self.cursor);
+                            self.slash_selected = 0;
                         }
                     }
                     ('\0', 1004) => {
@@ -1676,6 +1814,7 @@ impl<'a> Tui<'a> {
                         if self.cursor < self.input.len() {
                             let next = self.input[self.cursor..].chars().next().map(|c| c.len_utf8()).unwrap_or(0);
                             self.input.replace_range(self.cursor..self.cursor + next, "");
+                            self.slash_selected = 0;
                         }
                     }
                     ('\0', 1008) => {
@@ -1687,14 +1826,22 @@ impl<'a> Tui<'a> {
                         self.scroll_offset = self.scroll_offset.saturating_sub(5);
                     }
                     ('\0', 1000) => {
-                        // up arrow: scroll back 1 line if not multiline input
-                        if !self.input.contains('\n') && self.input.is_empty() {
+                        // up arrow: navigate slash dropdown if active, else scroll conversation
+                        let matches = self.matching_slash_commands();
+                        if !matches.is_empty() {
+                            let total = matches.len();
+                            self.slash_selected = (self.slash_selected + total - 1) % total;
+                        } else if !self.input.contains('\n') && self.input.is_empty() {
                             self.scroll_offset = self.scroll_offset.saturating_add(1);
                         }
                     }
                     ('\0', 1001) => {
-                        // down arrow: scroll forward 1 line if not multiline input
-                        if !self.input.contains('\n') && self.input.is_empty() {
+                        // down arrow: navigate slash dropdown if active, else scroll conversation
+                        let matches = self.matching_slash_commands();
+                        if !matches.is_empty() {
+                            let total = matches.len();
+                            self.slash_selected = (self.slash_selected + 1) % total;
+                        } else if !self.input.contains('\n') && self.input.is_empty() {
                             self.scroll_offset = self.scroll_offset.saturating_sub(1);
                         }
                     }
@@ -1716,6 +1863,7 @@ impl<'a> Tui<'a> {
                         self.scroll_offset = 0; // jump back to bottom when user begins typing
                         self.input.insert(self.cursor, c);
                         self.cursor += c.len_utf8();
+                        self.slash_selected = 0;
                         self.last_ctrl_d = None;
                     }
                     _ => {}
@@ -1726,6 +1874,7 @@ impl<'a> Tui<'a> {
                     self.input.insert(self.cursor, c);
                     self.cursor += c.len_utf8();
                 }
+                self.slash_selected = 0;
                 self.last_ctrl_d = None;
             }
             if self.quit {
