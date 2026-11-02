@@ -2,10 +2,12 @@
 //! Formats headings, bullet lists, blockquotes, code blocks with syntax highlighting,
 //! and inline emphasis (*italic*, **bold**, `code`).
 
+#[allow(unused_imports)]
 use crate::tui::char_width;
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
+#[allow(dead_code)]
 const DIM: &str = "\x1b[2m";
 const ITALIC: &str = "\x1b[3m";
 const CYAN: &str = "\x1b[36m";

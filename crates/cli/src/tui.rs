@@ -40,22 +40,39 @@ use std::time::Duration;
 use tools::audit::{ApprovalMode, AuditEntry, Gateway};
 use crate::markdown::render_markdown;
 
-// ---------------------------------------------------------------- ANSI/TTY ----
+// ---------------------------------------------------------------- ANSI/TTY & Ratatui Theme ----
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
-const ITALIC: &str = "\x1b[3m";
+const FG_240: &str = "\x1b[38;5;240m";
 const FG_245: &str = "\x1b[38;5;245m";
 const FG_250: &str = "\x1b[38;5;250m";
-const GREEN: &str = "\x1b[32m";
-const RED: &str = "\x1b[31m";
-const YELLOW: &str = "\x1b[33m";
-const BLUE: &str = "\x1b[34m";
-const MAGENTA: &str = "\x1b[35m";
-const CYAN: &str = "\x1b[36m";
-const FG_240: &str = "\x1b[38;5;240m";
-const FG_242: &str = "\x1b[38;5;242m";
+const GREEN: &str = "\x1b[38;5;42m";     // Clean jade green for success
+const RED: &str = "\x1b[38;5;196m";      // Crisp crimson for errors/denials
+const YELLOW: &str = "\x1b[38;5;214m";   // Amber for warnings/approval
+const BLUE: &str = "\x1b[38;5;75m";      // Subtle slate blue for info
+const CYAN: &str = "\x1b[38;5;51m";      // Electric cyan for primary accents
+const TRACK_COLOR: &str = "\x1b[38;5;237m"; // Unicode scrollbar track
+const THUMB_COLOR: &str = "\x1b[38;5;246m"; // Unicode scrollbar thumb
+
+// Unicode glyphs modelled directly on Grok Build's ratatui-pager glyph engine
+#[allow(dead_code)]
+mod glyphs {
+    pub const PROMPT_ARROW: &str = "❯ ";
+    pub const BALLOT_X: &str = "✗";
+    pub const CHECK_MARK: &str = "✓";
+    pub const ACCENT_BAR: &str = "┃";
+    pub const SELECTION_BAR: &str = "▏";
+    pub const CHEVRON: &str = "›";
+    pub const CHEVRON_DOWN: &str = "▾";
+    pub const DIAMOND_FILLED: &str = "◆";
+    pub const DIAMOND_HOLLOW: &str = "◇";
+    pub const TOKEN_ARROW: &str = "⇣";
+    pub const COPY_ICON: &str = "⧉";
+    pub const TRACK_CHAR: char = '│';
+    pub const THUMB_CHAR: char = '█';
+}
 
 /// Raw-mode guard: restores termios on drop, including panic unwind.
 struct RawMode(libc::termios);
@@ -948,17 +965,56 @@ impl<'a> Tui<'a> {
             &all_content[..total_content.min(avail_content)]
         };
 
-        // Fill content area
-        for line in slice {
-            out.push(line.clone());
+        // Grok-style smooth Unicode scrollbar calculations:
+        // When content overflows the viewport, render a track and proportional thumb on the right margin.
+        let needs_bar = total_content > avail_content && avail_content >= 2;
+        let (thumb_top, thumb_len) = if needs_bar {
+            let track_len = avail_content;
+            let tlen = ((track_len * avail_content) / total_content).max(1).min(track_len);
+            let free_track = track_len.saturating_sub(tlen);
+            let pos = if max_scroll == 0 {
+                0
+            } else {
+                let scrolled_down = max_scroll.saturating_sub(scroll);
+                (scrolled_down * free_track) / max_scroll
+            };
+            (pos, tlen)
+        } else {
+            (0, 0)
+        };
+
+        // Fill content area with right-anchored scrollbar
+        for (idx, line) in slice.iter().enumerate() {
+            if needs_bar {
+                let bar_char = if idx >= thumb_top && idx < thumb_top + thumb_len {
+                    format!("{THUMB_COLOR}{}{RESET}", glyphs::THUMB_CHAR)
+                } else {
+                    format!("{TRACK_COLOR}{}{RESET}", glyphs::TRACK_CHAR)
+                };
+                let vis_len = ansi_width(line);
+                let pad = w.saturating_sub(vis_len + 1);
+                out.push(format!("{line}{}{bar_char}", " ".repeat(pad)));
+            } else {
+                out.push(line.clone());
+            }
         }
 
         // Pad blank lines between transcript and footer to eliminate blank gap jumping
         // and keep the input composer permanently pinned to the bottom of the screen.
         let rendered_content_lines = slice.len();
         if rendered_content_lines < avail_content {
-            for _ in 0..(avail_content - rendered_content_lines) {
-                out.push(String::new());
+            for idx in rendered_content_lines..avail_content {
+                if needs_bar {
+                    let bar_char = if idx >= thumb_top && idx < thumb_top + thumb_len {
+                        format!("{THUMB_COLOR}{}{RESET}", glyphs::THUMB_CHAR)
+                    } else {
+                        format!("{TRACK_COLOR}{}{RESET}", glyphs::TRACK_CHAR)
+                    };
+                    let pad = w.saturating_sub(1);
+                    out.push(format!("{}{bar_char}", " ".repeat(pad)));
+                } else {
+                    out.push(String::new());
+                }
             }
         }
 
@@ -995,7 +1051,7 @@ impl<'a> Tui<'a> {
         let w = self.width.max(20);
         match it {
             Item::Banner => {
-                let left = format!("{BOLD}{CYAN}◆ ONYX{RESET} {DIM}v0.1.0{RESET}  {FG_245}{}{RESET}", self.workspace_dir);
+                let left = format!("{BOLD}{CYAN}{} ONYX{RESET} {DIM}v0.1.0{RESET}  {FG_245}{}{RESET}", glyphs::DIAMOND_FILLED, self.workspace_dir);
                 let right = format!("{DIM}{} · {}{RESET}", self.hm.model, self.session_label());
                 let left_w = ansi_width(&left);
                 let right_w = ansi_width(&right);
@@ -1008,7 +1064,7 @@ impl<'a> Tui<'a> {
             Item::User(t) => {
                 let mut out = Vec::new();
                 for (i, l) in fit_lines(t, w).into_iter().enumerate() {
-                    let mark = if i == 0 { "❯" } else { " " };
+                    let mark = if i == 0 { glyphs::PROMPT_ARROW.trim_end() } else { " " };
                     out.push(format!("{CYAN}{mark} {l}{RESET}"));
                 }
                 out
@@ -1018,9 +1074,9 @@ impl<'a> Tui<'a> {
                     return Vec::new();
                 }
                 let (marker, border) = if *denied {
-                    (format!("{RED}✗{RESET}"), RED)
+                    (format!("{RED}{}{RESET}", glyphs::BALLOT_X), RED)
                 } else if *ok {
-                    (format!("{GREEN}✓{RESET}"), FG_245)
+                    (format!("{GREEN}{}{RESET}", glyphs::CHECK_MARK), FG_245)
                 } else {
                     (format!("{YELLOW}⠋{RESET}"), YELLOW)
                 };
@@ -1039,7 +1095,7 @@ impl<'a> Tui<'a> {
                         olines.push("…".into());
                     }
                     for ol in olines {
-                        out.push(format!("{border}  │{RESET} {FG_250}{ol}{RESET}"));
+                        out.push(format!("{border}  {} {FG_250}{ol}{RESET}", glyphs::TRACK_CHAR));
                     }
                     out.push(format!("{border}  └────{RESET}"));
                 } else if !self.expanded && !output.is_empty() {
@@ -1054,7 +1110,7 @@ impl<'a> Tui<'a> {
             }
             Item::Answer(t) => {
                 let clean = clean_model_text(t);
-                let mut out = vec![format!("{CYAN}◆{RESET} {BOLD}onyx{RESET}")];
+                let mut out = vec![format!("{CYAN}{}{RESET} {BOLD}onyx{RESET}", glyphs::DIAMOND_FILLED)];
                 out.extend(render_markdown(&clean, w));
                 out
             }
@@ -1108,11 +1164,11 @@ impl<'a> Tui<'a> {
             // wrapping (a wrapped row would break the fixed "input line is
             // 2nd from bottom" rewind contract).
             let win = self.input_window();
-            return vec![format!("{BOLD}{CYAN}❯{RESET} {win}")];
+            return vec![format!("{BOLD}{CYAN}{}{RESET}{win}", glyphs::PROMPT_ARROW)];
         } else {
             format!("{}", self.input)
         };
-        out.push(format!("{BOLD}{CYAN}❯{RESET} {body}"));
+        out.push(format!("{BOLD}{CYAN}{}{RESET}{body}", glyphs::PROMPT_ARROW));
         out
     }
 
@@ -1168,7 +1224,8 @@ impl<'a> Tui<'a> {
             String::new()
         };
         format!(
-            "{DIM}╰─ {RESET}{mode_color}[{mode}]{RESET}{DIM} shift+tab mode · ctrl+o {exp} · pgup/pgdn scroll{scroll_hint} · esc cancel · ctrl+d×2 exit · /help{RESET}",
+            "{DIM}╰─ {RESET}{mode_color}[{mode}]{RESET}{DIM} {arrow} shift+tab mode · ctrl+o {exp} · pgup/pgdn scroll{scroll_hint} · esc cancel · ctrl+d×2 exit · /help{RESET}",
+            arrow = glyphs::CHEVRON,
             exp = if self.expanded { "collapse" } else { "expand" }
         )
     }
