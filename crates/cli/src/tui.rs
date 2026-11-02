@@ -1437,42 +1437,44 @@ impl<'a> Tui<'a> {
         let w = self.width.max(20);
         match it {
             Item::Banner => {
-                let logo_l1 = format!("{CYAN}  ██████{RESET}                              {BOLD}ONYX{RESET} {DIM}v0.1.0{RESET}");
-                let logo_l2 = format!("{CYAN}██      ██{RESET}                            {DIM}Signed in Local Engine{RESET}");
-                let logo_l3 = format!("{CYAN}██  ██  ██{RESET}  {BOLD}ONYX CLI{RESET} {DIM}v0.1.0{RESET}           {DIM}session: {}{RESET}", self.session_label());
-                let logo_l4 = format!("{CYAN}██    ██{RESET}    {DIM}dir: {FG_245}{}{RESET}", self.workspace_dir);
-                let logo_l5 = format!("{CYAN}  ████  ██{RESET}  {DIM}tools: {}{RESET}", self.gw.tools.names().len());
+                let logo_rows = [
+                    "██████╗ ███╗   ██╗██╗   ██╗██╗  ██╗",
+                    "██╔═══██╗████╗  ██║╚██╗ ██╔╝╚██╗██╔╝",
+                    "██║   ██║██╔██╗ ██║ ╚████╔╝  ╚███╔╝ ",
+                    "██║   ██║██║╚██╗██║  ╚██╔╝   ██╔██╗ ",
+                    "╚██████╔╝██║ ╚████║   ██║   ██╔╝ ██╗",
+                    " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝  ╚═╝",
+                ];
 
-                let _card_w = 40;
-                let c_top = format!("{FG_240}╭─ What's new (v0.1.0): ──────────╮{RESET}");
-                let c_l1  = format!("{FG_240}│{RESET} - Full Grok Tools architecture  {FG_240}│{RESET}");
-                let c_l2  = format!("{FG_240}│{RESET} - Interactive dropdowns & resume {FG_240}│{RESET}");
-                let c_l3  = format!("{FG_240}│{RESET} - Subagents & Plan Mode          {FG_240}│{RESET}");
-                let c_l4  = format!("{FG_240}│{RESET} - /effort, /usage, /settings     {FG_240}│{RESET}");
-                let c_bot = format!("{FG_240}╰─────────────────────────────────╯{RESET}");
+                let _card_w = 37;
+                let c_top = format!("{FG_240}╭─ What's new (v0.1.0): ────────────╮{RESET}");
+                let c_l1  = format!("{FG_240}│{RESET} - Full Grok Tools architecture    {FG_240}│{RESET}");
+                let c_l2  = format!("{FG_240}│{RESET} - Interactive dropdowns & resume   {FG_240}│{RESET}");
+                let c_l3  = format!("{FG_240}│{RESET} - Subagents & Plan Mode            {FG_240}│{RESET}");
+                let c_l4  = format!("{FG_240}│{RESET} - /effort, /usage, /settings       {FG_240}│{RESET}");
+                let c_bot = format!("{FG_240}╰───────────────────────────────────╯{RESET}");
+                let cards = [&c_top, &c_l1, &c_l2, &c_l3, &c_l4, &c_bot];
 
-                if w >= 78 {
+                if w >= 76 {
                     let pad = |left: &str, target: usize| {
                         let vis = ansi_width(left);
                         let sp = target.saturating_sub(vis);
                         format!("{left}{}", " ".repeat(sp))
                     };
-                    let col1_w = 34;
-                    vec![
-                        format!("{} {}", pad(&logo_l1, col1_w), c_top),
-                        format!("{} {}", pad(&logo_l2, col1_w), c_l1),
-                        format!("{} {}", pad(&logo_l3, col1_w), c_l2),
-                        format!("{} {}", pad(&logo_l4, col1_w), c_l3),
-                        format!("{} {}", pad(&logo_l5, col1_w), c_l4),
-                        format!("{} {}", pad("", col1_w), c_bot),
-                        format!("{FG_240}{}{RESET}", "─".repeat(w)),
-                    ]
+                    let col1_w = 38;
+                    let mut lines = Vec::new();
+                    for (i, row) in logo_rows.iter().enumerate() {
+                        let styled_logo = format!("{CYAN}{row}{RESET}");
+                        lines.push(format!("{} {}", pad(&styled_logo, col1_w), cards[i]));
+                    }
+                    lines.push(format!("{DIM}{arrow} model: {BOLD}{}{RESET}{DIM} · session: {} · dir: {FG_245}{}{RESET}", self.hm.model, self.session_label(), self.workspace_dir, arrow = glyphs::CHEVRON));
+                    lines.push(format!("{FG_240}{}{RESET}", "─".repeat(w)));
+                    lines
                 } else {
-                    vec![
-                        logo_l3,
-                        logo_l4,
-                        format!("{FG_240}{}{RESET}", "─".repeat(w)),
-                    ]
+                    let mut lines: Vec<String> = logo_rows.iter().map(|r| format!("{CYAN}{r}{RESET}")).collect();
+                    lines.push(format!("{DIM}model: {}{RESET}", self.hm.model));
+                    lines.push(format!("{FG_240}{}{RESET}", "─".repeat(w)));
+                    lines
                 }
             }
             Item::User(t) => {
