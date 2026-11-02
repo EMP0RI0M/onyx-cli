@@ -204,9 +204,11 @@ pub fn compact_history(history: &[Message], budget: usize) -> Option<Vec<Message
 }
 
 /// The synthetic digest line we inject — exempt from shrinking (it's already a
-/// summary) so compaction never eats its own bookkeeping.
+/// summary) so compaction never eats its own bookkeeping. A digest may lead
+/// with its re-extractable `<user_queries>` block, so recognise either head.
 fn is_digest(m: &Message) -> bool {
-    m.role == "user" && m.content.starts_with("[Context compacted:")
+    m.role == "user"
+        && (m.content.starts_with("[Context compacted:") || m.content.starts_with(QUERIES_OPEN))
 }
 
 pub const SHRINK_CAP: usize = 24_000;
@@ -215,21 +217,137 @@ const DIGEST_RESERVE: usize = 1024;
 /// Floor for the per-message keep in the last-resort shrink loop — never elide
 /// a body below this many kept chars, so each pass makes bounded progress.
 const MIN_KEEP_CHARS: usize = 24;
+/// Per-query character budget inside the preserved-queries block. Long user
+/// turns are middle-truncated (head + tail kept) to this many content chars.
+const QUERY_KEEP_CHARS: usize = 600;
+/// Hard ceiling on the preserved-queries block. Queries are collected oldest
+/// first and kept until this cap; the remainder is counted, not silently lost.
+const QUERIES_BLOCK_CAP: usize = 3072;
+/// The two markers delimiting the re-extractable user-queries block. Kept as
+/// consts so both the writer and the recompaction extractor agree verbatim.
+const QUERIES_OPEN: &str = "<user_queries>";
+const QUERIES_CLOSE: &str = "</user_queries>";
+
+/// Middle-truncate `text` to at most `max` content characters, keeping a head
+/// and tail with an exact dropped-count seam. Returns `None` when no truncation
+/// is needed (`text` already fits), mirroring the reference "truncate_middle"
+/// contract so callers can distinguish "fit verbatim" from "was clipped".
+fn truncate_middle(text: &str, max: usize) -> Option<String> {
+    let total = text.chars().count();
+    if total <= max {
+        return None;
+    }
+    let head_len = max / 2;
+    let tail_len = max - head_len;
+    let head: String = text.chars().take(head_len).collect();
+    let tail: String = text.chars().skip(total - tail_len).collect();
+    Some(format!(
+        "{head}…[{} chars truncated]…{tail}",
+        total - head_len - tail_len
+    ))
+}
+
+/// Split a digest's content into its `<user_queries>` block (if any) and the
+/// prose body with that block removed. On recompaction we strip the old block
+/// before folding again, so preserved queries never snowball across rounds —
+/// they're re-emitted once, merged with the newly-folded queries, at the front.
+fn split_queries(content: &str) -> (Option<String>, String) {
+    let start = match content.find(QUERIES_OPEN) {
+        Some(i) => i,
+        None => return (None, content.to_string()),
+    };
+    let rel_end = match content[start..].find(QUERIES_CLOSE) {
+        Some(r) => r,
+        None => return (None, content.to_string()),
+    };
+    let end = start + rel_end + QUERIES_CLOSE.len();
+    let block = content[start..end].to_string();
+    let mut rest = String::new();
+    rest.push_str(content[..start].trim());
+    let tail = content[end..].trim();
+    if !tail.is_empty() {
+        if !rest.is_empty() {
+            rest.push('\n');
+        }
+        rest.push_str(tail);
+    }
+    (Some(block), rest)
+}
 
 /// One-line-per-message factual digest: role, tool name when present, and a
 /// short excerpt. Deliberately mechanical — no summarisation claims. The whole
 /// digest is byte-capped so folding many messages can't outgrow the budget it
 /// was meant to save; overflow is counted, not silently truncated mid-line.
+///
+/// User turns additionally contribute a near-verbatim entry to a leading
+/// `<user_queries>` block that survives recompaction (harvested pattern: the
+/// original task intent must not decay just because the model call is
+/// mechanical). A prior digest's own query block is merged in rather than
+/// nested, so chained compactions accumulate without snowballing.
 fn digest_messages(msgs: &[&Message]) -> String {
     use std::fmt::Write as _;
     const EXCERPT_CHARS: usize = 120;
     const DIGEST_CAP: usize = 2048;
-    let mut s = format!(
+
+    // Preserved user queries: merge any block carried by a prior digest, then
+    // append the freshly-folded user turns. Capped oldest-first so the newest
+    // intents are the ones that survive when the block would overflow.
+    let mut queries: Vec<String> = Vec::new();
+    for m in msgs {
+        if is_digest(m) {
+            if let (Some(block), _) = split_queries(&m.content) {
+                for line in block.lines().filter_map(|l| l.strip_prefix("- ")) {
+                    queries.push(line.to_string());
+                }
+            }
+        } else if m.role == "user" && !m.content.trim().is_empty() {
+            let one_line = collapsed_ws(&m.content);
+            let q = truncate_middle(&one_line, QUERY_KEEP_CHARS).unwrap_or(one_line);
+            queries.push(q);
+        }
+    }
+    // Dedup identical query lines (a merged prior query can repeat), keeping order.
+    let mut seen = std::collections::HashSet::new();
+    queries.retain(|q| seen.insert(q.clone()));
+    let mut kept_queries: Vec<String> = Vec::new();
+    let mut qbytes = 0usize;
+    let mut dropped_queries = 0usize;
+    for q in queries {
+        let cost = q.len() + 4; // "- " + newline slack
+        if qbytes + cost > QUERIES_BLOCK_CAP {
+            dropped_queries += 1;
+            continue;
+        }
+        qbytes += cost;
+        kept_queries.push(q);
+    }
+
+    let mut out = String::new();
+    if !kept_queries.is_empty() {
+        out.push_str(QUERIES_OPEN);
+        out.push('\n');
+        for q in &kept_queries {
+            let _ = writeln!(out, "- {q}");
+        }
+        if dropped_queries > 0 {
+            let _ = writeln!(out, "- …and {dropped_queries} older queries dropped (block capped)");
+        }
+        out.push_str(QUERIES_CLOSE);
+        out.push('\n');
+    }
+
+    let _ = write!(
+        out,
         "[Context compacted: {} earlier messages folded. Excerpts below; full text was dropped from this request.]\n",
         msgs.len()
     );
     let mut shown = 0usize;
     for m in msgs {
+        // User turns are represented in the query block above; skip their
+        // redundant excerpt line so the prose body stays compact.
+        if m.role == "user" {
+            continue;
+        }
         let label = match &m.tool_call {
             Some(tc) => format!("{}→{}", m.role, tc.name),
             None => m.role.clone(),
@@ -237,14 +355,24 @@ fn digest_messages(msgs: &[&Message]) -> String {
         let excerpt: String = m.content.chars().take(EXCERPT_CHARS).collect();
         let excerpt = excerpt.trim();
         let line_len = label.len() + excerpt.len() + 8;
-        if s.len() + line_len > DIGEST_CAP {
-            let _ = writeln!(s, "- …and {} more folded (digest capped)", msgs.len() - shown);
+        if out.len() + line_len > DIGEST_CAP {
+            let remaining = msgs
+                .iter()
+                .filter(|mm| mm.role != "user")
+                .count()
+                - shown;
+            let _ = writeln!(out, "- …and {remaining} more folded (digest capped)");
             break;
         }
-        let _ = writeln!(s, "- {label}: {excerpt}");
+        let _ = writeln!(out, "- {label}: {excerpt}");
         shown += 1;
     }
-    s
+    out
+}
+
+/// Collapse all runs of whitespace to single spaces (for one-line query entries).
+fn collapsed_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]
@@ -275,8 +403,8 @@ mod tests {
         assert!(total <= 4096, "compacted still over budget: {total}");
         // System message survives verbatim at position 0.
         assert_eq!(c[0].role, "system");
-        // A digest message was injected.
-        assert!(c.iter().any(|m| m.content.starts_with("[Context compacted:")));
+        // A digest message was injected (may lead with its query block).
+        assert!(c.iter().any(is_digest));
     }
 
     #[test]
@@ -351,5 +479,98 @@ mod tests {
         assert_eq!(c.len(), h.len());
         // The huge bodies were elided, not dropped whole.
         assert!(c.iter().any(|m| m.content.contains("characters elided")));
+    }
+
+    #[test]
+    fn digest_preserves_user_queries_in_block() {
+        let msgs = vec![
+            Message::text("user", "build a rust TUI with inline viewport"),
+            Message::text("tool", "some big tool output"),
+        ];
+        let refs: Vec<&Message> = msgs.iter().collect();
+        let d = digest_messages(&refs);
+        assert!(d.starts_with("<user_queries>"), "{d}");
+        assert!(d.contains("</user_queries>"), "{d}");
+        assert!(
+            d.contains("- build a rust TUI with inline viewport"),
+            "query not preserved verbatim: {d}"
+        );
+        // The user turn is NOT also emitted as a redundant excerpt line.
+        assert!(!d.contains("- user:"), "user got a duplicate excerpt line: {d}");
+    }
+
+    #[test]
+    fn long_query_is_middle_truncated() {
+        let long = format!("START {} END", "x".repeat(2000));
+        let msgs = vec![Message::text("user", &long)];
+        let refs: Vec<&Message> = msgs.iter().collect();
+        let d = digest_messages(&refs);
+        assert!(d.contains("START"), "{d}");
+        assert!(d.contains("END"), "{d}");
+        assert!(d.contains("chars truncated"), "no truncation marker: {d}");
+        assert!(!d.contains(&"x".repeat(2000)), "body not clipped: {d}");
+    }
+
+    #[test]
+    fn recompaction_merges_queries_without_nesting_or_snowballing() {
+        // Round 1: fold an early user query + noise.
+        let round1 = vec![
+            Message::text("user", "first intent"),
+            Message::text("tool", "z".repeat(50_000)),
+        ];
+        let h1 = {
+            let mut h = vec![Message::text("system", "sys")];
+            h.extend(round1);
+            h.push(Message::text("user", "second intent"));
+            h
+        };
+        let c1 = compact_history(&h1, 64).expect("round1 compacts");
+        let digest1 = c1
+            .iter()
+            .find(|m| is_digest(m))
+            .expect("digest present");
+        assert!(digest1.content.contains("first intent"), "{:?}", digest1.content);
+
+        // Round 2: the prior digest itself gets folded alongside more history.
+        // Its query block must be MERGED (queries accumulate) and never nested
+        // (only one <user_queries> pair in the new digest). A trailing oversized
+        // tool is the newest message the loop always keeps; that pushes the huge
+        // user turn into the fold so its query must survive via the merge path.
+        let mut h2 = vec![Message::text("system", "sys"), digest1.clone()];
+        h2.push(Message::text("tool", "w".repeat(50_000)));
+        h2.push(Message::text("user", &format!("third intent {}", "t".repeat(30_000))));
+        h2.push(Message::text("tool", "v".repeat(50_000)));
+        let c2 = compact_history(&h2, 64).expect("round2 compacts");
+        let digest2 = c2.iter().find(|m| is_digest(m)).expect("digest2");
+        let body = &digest2.content;
+        assert!(body.contains("first intent"), "prior query lost: {body}");
+        assert!(body.contains("third intent"), "new query lost: {body}");
+        assert_eq!(
+            body.matches(QUERIES_OPEN).count(),
+            1,
+            "query block nested across recompaction: {body}"
+        );
+        assert_eq!(body.matches(QUERIES_CLOSE).count(), 1, "{body}");
+    }
+
+    #[test]
+    fn split_queries_roundtrips() {
+        let content = "<user_queries>\n- keep me\n</user_queries>\n[Context compacted: 3 earlier messages folded.]";
+        let (block, rest) = split_queries(content);
+        assert_eq!(block.as_deref(), Some("<user_queries>\n- keep me\n</user_queries>"));
+        assert!(!rest.contains("<user_queries>"), "block not stripped from rest: {rest}");
+        assert!(rest.contains("[Context compacted:"), "prose lost: {rest}");
+        // No block → whole content is prose, block None.
+        let (none, all) = split_queries("just prose");
+        assert!(none.is_none());
+        assert_eq!(all, "just prose");
+    }
+
+    #[test]
+    fn truncate_middle_only_when_over() {
+        assert_eq!(truncate_middle("short", 100), None);
+        let t = truncate_middle(&"y".repeat(100), 10).expect("should truncate");
+        assert!(t.contains("chars truncated"));
+        assert!(t.chars().count() < 100);
     }
 }
