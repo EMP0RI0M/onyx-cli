@@ -10,6 +10,7 @@ pub mod audit;
 pub mod bash;
 pub mod control;
 pub mod editor;
+pub mod implementations;
 pub mod planning;
 pub mod policy;
 pub mod python;
@@ -148,12 +149,24 @@ pub fn default_collection(editor_base: std::path::PathBuf) -> ToolCollection {
     let mut c = ToolCollection::new();
     c.add(bash::Bash::new());
     c.add(python::PythonExecute::default());
-    c.add(editor::StrReplaceEditor::new(editor_base));
+    c.add(editor::StrReplaceEditor::new(editor_base.clone()));
     c.add(planning::Planning::default());
     c.add(websearch::WebSearch);
     c.add(vecmath::VecMath);
     c.add(control::Terminate);
     c.add(control::AskHuman);
+
+    // Grok-build tools: read_file, list_dir, grep, search_replace, todo, plan mode, web_fetch
+    c.add(implementations::grok_build::ReadFile::new(editor_base.clone()));
+    c.add(implementations::grok_build::ListDir::new(editor_base.clone()));
+    c.add(implementations::grok_build::Grep::new(editor_base.clone()));
+    c.add(implementations::grok_build::SearchReplace::new(editor_base));
+    c.add(implementations::grok_build::TodoTool::new());
+    let plan_state = Arc::new(std::sync::Mutex::new(implementations::grok_build::PlanState::default()));
+    c.add(implementations::grok_build::EnterPlanMode::new(plan_state.clone()));
+    c.add(implementations::grok_build::ExitPlanMode::new(plan_state));
+    c.add(implementations::grok_build::WebFetch);
+
     c
 }
 
