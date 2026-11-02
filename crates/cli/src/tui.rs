@@ -187,29 +187,15 @@ fn hline(width: usize, color: &str) -> String {
     format!("{color}{}{RESET}", "─".repeat(width))
 }
 
-/// Center `text` within `avail` visible cells (plain text; ANSI-free so cell
-/// count == char count for these short labels).
+/// Center `text` within `avail` visible cells taking ANSI escape sequences into account.
 fn center_pad(text: &str, avail: usize) -> String {
-    let t = if text.chars().count() > avail {
-        clip_chars_static(text, avail)
-    } else {
-        text.to_string()
-    };
-    let left = avail.saturating_sub(t.chars().count()) / 2;
-    let right = avail - left - t.chars().count();
-    format!("{}{}{}", " ".repeat(left), t, " ".repeat(right))
-}
-
-/// Local clip that does not depend on App state (mirrors `clip_chars`).
-fn clip_chars_static(s: &str, n: usize) -> String {
-    let mut out = String::new();
-    for c in s.chars().take(n.saturating_sub(1)) {
-        out.push(c);
+    let vis = ansi_width(text);
+    if vis >= avail {
+        return text.to_string();
     }
-    if s.chars().count() > n.saturating_sub(1) {
-        out.push('…');
-    }
-    out
+    let left = (avail - vis) / 2;
+    let right = avail - left - vis;
+    format!("{}{}{}", " ".repeat(left), text, " ".repeat(right))
 }
 
 /// Rounded top rule with an optional centered title inset:
@@ -1100,14 +1086,15 @@ impl<'a> Tui<'a> {
         self.sync_size();
         let (lines, framed_row) = self.render_lines();
         let mut out = String::new();
-        // DEC private mode 2026: deferred painting for flicker-free frame sync
-        out.push_str("\x1b[?2026h");
-        out.push_str("\x1b[H\x1b[2J"); // home + clear entire screen
+        // Hide cursor during paint, home to (1,1) without clearing, overwrite every row to eliminate flicker
+        out.push_str("\x1b[?25l");
+        out.push_str("\x1b[H");
 
         for l in &lines {
             out.push_str(l);
-            out.push('\n');
+            out.push_str("\x1b[K\n"); // clear to end of row then newline
         }
+        out.push_str("\x1b[J"); // clear any remaining rows below frame
 
         // Park the caret on the composer's text row. The framed layout reports the
         // exact row; the compact fallback pins it to the second-from-last line.
@@ -1118,7 +1105,7 @@ impl<'a> Tui<'a> {
             let col = (lead + self.cursor_chars()).min(self.width.max(1));
             out.push_str(&format!("\x1b[{};{}H", cursor_row + 1, col));
         }
-        out.push_str("\x1b[?2026l");
+        out.push_str("\x1b[?25h"); // unhide cursor
         io::stdout().write_all(out.as_bytes()).ok();
         io::stdout().flush().ok();
     }
@@ -1248,7 +1235,7 @@ impl<'a> Tui<'a> {
     /// Returns the frame lines plus the row index where the caret should park.
     fn render_framed(&self) -> (Vec<String>, usize) {
         let w = self.width;
-        let inner = w.saturating_sub(2).max(1); // usable cells inside the left/right bars
+        let inner = w.saturating_sub(4).max(1); // 1 cell left border + 1 cell gutter + inner + 1 cell gutter + 1 cell right border = w
         let mut out: Vec<String> = Vec::with_capacity(self.height);
 
         // ── fixed chrome ──────────────────────────────────────────────
@@ -1257,19 +1244,20 @@ impl<'a> Tui<'a> {
         // Header: shadow-block wordmark (very wide) or a compact one-line mark,
         // then a centered "A NEW INTELLIGENCE" tagline. The wordmark is plain
         // ASCII-art so it can be tinted as one color without breaking alignment.
-        if inner >= 40 {
+        if inner >= 38 {
             for row in Self::BANNER {
-                out.push(format!("{}", center_pad(&format!("{CYAN}{row}{RESET}"), inner)));
+                out.push(side_row(&center_pad(&format!("{CYAN}{row}{RESET}"), inner), inner, FG_240));
             }
         } else {
-            out.push(format!("{}", center_pad(&format!("{CYAN}◆{RESET} {BOLD}ONYX{RESET} {DIM}· A NEW INTELLIGENCE{RESET}"), inner)));
+            out.push(side_row(&center_pad(&format!("{CYAN}◆{RESET} {BOLD}ONYX{RESET} {DIM}· A NEW INTELLIGENCE{RESET}"), inner), inner, FG_240));
         }
-        out.push(format!(
-            "{}",
-            center_pad(
+        out.push(side_row(
+            &center_pad(
                 &format!("{DIM}v1.0.0 · LOCAL{RESET}   {GREEN}●{RESET} {DIM}SYSTEM ONLINE{RESET}"),
-                inner
-            )
+                inner,
+            ),
+            inner,
+            FG_240,
         ));
 
         // SESSION box with the real context meter.
@@ -1286,7 +1274,7 @@ impl<'a> Tui<'a> {
             format!("{FG_245}├─{RESET} {BOLD}MODEL{RESET}    {}", self.hm.model),
             format!("{FG_245}└─{RESET} {BOLD}CONTEXT{RESET} {ctx_str}"),
         ];
-        let session_inner = inner.saturating_sub(2).max(8);
+        let session_inner = inner.saturating_sub(4).max(8);
         let sess_box = panel_box(Some("SESSION"), &session_rows, session_inner, FG_240);
         for l in sess_box {
             out.push(side_row(&l, inner, FG_240));
@@ -1296,14 +1284,14 @@ impl<'a> Tui<'a> {
         let approval: Vec<String> = self
             .status_lines_v()
             .into_iter()
-            .flat_map(|l| fit_lines(&l, inner))
+            .flat_map(|l| fit_lines(&l, inner.saturating_sub(4).max(8)))
             .collect();
 
         // Slash dropdown (if typing "/…").
         let slash_popup: Vec<String> = self
             .slash_dropdown_lines()
             .into_iter()
-            .flat_map(|l| fit_lines(&l, inner))
+            .flat_map(|l| fit_lines(&l, inner.saturating_sub(4).max(8)))
             .collect();
 
         // Framed composer.
@@ -1315,7 +1303,7 @@ impl<'a> Tui<'a> {
         } else {
             self.input_window()
         };
-        let comp_inner = inner.saturating_sub(2).max(8);
+        let comp_inner = inner.saturating_sub(4).max(8);
         let composer = panel_box(None, &[format!("{CYAN}❯{RESET} {body}")], comp_inner, FG_240);
 
         // Footer rows (key-hint + status).
@@ -1348,7 +1336,7 @@ impl<'a> Tui<'a> {
                 String::new(),
                 format!("{DIM}What would you like to work on?{RESET}"),
             ];
-            let cap_inner = inner.saturating_sub(2).max(8);
+            let cap_inner = inner.saturating_sub(4).max(8);
             body_lines = panel_box(Some("CAPABILITIES"), &cap_rows, cap_inner, FG_240)
                 .into_iter()
                 .map(|l| side_row(&l, inner, FG_240))
@@ -1386,8 +1374,8 @@ impl<'a> Tui<'a> {
         for l in composer {
             out.push(side_row(&l, inner, FG_240));
         }
-        out.push(format!(" {key_hint}"));
-        out.push(format!(" {status}"));
+        out.push(side_row(&key_hint, inner, FG_240));
+        out.push(side_row(&status, inner, FG_240));
         out.push(bot_border(w, FG_240));
 
         // Pad short frames (tiny transcript budget) so footer rows stay at the foot.
