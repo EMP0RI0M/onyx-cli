@@ -2,7 +2,7 @@
 //! exercised through the real Gateway (no network, no LLM).
 
 use serde_json::json;
-use tools::audit::Gateway;
+use tools::audit::{Approval, Gateway};
 use tools::policy::{BashGuard, Chained, Decision, Guardian, Policy, Risk, RiskJudge};
 use tools::ToolCollection;
 
@@ -59,7 +59,7 @@ fn high_risk_executes_when_approved() {
     let gw = Gateway::with_approver(collection(), chain(), move |_, _, reason| {
         // the guardian's reason reaches the approver
         seen2.lock().unwrap().push(reason.to_string());
-        true
+        Approval::Once
     });
     let out = gw.call("echo", &json!({"text": "hi"})).unwrap();
     assert_eq!(out.content, "hi");
@@ -76,7 +76,7 @@ fn high_risk_executes_when_approved() {
 fn static_deny_short_circuits_the_guardian() {
     // The judge would only Ask; BashGuard Denies and must win, and the tool
     // must not run.
-    let gw = Gateway::with_approver(collection(), chain(), |_, _, _| true);
+    let gw = Gateway::with_approver(collection(), chain(), |_, _, _| Approval::Once);
     match gw.policy.decide("bash", &json!({"command": "rm -rf /"})) {
         Decision::Deny(_) => {}
         other => panic!("expected Deny, got {other:?}"),

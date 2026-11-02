@@ -105,6 +105,10 @@ fn main() {
             eprintln!("\nerror: reached max_steps ({max_steps}) without terminating");
             exit(3);
         }
+        Err(AgentError::DoomLoop { tool, repeats, reason }) => {
+            eprintln!("\nerror: agent stuck — {reason} ({tool} ×{repeats})");
+            exit(5);
+        }
         Err(AgentError::Tool(t)) => {
             eprintln!("\nerror: a tool call failed at the gateway: {t}");
             exit(4);

@@ -28,7 +28,7 @@
 
 use crate::Opts;
 use agent::model::HttpModel;
-use agent::{AgentEvent, AgentError, Message, ToolCallAgent};
+use agent::{AgentEvent, AgentError, DoomReason, Message, ToolCallAgent};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::{self, Write};
@@ -37,7 +37,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use tools::audit::{ApprovalMode, AuditEntry, Gateway};
+use tools::audit::{Approval, ApprovalMode, AuditEntry, Gateway};
 use crate::markdown::render_markdown;
 
 // ---------------------------------------------------------------- ANSI/TTY & Ratatui Theme ----
@@ -179,6 +179,84 @@ fn frame_header(title: &str, width: usize, border_color: &str) -> String {
     let vis = ansi_width(title);
     let rem = width.saturating_sub(vis + 4).max(2);
     format!("{border_color}──{RESET} {title} {border_color}{}{RESET}", "─".repeat(rem))
+}
+
+/// A run of `─` in the given color, exactly `width` cells wide.
+#[allow(dead_code)]
+fn hline(width: usize, color: &str) -> String {
+    format!("{color}{}{RESET}", "─".repeat(width))
+}
+
+/// Center `text` within `avail` visible cells (plain text; ANSI-free so cell
+/// count == char count for these short labels).
+fn center_pad(text: &str, avail: usize) -> String {
+    let t = if text.chars().count() > avail {
+        clip_chars_static(text, avail)
+    } else {
+        text.to_string()
+    };
+    let left = avail.saturating_sub(t.chars().count()) / 2;
+    let right = avail - left - t.chars().count();
+    format!("{}{}{}", " ".repeat(left), t, " ".repeat(right))
+}
+
+/// Local clip that does not depend on App state (mirrors `clip_chars`).
+fn clip_chars_static(s: &str, n: usize) -> String {
+    let mut out = String::new();
+    for c in s.chars().take(n.saturating_sub(1)) {
+        out.push(c);
+    }
+    if s.chars().count() > n.saturating_sub(1) {
+        out.push('…');
+    }
+    out
+}
+
+/// Rounded top rule with an optional centered title inset:
+/// `╭────── TITLE ────────────╮`. `total` is the full outer width incl corners.
+fn top_border(total: usize, title: Option<&str>, color: &str) -> String {
+    let fill = total.saturating_sub(2);
+    match title {
+        Some(t) => {
+            let label = format!(" {} ", t);
+            let lw = label.chars().count().min(fill.saturating_sub(4));
+            let rem = fill.saturating_sub(lw);
+            let l = rem / 2;
+            let r = rem - l;
+            format!(
+                "{color}╭{}{RESET}{BOLD}{color}{}{RESET}{color}{}╮{RESET}",
+                "─".repeat(l),
+                label,
+                "─".repeat(r)
+            )
+        }
+        None => format!("{color}╭{}╮{RESET}", "─".repeat(fill)),
+    }
+}
+
+/// Rounded bottom rule: `╰─────────────────────╯`.
+fn bot_border(total: usize, color: &str) -> String {
+    format!("{color}╰{}╯{RESET}", "─".repeat(total.saturating_sub(2)))
+}
+
+/// One content row inside a box: `│ <text padded to inner> │`, where the two
+/// spaces around `text` are part of the inner width.
+fn side_row(text: &str, inner: usize, color: &str) -> String {
+    let pad = inner.saturating_sub(ansi_width(text));
+    format!("{color}│{RESET} {}{} {color}│{RESET}", text, " ".repeat(pad))
+}
+
+/// Compose a titled rounded box from already-width-fitted content lines.
+/// `inner` is the space between the vertical bars (incl. the one-cell gutters).
+fn panel_box(title: Option<&str>, content: &[String], inner: usize, color: &str) -> Vec<String> {
+    let total = inner + 2; // +2 vertical bars
+    let mut out = Vec::with_capacity(content.len() + 2);
+    out.push(top_border(total, title, color));
+    for c in content {
+        out.push(side_row(c, inner, color));
+    }
+    out.push(bot_border(total, color));
+    out
 }
 
 /// Hard-wrap one line at exactly `width` visible cells, preserving embedded ANSI escape sequences.
@@ -443,7 +521,7 @@ struct AskCtl {
 }
 struct AskState {
     pending: Option<(String, String, String)>,
-    answer: Option<bool>,
+    answer: Option<Approval>,
     approve_all: bool,
 }
 
@@ -454,29 +532,29 @@ impl AskCtl {
             cv: std::sync::Condvar::new(),
         }
     }
-    fn request(&self, tool: &str, args: &str, reason: &str) -> bool {
+    fn request(&self, tool: &str, args: &str, reason: &str) -> Approval {
         let mut s = self.state.lock().unwrap();
         if s.approve_all {
-            return true;
+            return Approval::Always;
         }
         s.pending = Some((tool.to_string(), args.to_string(), reason.to_string()));
         s.answer = None;
         while s.answer.is_none() {
             s = self.cv.wait(s).unwrap();
         }
-        let a = s.answer.unwrap_or(false);
+        let a = s.answer.unwrap_or(Approval::Reject);
+        if a == Approval::Always {
+            s.approve_all = true;
+        }
         s.pending = None;
         a
     }
     fn pending(&self) -> Option<(String, String, String)> {
         self.state.lock().unwrap().pending.clone()
     }
-    fn answer(&self, yes: bool, all: bool) {
+    fn answer(&self, reply: Approval) {
         let mut s = self.state.lock().unwrap();
-        s.answer = Some(yes);
-        if all {
-            s.approve_all = true;
-        }
+        s.answer = Some(reply);
         self.cv.notify_all();
     }
 }
@@ -824,7 +902,7 @@ impl<'a> Tui<'a> {
             // Approver runs ON the worker thread (it blocks on AskCtl). It may
             // only touch Sync state — AskCtl is enough: the main thread renders
             // the approval card from `ask.pending()` while it polls keys.
-            gw.set_approver(move |tool: &str, args: &str, reason: &str| -> bool {
+            gw.set_approver(move |tool: &str, args: &str, reason: &str| -> Approval {
                 ask.request(tool, args, reason)
             });
 
@@ -936,7 +1014,7 @@ impl<'a> Tui<'a> {
     /// regardless of where the previous frame landed.
     fn draw(&mut self) {
         self.sync_size();
-        let lines = self.render_lines();
+        let (lines, framed_row) = self.render_lines();
         let mut out = String::new();
         // DEC private mode 2026: deferred painting for flicker-free frame sync
         out.push_str("\x1b[?2026h");
@@ -947,22 +1025,36 @@ impl<'a> Tui<'a> {
             out.push('\n');
         }
 
-        // Always park cursor at the persistent input composer line
+        // Park the caret on the composer's text row. The framed layout reports the
+        // exact row; the compact fallback pins it to the second-from-last line.
         if self.height >= 4 {
-            let cursor_row = self.height.saturating_sub(2);
-            let col = (4 + self.cursor_chars()).min(self.width.max(1));
-            out.push_str(&format!("\x1b[{};{}H", cursor_row, col));
+            let cursor_row = framed_row.unwrap_or(self.height.saturating_sub(2));
+            // Framed: `│ ❯ ` = 4 cells before the glyph → col 5. Compact: "*  " → col 4.
+            let lead = if framed_row.is_some() { 5 } else { 4 };
+            let col = (lead + self.cursor_chars()).min(self.width.max(1));
+            out.push_str(&format!("\x1b[{};{}H", cursor_row + 1, col));
         }
         out.push_str("\x1b[?2026l");
         io::stdout().write_all(out.as_bytes()).ok();
         io::stdout().flush().ok();
     }
 
-    fn render_lines(&self) -> Vec<String> {
+    fn render_lines(&self) -> (Vec<String>, Option<usize>) {
+        if self.frame_fits() {
+            let (lines, row) = self.render_framed();
+            (lines, Some(row))
+        } else {
+            (self.render_compact(), None)
+        }
+    }
+
+    /// Compact fallback for small terminals: banner header + scrolling transcript
+    /// + flat footer rows (no outer frame, no nested boxes).
+    fn render_compact(&self) -> Vec<String> {
         let w = self.width.max(20);
         let mut out = Vec::with_capacity(self.height);
 
-        // 1. Header (fixed at top: 2 lines)
+        // 1. Header (fixed at top)
         let header_lines = self.item_lines(&Item::Banner);
         let header_count = header_lines.len();
         out.extend(header_lines);
@@ -986,18 +1078,7 @@ impl<'a> Tui<'a> {
         let footer_count = spin_row.len() + status.len() + slash_popup.len() + input.len() + hints.len();
         let avail_content = self.height.saturating_sub(header_count + footer_count).max(1);
 
-        // 3. Transcript lines (all non-banner items + tail)
-        let mut content: Vec<String> = Vec::new();
-        for it in &self.items {
-            if matches!(it, Item::Banner) {
-                continue;
-            }
-            content.extend(self.item_lines(it));
-        }
-        if self.tail_visible() {
-            content.extend(self.tail_lines());
-        }
-        let all_content: Vec<String> = content.into_iter().flat_map(|l| fit_lines(&l, w)).collect();
+        let all_content = self.transcript_lines(w);
 
         // Calculate scroll window
         let total_content = all_content.len();
@@ -1075,6 +1156,178 @@ impl<'a> Tui<'a> {
         // Truncate to exact terminal height to avoid unexpected terminal line wraps
         out.truncate(self.height);
         out
+    }
+
+    /// The framed ONYX panel: outer rounded border, centered header, SESSION box
+    /// (with a live CONTEXT meter), a scrollable transcript body (or a welcome
+    /// CAPABILITIES box when idle+empty), a framed composer, and dual footer rows.
+    /// Returns the frame lines plus the row index where the caret should park.
+    fn render_framed(&self) -> (Vec<String>, usize) {
+        let w = self.width;
+        let inner = w.saturating_sub(2).max(1); // usable cells inside the left/right bars
+        let mut out: Vec<String> = Vec::with_capacity(self.height);
+
+        // ── fixed chrome ──────────────────────────────────────────────
+        out.push(top_border(w, Some("ONYX"), FG_240));
+
+        // Header: shadow-block wordmark (very wide) or a compact one-line mark,
+        // then a centered "A NEW INTELLIGENCE" tagline. The wordmark is plain
+        // ASCII-art so it can be tinted as one color without breaking alignment.
+        if inner >= 40 {
+            for row in Self::BANNER {
+                out.push(format!("{}", center_pad(&format!("{CYAN}{row}{RESET}"), inner)));
+            }
+        } else {
+            out.push(format!("{}", center_pad(&format!("{CYAN}◆{RESET} {BOLD}ONYX{RESET} {DIM}· A NEW INTELLIGENCE{RESET}"), inner)));
+        }
+        out.push(format!(
+            "{}",
+            center_pad(
+                &format!("{DIM}v1.0.0 · LOCAL{RESET}   {GREEN}●{RESET} {DIM}SYSTEM ONLINE{RESET}"),
+                inner
+            )
+        ));
+
+        // SESSION box with the real context meter.
+        let (filled, empty, pct) = self.ctx_meter(20);
+        let ctx_str = format!(
+            "{CYAN}{}{RESET}{DIM}{}{RESET} {:>3}%",
+            "█".repeat(filled),
+            "░".repeat(empty),
+            pct
+        );
+        let session_rows = vec![
+            format!("{FG_245}├─{RESET} {BOLD}ID{RESET}       {DIM}{}{RESET}", self.session_label()),
+            format!("{FG_245}├─{RESET} {BOLD}WORKDIR{RESET} {}", self.workspace_dir),
+            format!("{FG_245}├─{RESET} {BOLD}MODEL{RESET}    {}", self.hm.model),
+            format!("{FG_245}└─{RESET} {BOLD}CONTEXT{RESET} {ctx_str}"),
+        ];
+        let session_inner = inner.saturating_sub(2).max(8);
+        let sess_box = panel_box(Some("SESSION"), &session_rows, session_inner, FG_240);
+        for l in sess_box {
+            out.push(side_row(&l, inner, FG_240));
+        }
+
+        // Approval card (if a tool is awaiting y/a/n) — pinned above the composer.
+        let approval: Vec<String> = self
+            .status_lines_v()
+            .into_iter()
+            .flat_map(|l| fit_lines(&l, inner))
+            .collect();
+
+        // Slash dropdown (if typing "/…").
+        let slash_popup: Vec<String> = self
+            .slash_dropdown_lines()
+            .into_iter()
+            .flat_map(|l| fit_lines(&l, inner))
+            .collect();
+
+        // Framed composer.
+        let sug = self.suggestion();
+        let body = if self.input.is_empty() && sug.is_empty() {
+            format!("{DIM}Type a command or ask Onyx anything…{RESET}")
+        } else if !sug.is_empty() && self.input.starts_with('/') {
+            format!("{}{DIM}{}{RESET}", self.input, sug.strip_prefix(&self.input).unwrap_or(""))
+        } else {
+            self.input_window()
+        };
+        let comp_inner = inner.saturating_sub(2).max(8);
+        let composer = panel_box(None, &[format!("{CYAN}❯{RESET} {body}")], comp_inner, FG_240);
+
+        // Footer rows (key-hint + status).
+        let mode = *self.gw.mode.lock().unwrap();
+        let key_hint = if self.thinking {
+            format!(
+                " {DIM}{spin} Thinking… (esc to cancel){RESET}",
+                spin = SPINNER[self.tick % SPINNER.len()]
+            )
+        } else {
+            let mode_lbl = match mode {
+                ApprovalMode::Auto => format!("{RED}{BOLD}⚠ AUTO{RESET}"),
+                _ => format!("{YELLOW}⇧⇥ Auto Mode{RESET}"),
+            };
+            format!(" {DIM}↵ Send{RESET}  {mode_lbl}  {DIM}/help Commands{RESET}")
+        };
+        let status = self.status_row(inner);
+
+        // Reserve chrome rows and compute the transcript budget.
+        let chrome = out.len() + approval.len() + slash_popup.len() + composer.len() + 2 + 1; // +footer rows +bottom border
+        let avail_body = self.height.saturating_sub(chrome).max(1);
+
+        // Body: welcome CAPABILITIES box only when there is nothing but the banner
+        // and no turn is running; otherwise the scrolling transcript.
+        let has_activity = self.items.iter().any(|it| !matches!(it, Item::Banner)) || self.running;
+        let body_lines: Vec<String>;
+        if !has_activity {
+            let cap_rows = vec![
+                format!("{CYAN}◆{RESET} {BOLD}CODE{RESET}  {BOLD}TERMINAL{RESET}  {BOLD}FILES{RESET}  {BOLD}RESEARCH{RESET}  {BOLD}AUTOMATION{RESET}  {BOLD}AGENTS{RESET}"),
+                String::new(),
+                format!("{DIM}What would you like to work on?{RESET}"),
+            ];
+            let cap_inner = inner.saturating_sub(2).max(8);
+            body_lines = panel_box(Some("CAPABILITIES"), &cap_rows, cap_inner, FG_240)
+                .into_iter()
+                .map(|l| side_row(&l, inner, FG_240))
+                .collect();
+        } else {
+            let all_content = self.transcript_lines(inner);
+            let total = all_content.len();
+            let max_scroll = total.saturating_sub(avail_body);
+            let scroll = self.scroll_offset.min(max_scroll);
+            let vend = total.saturating_sub(scroll);
+            let vstart = vend.saturating_sub(avail_body);
+            let slice = if vend > vstart && vstart < total {
+                &all_content[vstart..vend.min(total)]
+            } else {
+                &all_content[..total.min(avail_body)]
+            };
+            body_lines = slice.iter().map(|l| side_row(l, inner, FG_240)).collect();
+        }
+
+        // Emit: [body padded to avail_body] [approval] [slash popup] [composer]
+        // [key hint] [status] [bottom border], then pad/truncate to exactly height.
+        for idx in 0..avail_body {
+            match body_lines.get(idx) {
+                Some(l) => out.push(l.clone()),
+                None => out.push(side_row("", inner, FG_240)),
+            }
+        }
+        for l in approval {
+            out.push(side_row(&l, inner, YELLOW));
+        }
+        for l in slash_popup {
+            out.push(side_row(&l, inner, FG_240));
+        }
+        let cursor_row = out.len() + 1; // composer top border, then its text line
+        for l in composer {
+            out.push(side_row(&l, inner, FG_240));
+        }
+        out.push(format!(" {key_hint}"));
+        out.push(format!(" {status}"));
+        out.push(bot_border(w, FG_240));
+
+        // Pad short frames (tiny transcript budget) so footer rows stay at the foot.
+        while out.len() < self.height {
+            out.push(side_row("", inner, FG_240));
+        }
+        // Never exceed the screen height.
+        out.truncate(self.height);
+        (out, cursor_row.min(self.height.saturating_sub(1)))
+    }
+
+    /// All non-banner transcript items + streaming tail, each fitted to `width`.
+    fn transcript_lines(&self, width: usize) -> Vec<String> {
+        let mut content: Vec<String> = Vec::new();
+        for it in &self.items {
+            if matches!(it, Item::Banner) {
+                continue;
+            }
+            content.extend(self.item_lines(it));
+        }
+        if self.tail_visible() {
+            content.extend(self.tail_lines());
+        }
+        content.into_iter().flat_map(|l| fit_lines(&l, width)).collect()
     }
 
     fn tail_visible(&self) -> bool {
@@ -1503,6 +1756,56 @@ impl<'a> Tui<'a> {
             .unwrap_or_default()
     }
 
+    /// Real context usage: (filled cells, empty cells, pct) for a 20-cell bar,
+    /// computed from tokens actually reported by the model, falling back to a
+    /// byte/length heuristic before the first API round-trip. Shared by the
+    /// SESSION box meter and the compact footer so both agree.
+    fn ctx_meter(&self, cells: usize) -> (usize, usize, usize) {
+        let max_ctx = if self.hm.context_budget > 0 { self.hm.context_budget } else { 128_000 };
+        let used_tokens = if self.real_total_tokens > 0 {
+            self.real_total_tokens
+        } else {
+            (self.history_bytes / 4).max(self.history_len * 40)
+        };
+        let pct = ((used_tokens as f64 / max_ctx as f64) * 100.0).clamp(0.0, 100.0) as usize;
+        let filled = (pct * cells / 100).min(cells);
+        (filled, cells - filled, pct)
+    }
+
+    /// The framed panel needs room for header + SESSION box + composer + two
+    /// footer rows. Below this we fall back to the compact transcript layout.
+    fn frame_fits(&self) -> bool {
+        self.height >= 18 && self.width >= 52
+    }
+
+    /// Shadow-block ONYX wordmark (6 rows × 30 cols). Rendered only when the
+    /// frame is wide enough; otherwise a compact one-line mark is used.
+    const BANNER: &'static [&'static str] = &[
+        "██████╗ ███╗   ██╗██╗   ██╗██╗  ██╗",
+        "██╔═══██╗████╗  ██║╚██╗ ██╔╝╚██╗██╔╝",
+        "██║   ██║██╔██╗ ██║ ╚████╔╝  ╚███╔╝ ",
+        "██║   ██║██║╚██╗██║  ╚██╔╝   ██╔██╗ ",
+        "╚██████╔╝██║ ╚████║   ██║   ██╔╝ ██╗",
+        " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝  ╚═╝",
+    ];
+
+    /// Bottom status row — the first real surface for the MCP and skills counts
+    /// and the active model, mirroring the mockup's
+    /// `◈ ONYX ● N MCP SERVERS ◇ N SKILLS MODEL`.
+    fn status_row(&self, w: usize) -> String {
+        let mcp_n = self.mcp_count;
+        let sk_n = self.skill_count;
+        let left = format!(
+            "{CYAN}{}{RESET} {BOLD}ONYX{RESET}  {GREEN}●{RESET} {BOLD}{mcp_n}{RESET} {DIM}MCP {}{RESET}  {YELLOW}◇{RESET} {BOLD}{sk_n}{RESET} {DIM}SKILL {}{RESET}",
+            glyphs::DIAMOND_FILLED,
+            if mcp_n == 1 { "SERVER" } else { "SERVERS" },
+            if sk_n == 1 { "" } else { "S" },
+        );
+        let model = format!("{DIM}{}{RESET}", self.hm.model.to_uppercase());
+        let gap = w.saturating_sub(ansi_width(&left) + ansi_width(&model)).max(1);
+        format!(" {left}{}{model}", " ".repeat(gap))
+    }
+
     fn hints(&self) -> String {
         let is_auto = matches!(*self.gw.mode.lock().unwrap(), ApprovalMode::Auto);
         let mode_label = if is_auto {
@@ -1880,6 +2183,18 @@ impl<'a> Tui<'a> {
                     self.opts.max_steps
                 )));
             }
+            Err(AgentError::DoomLoop { tool, repeats, reason }) => {
+                let msg = match reason {
+                    DoomReason::RepeatedDenials => format!(
+                        "agent stuck: {repeats} calls in a row were denied by policy. \
+                         Consider changing the permission mode or adding allow rules."
+                    ),
+                    DoomReason::RepeatedCalls => format!(
+                        "agent stuck repeating `{tool}` {repeats}× with no progress"
+                    ),
+                };
+                self.items.push(Item::Error(msg));
+            }
             Err(AgentError::Tool(e)) => {
                 self.items.push(Item::Error(format!("tool failed at the gateway: {e}")));
             }
@@ -1945,9 +2260,9 @@ impl<'a> Tui<'a> {
             if self.ask.pending().is_some() {
                 for &ch in &chars {
                     match ch {
-                        'y' | 'Y' => self.ask.answer(true, false),
-                        'a' => self.ask.answer(true, true),
-                        'n' | 'N' => self.ask.answer(false, false),
+                        'y' | 'Y' => self.ask.answer(Approval::Once),
+                        'a' => self.ask.answer(Approval::Always),
+                        'n' | 'N' => self.ask.answer(Approval::Reject),
                         _ => {}
                     }
                 }

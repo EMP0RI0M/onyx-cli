@@ -7,6 +7,23 @@ use std::cell::RefCell;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// The operator's answer to an `Ask`. Distinct from a plain yes/no because
+/// "approve this once" and "remember this pattern" have different consequences:
+/// `Always` asks the gateway's policy to persist a session rule (see
+/// `Policy::on_approval`), while `Once` runs the call and forgets it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Approval {
+    Once,
+    Always,
+    Reject,
+}
+
+impl Approval {
+    pub fn is_approved(self) -> bool {
+        matches!(self, Approval::Once | Approval::Always)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AuditEntry {
     pub ts_ms: u64,
@@ -44,10 +61,11 @@ pub struct Gateway<P: Policy + ?Sized> {
     /// a plain reference (the TUI worker does exactly that).
     pub policy: Box<P>,
     pub audit: AuditLog,
-    /// Resolves `Decision::Ask`: given (tool, args, reason), returns whether the
-    /// human/judge approves. None means nobody can approve → Ask fails closed
-    /// to Deny. The CLI installs an interactive y/n closure here.
-    approver: RefCell<Option<Box<dyn Fn(&str, &str, &str) -> bool + Send + Sync>>>,
+    /// Resolves `Decision::Ask`: given (tool, args, reason), returns the human's
+    /// three-way answer. None means nobody can approve → Ask fails closed to
+    /// Deny. The CLI/TUI installs an interactive y/a/n closure here. An `Always`
+    /// reply is forwarded to `policy.on_approval` so a stateful policy persists it.
+    approver: RefCell<Option<Box<dyn Fn(&str, &str, &str) -> Approval + Send + Sync>>>,
     /// UI-level approval mode (agy's shift+tab cycle). `Auto` bypasses both the
     /// policy and the approver — the caller opted in explicitly (--allow-all or
     /// the TUI toggle); the binary prints a warning when it is on. Interior-
@@ -99,7 +117,7 @@ impl<P: Policy> Gateway<P> {
     pub fn with_approver(
         tools: ToolCollection,
         policy: P,
-        approver: impl Fn(&str, &str, &str) -> bool + Send + Sync + 'static,
+        approver: impl Fn(&str, &str, &str) -> Approval + Send + Sync + 'static,
     ) -> Self {
         Self { tools, policy: Box::new(policy), audit: AuditLog::default(), approver: RefCell::new(Some(Box::new(approver))), mode: Mutex::new(ApprovalMode::Normal) }
     }
@@ -116,7 +134,7 @@ impl<P: Policy + ?Sized> Gateway<P> {
     pub fn from_boxed_with_approver(
         tools: ToolCollection,
         policy: Box<P>,
-        approver: impl Fn(&str, &str, &str) -> bool + Send + Sync + 'static,
+        approver: impl Fn(&str, &str, &str) -> Approval + Send + Sync + 'static,
     ) -> Self {
         Self { tools, policy, audit: AuditLog::default(), approver: RefCell::new(Some(Box::new(approver))), mode: Mutex::new(ApprovalMode::Normal) }
     }
@@ -129,7 +147,7 @@ impl<P: Policy + ?Sized> Gateway<P> {
     /// it while frozen in AskCtl — see the Sync impl below.
     pub fn set_approver(
         &self,
-        approver: impl Fn(&str, &str, &str) -> bool + Send + Sync + 'static,
+        approver: impl Fn(&str, &str, &str) -> Approval + Send + Sync + 'static,
     ) {
         *self.approver.borrow_mut() = Some(Box::new(approver));
     }
@@ -153,14 +171,20 @@ impl<P: Policy + ?Sized> Gateway<P> {
                 Err(ToolError::Denied(rule))
             }
             Decision::Ask(reason) => {
-                let approved = self
+                let reply = self
                     .approver
                     .borrow()
                     .as_ref()
                     .map(|f| f(name, &args_str, &reason))
-                    .unwrap_or(false);
-                if approved {
-                    self.audit.record(name, &args_str, &format!("ASK-OK: {reason}"));
+                    .unwrap_or(Approval::Reject);
+                if reply.is_approved() {
+                    // Let a stateful policy persist an `Always` (session rule).
+                    self.policy.on_approval(name, args, reply);
+                    let tag = match reply {
+                        Approval::Always => "ASK-OK-ALWAYS",
+                        _ => "ASK-OK",
+                    };
+                    self.audit.record(name, &args_str, &format!("{tag}: {reason}"));
                     self.execute(name, &args_str, tool, args)
                 } else {
                     let rule = format!("confirmation refused ({reason})");
@@ -248,7 +272,7 @@ mod tests {
     fn ask_with_approver_executes_and_audits() {
         let mut c = ToolCollection::new();
         c.add(FakeBash);
-        let gw = Gateway::with_approver(c, AskOnce, |_n, _a, _r| true);
+        let gw = Gateway::with_approver(c, AskOnce, |_n, _a, _r| Approval::Once);
         let out = gw.call("bash", &json!({"command": "ls"})).unwrap();
         assert_eq!(out.content, "ls");
         assert!(gw.audit.snapshot()[0].outcome.starts_with("ASK-OK:"));
@@ -287,9 +311,9 @@ mod tests {
     fn set_approver_replaces_the_resolver() {
         let mut c = ToolCollection::new();
         c.add(FakeBash);
-        let gw = Gateway::with_approver(c, AskOnce, |_n, _a, _r| false);
+        let gw = Gateway::with_approver(c, AskOnce, |_n, _a, _r| Approval::Reject);
         assert!(matches!(gw.call("bash", &json!({"command": "ls"})), Err(ToolError::Denied(_))));
-        gw.set_approver(|_n, _a, _r| true);
+        gw.set_approver(|_n, _a, _r| Approval::Once);
         assert!(gw.call("bash", &json!({"command": "ls"})).is_ok());
     }
 }

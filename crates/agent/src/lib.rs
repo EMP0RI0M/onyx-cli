@@ -63,7 +63,29 @@ pub trait Model {
 #[derive(Debug)]
 pub enum AgentError {
     MaxSteps,
+    DoomLoop { tool: String, repeats: usize, reason: DoomReason },
     Tool(ToolError),
+}
+
+/// Why the loop guard fired. Two independent stuck signals (clean-room of the
+/// qodercli `doom_loop` decision): the model replaying one exact call batch with
+/// no progress, and the model hammering a tool that governance keeps denying —
+/// the latter means the permission mode is wrong, not that the model is dumb.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoomReason {
+    RepeatedCalls,
+    RepeatedDenials,
+}
+
+impl std::fmt::Display for DoomReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DoomReason::RepeatedCalls => f.write_str("repeating an identical call"),
+            DoomReason::RepeatedDenials => {
+                f.write_str("hammering a tool that keeps being denied")
+            }
+        }
+    }
 }
 
 /// Token usage returned from the model API.
@@ -102,6 +124,15 @@ pub struct RunReport {
 pub struct ToolCallAgent<'a, P: Policy + ?Sized> {
     pub gateway: &'a Gateway<P>,
     pub max_steps: usize,
+    /// Consecutive identical tool-call steps tolerated before the loop is
+    /// declared stuck. The model repeating one exact call (name + args) with no
+    /// progress is a doom loop; 0 disables detection.
+    pub doom_limit: usize,
+    /// Consecutive *denied* tool calls tolerated before the loop is declared
+    /// stuck. A denial is fed back to the model as a tool result rather than
+    /// aborting the turn, so without this a model that ignores the refusal would
+    /// retry forever against an unchanging policy. 0 disables detection.
+    pub denial_limit: usize,
     pub system: String,
 }
 
@@ -110,6 +141,8 @@ impl<'a, P: Policy + ?Sized> ToolCallAgent<'a, P> {
         Self {
             gateway,
             max_steps: 8,
+            doom_limit: 3,
+            denial_limit: 4,
             system: "You are tektile-core, a precise agent. Use tools to act; when done, \
                      call terminate with the final answer."
                 .into(),
@@ -156,6 +189,15 @@ impl<'a, P: Policy + ?Sized> ToolCallAgent<'a, P> {
         let tool_names = self.gateway.tools.names();
         let tools: Vec<&str> = tool_names.iter().map(|s| s.as_str()).collect();
 
+        // Doom-loop guard: if the model emits the exact same batch of tool calls
+        // (names + args, in order) on `doom_limit` consecutive steps, it is stuck
+        // repeating itself with no progress — stop rather than burn the budget.
+        let mut last_sig: Option<String> = None;
+        let mut repeat_run = 0usize;
+        // Denial-streak guard (see `denial_limit`): consecutive steps in which at
+        // least one call was refused by policy.
+        let mut denial_run = 0usize;
+
         for step in 0..self.max_steps {
             on_event(AgentEvent::Thinking { step });
             let action = if stream {
@@ -178,7 +220,30 @@ impl<'a, P: Policy + ?Sized> ToolCallAgent<'a, P> {
                     return Ok(RunReport { answer, steps: step + 1, history: history.clone() });
                 }
                 Step::Calls(calls) => {
+                    let sig = calls
+                        .iter()
+                        .map(|c| format!("{}({})", c.name, c.args))
+                        .collect::<Vec<_>>()
+                        .join("|");
+                    if self.doom_limit > 0 && Some(&sig) == last_sig.as_ref() {
+                        repeat_run += 1;
+                        if repeat_run >= self.doom_limit {
+                            return Err(AgentError::DoomLoop {
+                                tool: calls[0].name.clone(),
+                                repeats: repeat_run,
+                                reason: DoomReason::RepeatedCalls,
+                            });
+                        }
+                    } else {
+                        repeat_run = 0;
+                        last_sig = Some(sig);
+                    }
                     let mut terminate_answer: Option<String> = None;
+                    // A denial is not a hard stop — it is fed back to the model as
+                    // a tool result so it can pick another path. We only count the
+                    // *consecutive* run across the whole batch (denials interleaved
+                    // with successes mean the agent is making progress).
+                    let mut denied_this_step = false;
                     for call in calls {
                         on_event(AgentEvent::ToolStart { name: call.name.clone(), args: call.args.clone() });
                         history.push(Message {
@@ -199,20 +264,46 @@ impl<'a, P: Policy + ?Sized> ToolCallAgent<'a, P> {
                                 output: e.to_string(),
                             }),
                         }
-                        let output = outcome.map_err(AgentError::Tool)?;
-                        // Context window protection: middle-elide enormous tool
-                        // outputs (e.g. `ls -R` or large dumps) so a single result
-                        // can't blow the request budget on its own. Whole-history
-                        // compaction lives in crate::context, applied at send time.
-                        let content = crate::context::shrink_tool_output(
-                            &output.content,
-                            24_000,
-                            12_000,
-                        );
+                        let content = match outcome {
+                            Ok(out) => {
+                                if call.name == "terminate" {
+                                    terminate_answer = Some(out.content.clone());
+                                }
+                                crate::context::shrink_tool_output(
+                                    &out.content,
+                                    24_000,
+                                    12_000,
+                                )
+                            }
+                            Err(ToolError::Denied(rule)) => {
+                                denied_this_step = true;
+                                format!(
+                                    "DENIED by policy: {rule}\n\
+                                     The user's governance rules will keep refusing this \
+                                     exact call. Do NOT retry it unchanged — choose a \
+                                     different tool or argument, explain why you need it, or \
+                                     finish without it."
+                                )
+                            }
+                            Err(e) => return Err(AgentError::Tool(e)),
+                        };
                         history.push(Message::text("tool", content));
-                        if call.name == "terminate" {
-                            terminate_answer = Some(output.content);
+                        if terminate_answer.is_some() {
                             break; // terminate ends the turn
+                        }
+                    }
+                    if self.denial_limit > 0 {
+                        if denied_this_step {
+                            denial_run += 1;
+                            if denial_run >= self.denial_limit {
+                                return Err(AgentError::DoomLoop {
+                                    tool: String::new(),
+                                    repeats: denial_run,
+                                    reason: DoomReason::RepeatedDenials,
+                                });
+                            }
+                        } else {
+                            denial_run = 0;
                         }
                     }
                     if let Some(answer) = terminate_answer {
@@ -331,9 +422,16 @@ mod tests {
             Step::Calls(vec![ToolCall { name: "bash".into(), args: json!({"command":"rm -rf /"}) }]),
         ]);
         let agent = ToolCallAgent::new(&gw);
-        // BashGuard denies; the gateway surfaces a Denied error to the agent.
-        let res = agent.run(&mut model, "destroy everything");
-        assert!(matches!(res, Err(AgentError::Tool(ToolError::Denied(_)))));
+        // BashGuard denies; the denial is fed back to the model as a tool result
+        // (not a thrown error), so the script exhausts into a Final answer. The
+        // invariant is that the dangerous command NEVER ran — proven by the audit
+        // recording a DENY, not an OK/FAIL for bash.
+        let rep = agent.run(&mut model, "destroy everything").unwrap();
+        assert_eq!(rep.answer, "(script exhausted)");
+        let audit = gw.audit.snapshot();
+        assert!(audit.iter().any(|e| e.tool == "bash" && e.outcome.starts_with("DENY")), "{audit:?}");
+        // the command never executed: no OK/FAIL/AUTO outcome for bash
+        assert!(!audit.iter().any(|e| e.tool == "bash" && !e.outcome.starts_with("DENY")), "{audit:?}");
     }
 
     #[test]
@@ -344,5 +442,80 @@ mod tests {
         let rep = agent.run(&mut model, "what is 2+2").unwrap();
         assert_eq!(rep.answer, "2+2=4");
         assert_eq!(rep.steps, 1);
+    }
+
+    #[test]
+    fn doom_loop_detected_on_repeated_identical_calls() {
+        let gw = gateway();
+        // The model repeats one exact vecmath call forever; the loop must stop it.
+        let same = || Step::Calls(vec![ToolCall {
+            name: "vecmath".into(),
+            args: json!({"op":"dot","a":[1.0],"b":[1.0]}),
+        }]);
+        let mut model = ScriptedModel::new(vec![same(), same(), same(), same(), same()]);
+        let mut agent = ToolCallAgent::new(&gw);
+        agent.doom_limit = 3;
+        agent.max_steps = 8;
+        let res = agent.run(&mut model, "loop forever");
+        assert!(
+            matches!(res, Err(AgentError::DoomLoop { tool: ref t, repeats, reason: DoomReason::RepeatedCalls }) if t == "vecmath" && repeats == 3),
+            "{res:?}"
+        );
+    }
+
+    #[test]
+    fn repeated_denials_are_fed_back_then_intercepted() {
+        let gw = gateway();
+        // BashGuard refuses `rm -rf /`; the model keeps trying it unchanged. The
+        // loop must NOT abort on the first denial — it feeds the refusal back as a
+        // tool result so the model can adapt, and only fires once the streak hits
+        // the limit.
+        let rm = || Step::Calls(vec![ToolCall {
+            name: "bash".into(),
+            args: json!({"command": "rm -rf /"}),
+        }]);
+        let mut model = ScriptedModel::new(vec![rm(), rm(), rm(), rm(), rm()]);
+        let mut agent = ToolCallAgent::new(&gw);
+        agent.doom_limit = 0; // isolate the denial signal from the repeat signal
+        agent.denial_limit = 4;
+        agent.max_steps = 8;
+        let res = agent.run(&mut model, "destroy everything");
+        assert!(
+            matches!(res, Err(AgentError::DoomLoop { repeats, reason: DoomReason::RepeatedDenials, .. }) if repeats == 4),
+            "{res:?}"
+        );
+    }
+
+    #[test]
+    fn single_denial_does_not_abort_the_turn() {
+        let gw = gateway();
+        // One denial, then the model adapts and finishes. A lone refusal is a
+        // recoverable signal, not a hard stop.
+        let mut model = ScriptedModel::new(vec![
+            Step::Calls(vec![ToolCall { name: "bash".into(), args: json!({"command": "rm -rf /"}) }]),
+            Step::Final("I cannot delete the filesystem; here is a safe alternative.".into()),
+        ]);
+        let agent = ToolCallAgent::new(&gw);
+        let rep = agent.run(&mut model, "destroy everything").unwrap();
+        assert!(rep.answer.contains("safe alternative"));
+        // the denial was recorded in history as a tool message, not thrown
+        assert!(rep.history.iter().any(|m| m.role == "tool" && m.content.starts_with("DENIED by policy")));
+    }
+
+    #[test]
+    fn varying_calls_are_not_a_doom_loop() {
+        let gw = gateway();
+        // Same tool, different args each step — real progress, must not trip.
+        let mut model = ScriptedModel::new(vec![
+            Step::Calls(vec![ToolCall { name: "vecmath".into(), args: json!({"op":"dot","a":[1.0],"b":[1.0]}) }]),
+            Step::Calls(vec![ToolCall { name: "vecmath".into(), args: json!({"op":"dot","a":[2.0],"b":[2.0]}) }]),
+            Step::Calls(vec![ToolCall { name: "vecmath".into(), args: json!({"op":"dot","a":[3.0],"b":[3.0]}) }]),
+            Step::Final("done".into()),
+        ]);
+        let mut agent = ToolCallAgent::new(&gw);
+        agent.doom_limit = 3;
+        agent.max_steps = 8;
+        let rep = agent.run(&mut model, "varying dots").unwrap();
+        assert_eq!(rep.answer, "done");
     }
 }

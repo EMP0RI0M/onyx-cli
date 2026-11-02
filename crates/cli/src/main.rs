@@ -18,7 +18,7 @@ use std::env;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::process::exit;
-use tools::audit::Gateway;
+use tools::audit::{Approval, Gateway};
 use guardian::HttpJudge;
 use tools::policy::{AllowAll, BashGuard, Chained, DynChained, Guardian, Policy};
 
@@ -92,15 +92,19 @@ fn usage() {
 
 /// Ask-before-execute approver wired into the BashGuard policy's `Ask` arm.
 /// Refusal (or EOF) fails closed.
-fn interactive_approve(tool: &str, args: &str, reason: &str) -> bool {
+fn interactive_approve(tool: &str, args: &str, reason: &str) -> Approval {
     println!("\n⚠ approval needed — {tool} {args}\n  reason: {reason}");
-    print!("allow? [y/N] ");
+    print!("allow? [y] once / [a] always / [N] no: ");
     io::stdout().flush().ok();
     let mut line = String::new();
     if io::stdin().lock().read_line(&mut line).unwrap_or(0) == 0 {
-        return false;
+        return Approval::Reject;
     }
-    matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
+    match line.trim().to_lowercase().as_str() {
+        "y" | "yes" => Approval::Once,
+        "a" | "always" => Approval::Always,
+        _ => Approval::Reject,
+    }
 }
 
 /// Run one turn against a live model, printing this turn's trace + answer.
@@ -132,6 +136,9 @@ fn do_turn<P: Policy + ?Sized>(
         }
         Err(AgentError::MaxSteps) => {
             eprintln!("error: reached max_steps ({}) without terminating", opts.max_steps);
+        }
+        Err(AgentError::DoomLoop { tool, repeats, reason }) => {
+            eprintln!("error: agent stuck — {reason} ({tool} ×{repeats})");
         }
         Err(AgentError::Tool(t)) => {
             eprintln!("error: tool call failed at the gateway: {t}");

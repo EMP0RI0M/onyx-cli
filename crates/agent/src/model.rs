@@ -845,12 +845,13 @@ mod tests {
             .max()
             .unwrap_or(0);
         assert!(biggest < 30_000, "expected shrink/fold, got a {biggest}-char body");
-        assert!(msgs.iter().any(|m| {
-            m["content"]
-                .as_str()
-                .unwrap_or("")
-                .contains("[Context compacted:")
-        }));
+        // Compaction ran: either stale tools were pruned (elision markers) or
+        // older turns were folded into a digest. Either satisfies the budget.
+        let compacted = msgs.iter().any(|m| {
+            let c = m["content"].as_str().unwrap_or("");
+            c.contains("[Context compacted:") || c.contains("characters elided")
+        });
+        assert!(compacted, "neither fold nor prune left a trace");
     }
 
     #[test]

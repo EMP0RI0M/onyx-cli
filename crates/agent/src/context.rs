@@ -5,12 +5,14 @@
 //! 1. [`shrink_tool_output`] — per-message: every tool result above the cap is
 //!    middle-elided (head + tail kept, the seam labelled with an exact count).
 //!    Enormous outputs (`ls -R`, log dumps) are what blow the window first.
-//! 2. [`compact_history`] — whole-history: when the estimated total exceeds the
-//!    budget, the oldest `user`/`tool` messages between the two ends are folded
-//!    into ONE digest message; the system prompt, the first exchange, and the
-//!    most recent messages survive verbatim. Tool-call bookkeeping messages are
-//!    never dropped, so replaying the compacted history can't produce dangling
-//!    tool results.
+//! 2. [`compact_history`] — whole-history, applied at send time when the
+//!    estimated total exceeds the budget. It runs in two stages: first PRUNE
+//!    (middle-elide stale oversized tool outputs, keeping every message's
+//!    head+tail), and only if that alone doesn't fit, FOLD the oldest user/tool
+//!    messages into ONE digest. The system prompt, assistant tool-call
+//!    bookkeeping, and the most recent messages survive verbatim, so replaying
+//!    the compacted history can't produce dangling tool results. Pruning first
+//!    means many histories never need the lossier fold at all.
 //!
 //! The estimator ([`estimate_tokens`]) is deliberately conservative: ~4 chars
 //! per token for ASCII-heavy text, halved for non-ASCII payloads which tend to
@@ -75,6 +77,28 @@ pub fn compact_history(history: &[Message], budget: usize) -> Option<Vec<Message
     if total <= budget {
         return None;
     }
+
+    // Tier 2a — PRUNE. Before folding anything away, drop the bulk of stale,
+    // oversized TOOL outputs (head + tail kept). This is the cheap win opencode
+    // makes first: it reclaims the most bytes while keeping every message's
+    // identity and its beginning/end readable. If pruning alone fits the budget,
+    // we never pay for the lossier digest fold below. User turns are NOT pruned
+    // here — they are conversation anchors and get folded whole instead.
+    const PRUNE_KEEP: usize = 600;
+    let mut work: Vec<Message> = history.to_vec();
+    for m in &mut work {
+        if m.role == "tool" {
+            m.content = shrink_tool_output(&m.content, PRUNE_KEEP * 2, PRUNE_KEEP);
+        }
+    }
+    let pruned_total: usize = work.iter().map(|m| estimate_tokens(&m.content)).sum();
+    if pruned_total <= budget {
+        return Some(work);
+    }
+
+    // Tier 2b — FOLD. Pruning wasn't enough: now the oldest user/tool messages
+    // between the two ends collapse into ONE digest line.
+    let history = &work[..];
 
     // Partition: the system message and any assistant / tool-call bookkeeping
     // message survive verbatim (dropping them would dangle a tool result).
@@ -300,5 +324,32 @@ mod tests {
         };
         let d = digest_messages(&[&m]);
         assert!(d.contains("tool→vecmath"), "{d}");
+    }
+
+    #[test]
+    fn prune_fits_without_folding_when_only_tools_are_huge() {
+        // A short history whose bulk is two enormous tool dumps. Pruning alone
+        // should reclaim enough that NO digest fold is needed — every message
+        // keeps its identity (role), just shrunk head+tail.
+        let h = vec![
+            Message::text("system", "sys"),
+            Message::text("user", "short question"),
+            Message::text("tool", "L".repeat(60_000)),
+            Message::text("assistant", "thinking"),
+            Message::text("tool", "R".repeat(60_000)),
+            Message::text("user", "thanks"),
+        ];
+        let c = compact_history(&h, 4096).expect("should compact");
+        let total: usize = c.iter().map(|m| estimate_tokens(&m.content)).sum();
+        assert!(total <= 4096, "pruned still over budget: {total}");
+        // No digest was injected — pruning sufficed.
+        assert!(
+            !c.iter().any(|m| m.content.starts_with("[Context compacted:")),
+            "fold ran when prune should have been enough"
+        );
+        // All six original messages survive (nothing folded away).
+        assert_eq!(c.len(), h.len());
+        // The huge bodies were elided, not dropped whole.
+        assert!(c.iter().any(|m| m.content.contains("characters elided")));
     }
 }
