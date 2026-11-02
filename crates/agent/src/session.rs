@@ -87,6 +87,15 @@ impl Transcript {
     pub fn path(&self) -> &PathBuf {
         &self.path
     }
+
+    /// True when the last message record already carries this exact user turn.
+    /// The TUI persists the prompt before the loop runs; the loop re-checks
+    /// against the file so a resumed or replayed prompt never double-writes.
+    pub fn last_is_user(&self, content: &str) -> bool {
+        load_messages(&self.path)
+            .last()
+            .map_or(false, |m| m.role == "user" && m.content == content)
+    }
 }
 
 /// Read a stored transcript back into messages, skipping the header and any

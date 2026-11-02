@@ -136,7 +136,11 @@ impl<'a, P: Policy + ?Sized> ToolCallAgent<'a, P> {
             .as_any_mut()
             .downcast_mut::<crate::model::HttpModel>()
             .is_some();
-        history.push(Message::text("user", user));
+        // Skip the push when the caller already appended this exact last user
+        // message (the TUI persists the prompt before calling in).
+        if history.last().map_or(true, |m| m.role != "user" || m.content != user) {
+            history.push(Message::text("user", user));
+        }
         let tool_names = self.gateway.tools.names();
         let tools: Vec<&str> = tool_names.iter().map(|s| s.as_str()).collect();
 

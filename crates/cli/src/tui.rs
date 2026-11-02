@@ -481,20 +481,58 @@ fn first_line(s: &str) -> &str {
 }
 
 /// Clean up LLM response text that may contain raw JSON fallback tool blocks
-/// (such as {"tool":"terminate","args":{...}}). If present, extracts the
-/// actual message content so raw JSON schema blobs don't leak into the UI.
+/// (such as {"tool":"terminate","args":{...}} or {"tool":"ask_human","args":{...}} or {"question": "..."}).
+/// If present, extracts the actual message content so raw JSON schema blobs don't leak into the UI.
 fn clean_model_text(text: &str) -> String {
     let t = text.trim();
+    // Case 1: `→ tool_name({"question":"..."})` or `→ tool_name({...})` from agent loop tool calls
+    if t.starts_with("→ ") {
+        if let Some(open_paren) = t.find('(') {
+            let tool_name = t[2..open_paren].trim();
+            if let Some(close_paren) = t.rfind(')') {
+                let inside = &t[open_paren + 1..close_paren];
+                if tool_name == "ask_human" || tool_name == "terminate" {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(inside) {
+                        if let Some(q) = v.get("question").or_else(|| v.get("content")).or_else(|| v.get("answer")).and_then(|s| s.as_str()) {
+                            return q.to_string();
+                        }
+                    }
+                    return inside.trim_matches('"').to_string();
+                }
+            }
+        }
+    }
+
     if t.starts_with('{') && t.contains("\"tool\"") {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(t) {
-            if v.get("tool").and_then(|s| s.as_str()) == Some("terminate") {
+            let tool = v.get("tool").and_then(|s| s.as_str()).unwrap_or("");
+            if tool == "terminate" || tool == "ask_human" {
                 if let Some(args) = v.get("args") {
-                    if let Some(content) = args.get("content").and_then(|c| c.as_str()) {
+                    if let Some(content) = args.get("content").or_else(|| args.get("question")).or_else(|| args.get("answer")).and_then(|c| c.as_str()) {
                         return content.to_string();
                     }
-                    if let Some(answer) = args.get("answer").and_then(|a| a.as_str()) {
-                        return answer.to_string();
-                    }
+                }
+            }
+        }
+    }
+    // Direct question or content objects: {"question":"..."}
+    if t.starts_with('{') && t.contains("\"question\"") {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(t) {
+            if let Some(q) = v.get("question").and_then(|s| s.as_str()) {
+                return q.to_string();
+            }
+        }
+    }
+    // terminate-shaped result envelopes the model echoes back verbatim:
+    // {"status":"success","content":"42"}. Show only the content.
+    if t.starts_with('{') && t.contains("\"status\"") && t.contains("\"content\"") {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(t) {
+            if v.get("tool").is_none()
+                && v.as_object().map_or(false, |o| o.len() == 2)
+                && v.get("status").and_then(|s| s.as_str()) == Some("success")
+            {
+                if let Some(c) = v.get("content").and_then(|c| c.as_str()) {
+                    return c.to_string();
                 }
             }
         }
@@ -511,6 +549,11 @@ fn pretty_args(name: &str, args: &str) -> String {
     if name == "bash" || name == "shell" {
         if let Some(cmd) = obj.get("command").or_else(|| obj.get("cmd")).and_then(|x| x.as_str()) {
             return format!("$ {}", clip_chars(first_line(cmd), 90));
+        }
+    }
+    if name == "ask_human" {
+        if let Some(q) = obj.get("question").or_else(|| obj.get("content")).and_then(|x| x.as_str()) {
+            return format!("question: {}", clip_chars(first_line(q), 90));
         }
     }
     if name == "editor" || name == "file_write" || name == "file_read" || name == "view" {
@@ -731,7 +774,9 @@ impl<'a> Tui<'a> {
                         *cancel.lock().unwrap() = false;
                         let cut = history.len();
                         if let Some(t) = &transcript {
-                            t.push(&Message::text("user", &prompt));
+                            if !t.last_is_user(&prompt) {
+                                t.push(&Message::text("user", &prompt));
+                            }
                         }
                         let mut agent = ToolCallAgent::new(gw);
                         agent.max_steps = max_steps;
@@ -885,14 +930,15 @@ impl<'a> Tui<'a> {
 
         // Calculate scroll window
         let total_content = all_content.len();
-        let scroll = self.scroll_offset.min(total_content.saturating_sub(avail_content));
+        let max_scroll = total_content.saturating_sub(avail_content);
+        let scroll = self.scroll_offset.min(max_scroll);
         let visible_end = total_content.saturating_sub(scroll);
         let visible_start = visible_end.saturating_sub(avail_content);
 
-        let slice = if visible_end > visible_start {
-            &all_content[visible_start..visible_end]
+        let slice = if visible_end > visible_start && visible_start < total_content {
+            &all_content[visible_start..visible_end.min(total_content)]
         } else {
-            &[]
+            &all_content[..total_content.min(avail_content)]
         };
 
         // Fill content area
@@ -961,7 +1007,7 @@ impl<'a> Tui<'a> {
                 out
             }
             Item::Tool { name, args, ok, denied, duration, output } => {
-                if name == "terminate" {
+                if name == "terminate" || name == "ask_human" {
                     return Vec::new();
                 }
                 let (marker, border) = if *denied {
@@ -1327,8 +1373,8 @@ impl<'a> Tui<'a> {
                 }
             }
             AgentEvent::ToolStart { name, args } => {
-                if name == "terminate" {
-                    // Do not print internal terminate control call as a tool card
+                if name == "terminate" || name == "ask_human" {
+                    // Do not print internal control calls as noisy execution cards
                     return;
                 }
                 self.finalize_tail();
@@ -1344,7 +1390,7 @@ impl<'a> Tui<'a> {
                 });
             }
             AgentEvent::ToolDone { name, ok, output } => {
-                if name == "terminate" {
+                if name == "terminate" || name == "ask_human" {
                     return;
                 }
                 let dur = self.active_tool_start.take().map(|t| t.elapsed());
@@ -1566,6 +1612,7 @@ impl<'a> Tui<'a> {
                     ('\0', 1006) => self.cursor = 0,
                     ('\0', 1007) => self.cursor = self.input.len(),
                     (c, 0) if !c.is_control() => {
+                        self.scroll_offset = 0; // jump back to bottom when user begins typing
                         self.input.insert(self.cursor, c);
                         self.cursor += c.len_utf8();
                         self.last_ctrl_d = None;
@@ -1573,6 +1620,7 @@ impl<'a> Tui<'a> {
                     _ => {}
                 }
             } else {
+                self.scroll_offset = 0; // jump back to bottom on paste/multi-character input
                 for &c in &chars {
                     self.input.insert(self.cursor, c);
                     self.cursor += c.len_utf8();
