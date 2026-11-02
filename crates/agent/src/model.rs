@@ -179,6 +179,17 @@ fn parse_host_port(base: &str) -> (String, u16) {
     }
 }
 
+/// ONYX_CONTEXT_TOKENS (or legacy TEK_CONTEXT_TOKENS) overrides the default
+/// request budget; 0 disables compaction entirely. Default assumes a ~16k
+/// context model with room left for the reply.
+pub fn default_context_budget() -> usize {
+    std::env::var("ONYX_CONTEXT_TOKENS")
+        .or_else(|_| std::env::var("TEK_CONTEXT_TOKENS"))
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(12_000)
+}
+
 /// The live model. Constructed with the gateway coordinates + a rendered tool
 /// catalog (name: description lines) used to teach the model what it may call.
 #[derive(Clone)]
@@ -191,6 +202,9 @@ pub struct HttpModel {
     pub temperature: f32,
     pub system: String,
     pub catalog: String,
+    /// Token budget for the whole request; histories estimated above it are
+    /// compacted (see crate::context) before sending. 0 disables compaction.
+    pub context_budget: usize,
     /// OpenAI-style `tools` array (from tools::tool_schemas); empty = text protocol only.
     pub tool_defs: Vec<Value>,
 }
@@ -207,6 +221,7 @@ impl HttpModel {
             temperature: 0.1,
             system: "You are onyx, a precise agent that acts through tools.".to_string(),
             catalog,
+            context_budget: default_context_budget(),
             tool_defs: Vec::new(),
         }
     }
@@ -225,11 +240,12 @@ impl HttpModel {
             temperature: 0.1,
             system: "You are onyx, a precise agent that acts through tools.".to_string(),
             catalog,
+            context_budget: default_context_budget(),
             tool_defs,
         }
     }
 
-    /// One-shot completion for non-agent callers (e.g. the guardian judge):
+/// One-shot completion for non-agent callers (e.g. the guardian judge):
     /// post a ready-made chat-completions body, return `choices[0].message.content`.
     pub fn chat_raw(&self, body_json: &str) -> Result<String, String> {
         let auth = if self.key.is_empty() { None } else { Some(self.key.as_str()) };
@@ -246,6 +262,17 @@ impl HttpModel {
     }
 
     fn build_messages(&self, history: &[Message]) -> Vec<Value> {
+        // Compact the history first when it's estimated to exceed our budget;
+        // compaction is a no-op (returns None) for normal conversations.
+        let compacted = if self.context_budget > 0 {
+            crate::context::compact_history(history, self.context_budget)
+        } else {
+            None
+        };
+        let history: &[Message] = match &compacted {
+            Some(c) => c.as_slice(),
+            None => history,
+        };
         let protocol = if self.tool_defs.is_empty() {
             "\n\nTo call a tool, reply with ONLY a JSON object, no prose:\n  {\"tool\":\"<name>\",\"args\":{...}}\nUse args exactly as the tool needs. When you are finished, call the terminate tool:\n  {\"tool\":\"terminate\",\"args\":{\"status\":\"success\",\"content\":\"<final answer for the user>\"}}\nDo not invent tools. Do not emit more than one JSON object per turn.\nIf the request needs SEVERAL tools, call them one per turn and keep going until you have run EVERY tool the request asks for and gathered each result. Do NOT call terminate until all requested tool work is done; the terminate content must report every result."
                 .to_string()

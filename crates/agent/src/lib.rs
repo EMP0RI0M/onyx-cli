@@ -6,6 +6,7 @@
 //! plugs in behind the `Model` trait; here we ship a `ScriptedModel` so the whole
 //! loop is testable with zero network and zero secrets.
 
+pub mod context;
 pub mod model;
 pub mod session;
 
@@ -184,17 +185,15 @@ impl<'a, P: Policy + ?Sized> ToolCallAgent<'a, P> {
                             }),
                         }
                         let output = outcome.map_err(AgentError::Tool)?;
-                        // Context window protection: if a tool output exceeds 24,000 chars
-                        // (~6,000 tokens), truncate the middle so enormous outputs (e.g. `ls -R`
-                        // or large dumps) don't trigger context length exceeded HTTP 400 errors.
-                        let content = if output.content.chars().count() > 24000 {
-                            let head: String = output.content.chars().take(12000).collect();
-                            let tail: String = output.content.chars().skip(output.content.chars().count().saturating_sub(12000)).collect();
-                            let total = output.content.chars().count();
-                            format!("{head}\n\n[... truncated {} characters to fit context window ...]\n\n{tail}", total - 24000)
-                        } else {
-                            output.content.clone()
-                        };
+                        // Context window protection: middle-elide enormous tool
+                        // outputs (e.g. `ls -R` or large dumps) so a single result
+                        // can't blow the request budget on its own. Whole-history
+                        // compaction lives in crate::context, applied at send time.
+                        let content = crate::context::shrink_tool_output(
+                            &output.content,
+                            24_000,
+                            12_000,
+                        );
                         history.push(Message::text("tool", content));
                         if call.name == "terminate" {
                             terminate_answer = Some(output.content);
