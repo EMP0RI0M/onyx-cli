@@ -760,3 +760,67 @@ fn sse_data(line: &str) -> Option<String> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Message;
+
+    fn model_with_budget(budget: usize) -> HttpModel {
+        let mut m = HttpModel::new(
+            "127.0.0.1".into(),
+            1,
+            "test".into(),
+            "k".into(),
+            "catalog".into(),
+        );
+        m.context_budget = budget;
+        m
+    }
+
+    #[test]
+    fn build_messages_compacts_oversized_history() {
+        // A history far above a tiny budget must be folded before sending.
+        let mut h = vec![Message::text("system", "sys"), Message::text("user", "go")];
+        for _ in 0..6 {
+            h.push(Message::text("tool", "z".repeat(30_000)));
+            h.push(Message::text("user", "next"));
+        }
+        let raw_total: usize = h.iter().map(|m| crate::context::estimate_tokens(&m.content)).sum();
+        assert!(raw_total > 4096, "precondition: history busts the budget");
+
+        let msgs = model_with_budget(4096).build_messages(&h);
+        // The system prompt is always first; every other message was compacted
+        // so no single user/tool body carries the full 30k blob any more.
+        let biggest = msgs
+            .iter()
+            .skip(1)
+            .map(|m| m["content"].as_str().unwrap_or("").chars().count())
+            .max()
+            .unwrap_or(0);
+        assert!(biggest < 30_000, "expected shrink/fold, got a {biggest}-char body");
+        assert!(msgs.iter().any(|m| {
+            m["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("[Context compacted:")
+        }));
+    }
+
+    #[test]
+    fn build_messages_leaves_small_history_intact() {
+        let h = vec![
+            Message::text("system", "sys"),
+            Message::text("user", "hello"),
+            Message::text("assistant", "hi"),
+        ];
+        let msgs = model_with_budget(4096).build_messages(&h);
+        assert!(!msgs.iter().any(|m| {
+            m["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("[Context compacted:")
+        }));
+    }
+}
+

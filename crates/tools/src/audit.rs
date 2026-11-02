@@ -270,7 +270,7 @@ mod tests {
         let mut c = ToolCollection::new();
         c.add(FakeBash);
         // AskOnce would deny without an approver; Auto bypasses the policy.
-        let mut gw = Gateway::new(c, AskOnce);
+        let gw = Gateway::new(c, AskOnce);
         *gw.mode.lock().unwrap() = ApprovalMode::Auto;
         assert_eq!(gw.call("bash", &json!({"command": "ls"})).unwrap().content, "ls");
         assert!(gw.audit.snapshot()[0].outcome == "AUTO");

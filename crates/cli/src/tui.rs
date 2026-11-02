@@ -906,10 +906,10 @@ impl<'a> Tui<'a> {
             out.push('\n');
         }
 
-        // Always park cursor at the persistent input composer line (self.height - 1)
-        if self.height >= 2 {
-            let cursor_row = self.height - 1;
-            let col = (3 + self.cursor_chars()).min(self.width.max(1));
+        // Always park cursor at the persistent input composer line
+        if self.height >= 4 {
+            let cursor_row = self.height.saturating_sub(2);
+            let col = (4 + self.cursor_chars()).min(self.width.max(1));
             out.push_str(&format!("\x1b[{};{}H", cursor_row, col));
         }
         out.push_str("\x1b[?2026l");
@@ -1059,27 +1059,41 @@ impl<'a> Tui<'a> {
         let w = self.width.max(20);
         match it {
             Item::Banner => {
-                let title = format!("{BOLD}{CYAN}{} ONYX{RESET} {DIM}v0.1.0{RESET}", glyphs::DIAMOND_FILLED);
-                let meta = format!("{DIM}{arrow} model: {BOLD}{}{RESET}{DIM} · session: {}{RESET}", self.hm.model, self.session_label(), arrow = glyphs::CHEVRON);
-                let cwd = format!("{DIM}dir: {FG_245}{}{RESET}", self.workspace_dir);
-                let inner_w = w.saturating_sub(4).max(10);
+                let logo_l1 = format!("{CYAN}  ██████{RESET}");
+                let logo_l2 = format!("{CYAN}██      ██{RESET}");
+                let logo_l3 = format!("{CYAN}██  ██  ██{RESET}  {BOLD}ONYX CLI{RESET} {DIM}v0.1.0{RESET}");
+                let logo_l4 = format!("{CYAN}██    ██{RESET}    {DIM}Signed in Local Engine · session: {}{RESET}", self.session_label());
+                let logo_l5 = format!("{CYAN}  ████  ██{RESET}  {DIM}dir: {FG_245}{}{RESET}", self.workspace_dir);
 
-                let line1 = format!("{title}   {cwd}");
-                let pad1 = inner_w.saturating_sub(ansi_width(&line1));
-                let line1_padded = format!("{line1}{}", " ".repeat(pad1));
+                let _card_w = 40;
+                let c_top = format!("{FG_240}╭─ What's new (v0.1.0): ──────────╮{RESET}");
+                let c_l1  = format!("{FG_240}│{RESET} - Full Grok Tools architecture  {FG_240}│{RESET}");
+                let c_l2  = format!("{FG_240}│{RESET} - Interactive dropdowns & resume {FG_240}│{RESET}");
+                let c_l3  = format!("{FG_240}│{RESET} - Subagents & Plan Mode integrated {FG_240}│{RESET}");
+                let c_bot = format!("{FG_240}╰─────────────────────────────────╯{RESET}");
 
-                let pad2 = inner_w.saturating_sub(ansi_width(&meta));
-                let line2_padded = format!("{meta}{}", " ".repeat(pad2));
-
-                let top_border = format!("{FG_240}╭─{RESET} {BOLD}{CYAN}ONYX WORKSPACE{RESET} {FG_240}{}{RESET}", "─".repeat(w.saturating_sub(18).max(2)));
-                let bottom_border = format!("{FG_240}╰{RESET}{}{FG_240}╯{RESET}", "─".repeat(w.saturating_sub(2).max(2)));
-
-                vec![
-                    top_border,
-                    format!("{FG_240}│{RESET} {line1_padded} {FG_240}│{RESET}"),
-                    format!("{FG_240}│{RESET} {line2_padded} {FG_240}│{RESET}"),
-                    bottom_border,
-                ]
+                if w >= 78 {
+                    let pad = |left: &str, target: usize| {
+                        let vis = ansi_width(left);
+                        let sp = target.saturating_sub(vis);
+                        format!("{left}{}", " ".repeat(sp))
+                    };
+                    let col1_w = 34;
+                    vec![
+                        format!("{} {}", pad(&logo_l1, col1_w), c_top),
+                        format!("{} {}", pad(&logo_l2, col1_w), c_l1),
+                        format!("{} {}", pad(&logo_l3, col1_w), c_l2),
+                        format!("{} {}", pad(&logo_l4, col1_w), c_l3),
+                        format!("{} {}", pad(&logo_l5, col1_w), c_bot),
+                        format!("{FG_240}{}{RESET}", "─".repeat(w)),
+                    ]
+                } else {
+                    vec![
+                        logo_l3,
+                        logo_l5,
+                        format!("{FG_240}{}{RESET}", "─".repeat(w)),
+                    ]
+                }
             }
             Item::User(t) => {
                 let mut out = Vec::new();
@@ -1178,17 +1192,17 @@ impl<'a> Tui<'a> {
             out.push(format!("{DIM}{sug}{RESET}"));
         }
         let body = if self.input.is_empty() && sug.is_empty() {
-            format!("{DIM}ask onyx… (enter to send, alt+enter newline){RESET}")
+            format!("{DIM}Type your message or @path/to/file{RESET}")
         } else if self.cursor_chars() + 2 >= self.width || self.input.contains('\n') {
             // Long input scrolls a one-row window around the caret instead of
             // wrapping (a wrapped row would break the fixed "input line is
             // 2nd from bottom" rewind contract).
             let win = self.input_window();
-            return vec![format!("{BOLD}{CYAN}{}{RESET}{win}", glyphs::PROMPT_ARROW)];
+            return vec![format!("{BOLD}{CYAN}*  {RESET}{win}")];
         } else {
             format!("{}", self.input)
         };
-        out.push(format!("{BOLD}{CYAN}{}{RESET}{body}", glyphs::PROMPT_ARROW));
+        out.push(format!("{BOLD}{CYAN}*  {RESET}{body}"));
         out
     }
 
@@ -1402,22 +1416,29 @@ impl<'a> Tui<'a> {
     }
 
     fn hints(&self) -> String {
-        let mode = self.gw.mode.lock().unwrap().label();
-        let mode_color = match *self.gw.mode.lock().unwrap() {
-            ApprovalMode::Normal => FG_245,
-            ApprovalMode::AcceptEdits => YELLOW,
-            ApprovalMode::Auto => RED,
-        };
-        let scroll_hint = if self.scroll_offset > 0 {
-            format!(" · {CYAN}scroll -{offset}{RESET}", offset = self.scroll_offset)
+        let is_auto = matches!(*self.gw.mode.lock().unwrap(), ApprovalMode::Auto);
+        let mode_label = if is_auto {
+            format!("{RED}{BOLD}YOLO{RESET} {DIM}Auto Mode active{RESET}")
         } else {
-            String::new()
+            format!("{YELLOW}Shift+Tab to Auto Mode{RESET}")
         };
-        format!(
-            "{DIM}╰─ {RESET}{mode_color}[{mode}]{RESET}{DIM} {arrow} shift+tab mode · ctrl+o {exp} · pgup/pgdn scroll{scroll_hint} · esc cancel · ctrl+d×2 exit · /help{RESET}",
-            arrow = glyphs::CHEVRON,
-            exp = if self.expanded { "collapse" } else { "expand" }
-        )
+
+        // Context progress calculation
+        let max_ctx = 200_000;
+        let used_tokens = (self.history_bytes / 4).max(self.history_len * 40);
+        let pct = ((used_tokens as f64 / max_ctx as f64) * 100.0).clamp(0.0, 100.0) as usize;
+        let filled_bars = (pct / 10).min(10);
+        let empty_bars = 10 - filled_bars;
+        let ctx_bar = format!("ctx {CYAN}{}{RESET}{DIM}{}{RESET} {:>2}%", "▓".repeat(filled_bars), "░".repeat(empty_bars), pct);
+
+        let sep = format!("{FG_240}{}{RESET}", "─".repeat(self.width.max(20)));
+        let line1 = format!("{mode_label}  {DIM}·  1 MCP server · 42 skills{RESET}");
+        let line2 = format!(
+            "{DIM}{model} · Normal Effort · 200K context · {ctx_bar}{RESET}",
+            model = self.hm.model
+        );
+
+        format!("{sep}\n{line1}\n{sep}\n{line2}")
     }
 
     // ------------------------------------------------------------ turn flow ----

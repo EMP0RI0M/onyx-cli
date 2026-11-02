@@ -276,7 +276,7 @@ impl<M: Model + Clone + Send + 'static> Tool for SwarmTool<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent::{run_scripted_entry, Message, Step, ToolCall};
+    use agent::{run_scripted_entry, Message, Step};
     use serde_json::json;
 
     /// Replays a fixed script; once exhausted it terminates with `answer`.
