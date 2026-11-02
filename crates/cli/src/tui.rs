@@ -1051,14 +1051,26 @@ impl<'a> Tui<'a> {
         let w = self.width.max(20);
         match it {
             Item::Banner => {
-                let left = format!("{BOLD}{CYAN}{} ONYX{RESET} {DIM}v0.1.0{RESET}  {FG_245}{}{RESET}", glyphs::DIAMOND_FILLED, self.workspace_dir);
-                let right = format!("{DIM}{} · {}{RESET}", self.hm.model, self.session_label());
-                let left_w = ansi_width(&left);
-                let right_w = ansi_width(&right);
-                let pad = w.saturating_sub(left_w + right_w);
+                let title = format!("{BOLD}{CYAN}{} ONYX{RESET} {DIM}v0.1.0{RESET}", glyphs::DIAMOND_FILLED);
+                let meta = format!("{DIM}{arrow} model: {BOLD}{}{RESET}{DIM} · session: {}{RESET}", self.hm.model, self.session_label(), arrow = glyphs::CHEVRON);
+                let cwd = format!("{DIM}dir: {FG_245}{}{RESET}", self.workspace_dir);
+                let inner_w = w.saturating_sub(4).max(10);
+
+                let line1 = format!("{title}   {cwd}");
+                let pad1 = inner_w.saturating_sub(ansi_width(&line1));
+                let line1_padded = format!("{line1}{}", " ".repeat(pad1));
+
+                let pad2 = inner_w.saturating_sub(ansi_width(&meta));
+                let line2_padded = format!("{meta}{}", " ".repeat(pad2));
+
+                let top_border = format!("{FG_240}╭─{RESET} {BOLD}{CYAN}ONYX WORKSPACE{RESET} {FG_240}{}{RESET}", "─".repeat(w.saturating_sub(18).max(2)));
+                let bottom_border = format!("{FG_240}╰{RESET}{}{FG_240}╯{RESET}", "─".repeat(w.saturating_sub(2).max(2)));
+
                 vec![
-                    format!("{left}{}{right}", " ".repeat(pad)),
-                    format!("{FG_240}{}{RESET}", "─".repeat(w)),
+                    top_border,
+                    format!("{FG_240}│{RESET} {line1_padded} {FG_240}│{RESET}"),
+                    format!("{FG_240}│{RESET} {line2_padded} {FG_240}│{RESET}"),
+                    bottom_border,
                 ]
             }
             Item::User(t) => {
