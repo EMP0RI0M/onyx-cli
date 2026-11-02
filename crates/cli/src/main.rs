@@ -177,7 +177,35 @@ fn slash_command(line: &str, hm: &mut HttpModel, opts: &mut Opts, history: &mut 
                 println!("usage: /skill <name>");
             }
         }
-        "/help" => println!("commands: /model [name] /steps N /skill <name> /clear /quit"),
+        "/sessions" => {
+            let list = agent::session::list_sessions(12);
+            if list.is_empty() {
+                println!("no saved sessions yet");
+            }
+            for s in list {
+                let pv = if s.preview.is_empty() { "(no prompt)".to_string() } else { s.preview };
+                println!("  {} · {} msg · {}", s.id, s.messages, pv);
+            }
+            println!("/resume <id|prefix|suffix> to replay one");
+        }
+        "/res" | "/resume" => {
+            if let Some(q) = it.next() {
+                match agent::session::resolve_session(q) {
+                    None => println!("no session matches `{q}` (try /sessions)"),
+                    Some((path, msgs)) => {
+                        *history = msgs.clone();
+                        println!(
+                            "resumed {} message(s) from {}",
+                            msgs.len(),
+                            path.file_stem().and_then(|s| s.to_str()).unwrap_or("?")
+                        );
+                    }
+                }
+            } else {
+                println!("usage: /resume <id|prefix|suffix> (see /sessions)");
+            }
+        }
+        "/help" => println!("commands: /model [name] /steps N /skill <name> /sessions /resume <id> /clear /quit"),
         other => println!("unknown command `{other}` (try /help)"),
     }
     true

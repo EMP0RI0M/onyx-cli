@@ -1349,9 +1349,9 @@ impl<'a> Tui<'a> {
                 }
                 self.items.push(Item::Info("/resume <id|prefix> to replay one".into()));
             }
-            "/resume" => {
+            "/res" | "/resume" => {
                 match arg {
-                    None => self.items.push(Item::Info("usage: /resume <id|prefix>  (see /sessions)".into())),
+                    None => self.items.push(Item::Info("usage: /resume <id|prefix|suffix>  (see /sessions)".into())),
                     Some(q) => match agent::session::resolve_session(q) {
                         None => self.items.push(Item::Error(format!("no session matches `{q}` (try /sessions)"))),
                         Some((path, msgs)) => {
@@ -1373,13 +1373,36 @@ impl<'a> Tui<'a> {
                             if let Some(tx) = &self.ctl_tx {
                                 let _ = tx.send(Ctl::Resume(msgs.clone()));
                             }
+                            // Clear previous local items except banner before replaying resumed session
+                            self.items.retain(|it| matches!(it, Item::Banner));
                             // Mirror the replayed conversation into the visible scrollback.
                             for m in &msgs {
                                 match m.role.as_str() {
                                     "user" => self.items.push(Item::User(m.content.clone())),
                                     "assistant" => {
-                                        if !m.content.is_empty() {
-                                            self.items.push(Item::Answer(m.content.clone()));
+                                        if let Some(tc) = &m.tool_call {
+                                            if tc.name != "terminate" && tc.name != "ask_human" {
+                                                self.items.push(Item::Tool {
+                                                    name: tc.name.clone(),
+                                                    args: tc.args.to_string(),
+                                                    ok: true,
+                                                    denied: false,
+                                                    duration: None,
+                                                    output: String::new(),
+                                                });
+                                            }
+                                        } else if !m.content.is_empty() {
+                                            let clean = clean_model_text(&m.content);
+                                            if !clean.trim().is_empty() {
+                                                self.items.push(Item::Answer(clean));
+                                            }
+                                        }
+                                    }
+                                    "tool" => {
+                                        if let Some(Item::Tool { output, .. }) = self.items.last_mut() {
+                                            if output.is_empty() {
+                                                *output = m.content.clone();
+                                            }
                                         }
                                     }
                                     _ => {}

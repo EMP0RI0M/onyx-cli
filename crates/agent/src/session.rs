@@ -162,21 +162,36 @@ pub fn list_sessions(limit: usize) -> Vec<SessionInfo> {
     infos
 }
 
-/// Resolve a resume target by exact id or unique prefix; returns the message list.
+/// Resolve a resume target by exact id, prefix, or suffix; returns the message list.
 pub fn resolve_session(query: &str) -> Option<(PathBuf, Vec<Message>)> {
+    let q = query.trim().trim_end_matches(".jsonl");
+    if q.is_empty() {
+        return None;
+    }
     let dir = sessions_dir();
-    let exact = dir.join(format!("{query}.jsonl"));
+    let exact = dir.join(format!("{q}.jsonl"));
     if exact.exists() {
         return Some((exact.clone(), load_messages(&exact)));
     }
-    // Unique prefix match among stored ids.
-    let matches: Vec<PathBuf> = list_sessions(usize::MAX)
-        .into_iter()
-        .filter(|s| s.id.starts_with(query))
+    // Prefix or suffix match (e.g. `343c481b` from `1793621685-343c481b`)
+    let all = list_sessions(usize::MAX);
+    let prefix_matches: Vec<PathBuf> = all
+        .iter()
+        .filter(|s| s.id.starts_with(q))
         .map(|s| dir.join(format!("{}.jsonl", s.id)))
         .collect();
-    if matches.len() == 1 {
-        let p = matches.into_iter().next().unwrap();
+    if prefix_matches.len() == 1 {
+        let p = prefix_matches.into_iter().next().unwrap();
+        return Some((p.clone(), load_messages(&p)));
+    }
+
+    let suffix_or_substr_matches: Vec<PathBuf> = all
+        .iter()
+        .filter(|s| s.id.ends_with(q) || s.id.contains(q))
+        .map(|s| dir.join(format!("{}.jsonl", s.id)))
+        .collect();
+    if suffix_or_substr_matches.len() == 1 {
+        let p = suffix_or_substr_matches.into_iter().next().unwrap();
         return Some((p.clone(), load_messages(&p)));
     }
     None
