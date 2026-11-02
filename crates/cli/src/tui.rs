@@ -1104,8 +1104,8 @@ impl<'a> Tui<'a> {
 
         // Park the caret on the composer's input text row (❯ ...)
         if self.height >= 4 {
-            let slash_len = self.slash_dropdown_lines().len();
-            let cursor_row = self.height.saturating_sub(2 + slash_len);
+            let hints_count = fit_lines(&self.hints(), self.width.max(20)).len();
+            let cursor_row = self.height.saturating_sub(hints_count);
             let col = (5 + self.cursor_chars()).min(self.width.max(1));
             out.push_str(&format!("\x1b[{};{}H", cursor_row, col));
         }
@@ -1424,15 +1424,6 @@ impl<'a> Tui<'a> {
         let w = self.width.max(20);
         match it {
             Item::Banner => {
-                let logo_rows = [
-                    "███╗   ██╗ ██████╗ ███╗   ██╗",
-                    "████╗  ██║██╔═══██╗████╗  ██║",
-                    "██╔██╗ ██║██║   ██║██╔██╗ ██║",
-                    "██║╚██╗██║██║   ██║██║╚██╗██║",
-                    "██║ ╚████║╚██████╔╝██║ ╚████║",
-                    "╚═╝  ╚═══╝ ╚═════╝ ╚═╝  ╚═══╝",
-                ];
-
                 let (filled, empty, pct) = self.ctx_meter(18);
                 let ctx_bar = format!("{CYAN}{}{RESET}{DIM}{}{RESET} {:>3}%", "█".repeat(filled), "░".repeat(empty), pct);
 
@@ -1445,10 +1436,10 @@ impl<'a> Tui<'a> {
                 let mut lines = Vec::new();
 
                 // Centered ONYX Header
-                for row in logo_rows {
+                for row in Self::BANNER {
                     lines.push(center_pad(&format!("{CYAN}{row}{RESET}"), w));
                 }
-                lines.push(center_pad(&format!("{BOLD}{FG_MAIN}INTELLIGENCE ENGINE{RESET}"), w));
+                lines.push(center_pad(&format!("{BOLD}{CYAN}ONYX{RESET} {DIM}·{RESET} {BOLD}{FG_MAIN}INTELLIGENCE ENGINE{RESET}"), w));
                 lines.push(center_pad(&format!("{BORDER}━━━━━━━━━━━━━━━━━━━━━━━{RESET}"), w));
                 lines.push(String::new());
 
