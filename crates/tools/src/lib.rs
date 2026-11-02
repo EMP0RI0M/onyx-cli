@@ -156,7 +156,7 @@ pub fn default_collection(editor_base: std::path::PathBuf) -> ToolCollection {
     c.add(control::Terminate);
     c.add(control::AskHuman);
 
-    // Grok-build tools: read_file, list_dir, grep, search_replace, todo, plan mode, web_fetch
+    // Grok-build tools: read_file, list_dir, grep, search_replace, todo, plan mode, web_fetch, update_goal, task_output, kill_task, ask_user_question
     c.add(implementations::grok_build::ReadFile::new(editor_base.clone()));
     c.add(implementations::grok_build::ListDir::new(editor_base.clone()));
     c.add(implementations::grok_build::Grep::new(editor_base.clone()));
@@ -166,6 +166,10 @@ pub fn default_collection(editor_base: std::path::PathBuf) -> ToolCollection {
     c.add(implementations::grok_build::EnterPlanMode::new(plan_state.clone()));
     c.add(implementations::grok_build::ExitPlanMode::new(plan_state));
     c.add(implementations::grok_build::WebFetch);
+    c.add(implementations::grok_build::UpdateGoalTool::default());
+    c.add(implementations::grok_build::TaskOutputTool);
+    c.add(implementations::grok_build::KillTaskTool);
+    c.add(implementations::grok_build::AskUserQuestion);
 
     c
 }

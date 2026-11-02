@@ -91,10 +91,11 @@ pub fn capability_of(name: &str) -> Capability {
         "editor" | "read_file" | "list_dir" | "grep" | "search_replace" => Capability::Filesystem,
         "web_search" | "web_fetch" => Capability::Network,
         "vecmath" => Capability::Compute,
-        "planning" | "todo" => Capability::Planning,
+        "planning" | "todo" | "update_goal" => Capability::Planning,
         "enter_plan_mode" | "exit_plan_mode" => Capability::Planning,
         "spawn_subagent" | "swarm" => Capability::Orchestration,
-        "terminate" | "ask_human" => Capability::Meta,
+        "terminate" | "ask_human" | "ask_user_question" => Capability::Meta,
+        "get_task_output" | "kill_task" => Capability::Shell,
         _ if is_mcp_tool(name) => Capability::Remote,
         _ => Capability::Unknown,
     }
