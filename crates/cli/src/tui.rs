@@ -668,6 +668,7 @@ pub struct Tui<'a> {
     active_tool_start: Option<std::time::Instant>,
     workspace_dir: String,
     slash_selected: usize,
+    cached_models: Vec<String>,
 }
 
 
@@ -677,6 +678,7 @@ impl<'a> Tui<'a> {
         hm: &'a mut HttpModel,
         opts: &'a mut Opts,
     ) -> Self {
+        let cached_models = hm.list_models().unwrap_or_default();
         Self {
             gw,
             hm,
@@ -705,6 +707,7 @@ impl<'a> Tui<'a> {
             scroll_offset: 0,
             active_tool_start: None,
             slash_selected: 0,
+            cached_models,
             workspace_dir: std::env::current_dir()
                 .map(|p| {
                     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
@@ -1214,22 +1217,89 @@ impl<'a> Tui<'a> {
         self.input[..self.cursor].chars().count()
     }
 
-    fn matching_slash_commands(&self) -> Vec<(&'static str, &'static str)> {
-        if !self.input.starts_with('/') || self.input.contains(' ') {
-            return Vec::new();
+    fn matching_dropdown_items(&self) -> (String, Vec<(String, String, String)>) {
+        let input = self.input.trim_start();
+        if !input.starts_with('/') {
+            return (String::new(), Vec::new());
         }
-        let lower = self.input.to_lowercase();
-        SLASH_COMMANDS
-            .iter()
-            .copied()
-            .filter(|(c, _)| c.to_lowercase().starts_with(&lower))
-            .collect()
+
+        // Subcommand dropdown for /resume or /res
+        if input.starts_with("/resume") || input.starts_with("/res ") {
+            let arg = if let Some((_, rest)) = input.split_once(' ') {
+                rest.trim()
+            } else {
+                ""
+            };
+            let sessions = agent::session::list_sessions(20);
+            let mut items = Vec::new();
+            for s in sessions {
+                let id_short = if s.id.len() > 16 {
+                    format!("…{}", &s.id[s.id.len().saturating_sub(12)..])
+                } else {
+                    s.id.clone()
+                };
+                let title = if s.preview.is_empty() {
+                    "(empty session)".to_string()
+                } else {
+                    s.preview.clone()
+                };
+                let desc = format!("{title} ({msg} msgs)", msg = s.messages);
+                if arg.is_empty()
+                    || s.id.to_lowercase().contains(&arg.to_lowercase())
+                    || title.to_lowercase().contains(&arg.to_lowercase())
+                {
+                    items.push((s.id, id_short, desc));
+                }
+            }
+            return (" Resume Session (↑/↓ to choose, tab/enter to resume) ".into(), items);
+        }
+
+        // Subcommand dropdown for /model or /models
+        if input.starts_with("/model") || input.starts_with("/models") {
+            let arg = if let Some((_, rest)) = input.split_once(' ') {
+                rest.trim()
+            } else {
+                ""
+            };
+            let mut models = self.cached_models.clone();
+            if models.is_empty() {
+                models = vec![
+                    "gpt-oss-120b-medium".into(),
+                    "claude-opus-4-6-thinking".into(),
+                    "claude-sonnet-4-6".into(),
+                    "gemini-3.1-flash-lite".into(),
+                    "gemini-3.5-flash-lite".into(),
+                ];
+            }
+            let mut items = Vec::new();
+            for m in models {
+                let active = if m == self.hm.model { " [active]" } else { "" };
+                let desc = format!("model{active}");
+                if arg.is_empty() || m.to_lowercase().contains(&arg.to_lowercase()) {
+                    items.push((m.clone(), m, desc));
+                }
+            }
+            return (" Switch Model (↑/↓ to choose, tab/enter to select) ".into(), items);
+        }
+
+        // Top-level slash commands
+        if !input.contains(' ') {
+            let lower = input.to_lowercase();
+            let items = SLASH_COMMANDS
+                .iter()
+                .filter(|(c, _)| c.to_lowercase().starts_with(&lower))
+                .map(|(c, d)| (c.to_string(), c.to_string(), d.to_string()))
+                .collect();
+            return (" Commands (↑/↓ to select, tab/enter to apply) ".into(), items);
+        }
+
+        (String::new(), Vec::new())
     }
 
     /// Renders an interactive slash command popup card above the input composer
     /// modelled after Grok Build's slash dropdown.
     fn slash_dropdown_lines(&self) -> Vec<String> {
-        let matches = self.matching_slash_commands();
+        let (title, matches) = self.matching_dropdown_items();
         if matches.is_empty() {
             return Vec::new();
         }
@@ -1256,16 +1326,21 @@ impl<'a> Tui<'a> {
 
         let mut out = Vec::new();
         // Top border with title & key hint
-        let title = format!(" Commands (↑/↓ to select, tab/enter to apply) ");
         let right_pad = inner_w.saturating_sub(title.chars().count() + 2);
         out.push(format!(
             "{FG_240}╭─{RESET}{BOLD}{CYAN}{title}{RESET}{FG_240}{}{RESET}",
             "─".repeat(right_pad.max(2))
         ));
 
-        let cmd_col_w = 14;
+        let cmd_col_w = if title.contains("Resume") {
+            16
+        } else if title.contains("Model") {
+            26
+        } else {
+            14
+        };
 
-        for (idx, (cmd, desc)) in matches[start_idx..end_idx].iter().enumerate() {
+        for (idx, (_full, display_col, desc)) in matches[start_idx..end_idx].iter().enumerate() {
             let actual_idx = start_idx + idx;
             let is_sel = actual_idx == selected;
 
@@ -1276,9 +1351,9 @@ impl<'a> Tui<'a> {
             };
 
             let cmd_formatted = if is_sel {
-                format!("{BOLD}{CYAN}{:<width$}{RESET}", cmd, width = cmd_col_w)
+                format!("{BOLD}{CYAN}{:<width$}{RESET}", display_col, width = cmd_col_w)
             } else {
-                format!("{FG_250}{:<width$}{RESET}", cmd, width = cmd_col_w)
+                format!("{FG_250}{:<width$}{RESET}", display_col, width = cmd_col_w)
             };
 
             let desc_w = inner_w.saturating_sub(cmd_col_w + 3).max(8);
@@ -1389,7 +1464,7 @@ impl<'a> Tui<'a> {
                 }
                 self.items.push(Item::Info("conversation cleared".into()));
             }
-            "/model" => {
+            "/model" | "/models" => {
                 if let Some(m) = arg {
                     if let Some(tx) = &self.ctl_tx {
                         let _ = tx.send(Ctl::SetModel(m.to_string()));
@@ -1758,10 +1833,17 @@ impl<'a> Tui<'a> {
                     }
                     ('\0', 10) => self.cycle_mode(), // shift+tab
                     ('\t', _) => {
-                        let matches = self.matching_slash_commands();
+                        let (title, matches) = self.matching_dropdown_items();
                         if !matches.is_empty() {
                             let idx = self.slash_selected.min(matches.len() - 1);
-                            self.input = format!("{} ", matches[idx].0);
+                            let target = &matches[idx].0;
+                            if title.contains("Resume") {
+                                self.input = format!("/resume {target}");
+                            } else if title.contains("Model") {
+                                self.input = format!("/model {target}");
+                            } else {
+                                self.input = format!("{target} ");
+                            }
                             self.cursor = self.input.len();
                             self.slash_selected = 0;
                         } else {
@@ -1774,23 +1856,36 @@ impl<'a> Tui<'a> {
                         }
                     }
                     ('\r', _) => {
-                        let matches = self.matching_slash_commands();
-                        // If user opened dropdown by typing "/" or "/part" and hasn't typed arguments,
-                        // hitting Enter selects the highlighted command into the composer!
-                        if !matches.is_empty() && (!self.input.contains(' ') && self.input != matches[self.slash_selected.min(matches.len() - 1)].0) {
+                        let (title, matches) = self.matching_dropdown_items();
+                        if !matches.is_empty() {
                             let idx = self.slash_selected.min(matches.len() - 1);
-                            let cmd = matches[idx].0;
-                            // If command takes arguments, fill it with a trailing space so user can type args.
-                            // If it's a zero-arg command (like /clear, /tools, /exit, /mode), submit directly!
-                            if cmd == "/clear" || cmd == "/tools" || cmd == "/exit" || cmd == "/mode" || cmd == "/help" || cmd == "/usage" || cmd == "/audit" || cmd == "/sessions" {
-                                self.input = cmd.to_string();
+                            let target = &matches[idx].0;
+                            if title.contains("Resume") {
+                                // Resume immediately!
+                                self.input = format!("/resume {target}");
                                 self.cursor = self.input.len();
                                 self.slash_selected = 0;
                                 self.submit();
-                            } else {
-                                self.input = format!("{cmd} ");
+                            } else if title.contains("Model") {
+                                // Switch model immediately!
+                                self.input = format!("/model {target}");
                                 self.cursor = self.input.len();
                                 self.slash_selected = 0;
+                                self.submit();
+                            } else if !self.input.contains(' ') && self.input != *target {
+                                let cmd = target;
+                                if cmd == "/clear" || cmd == "/tools" || cmd == "/exit" || cmd == "/mode" || cmd == "/help" || cmd == "/usage" || cmd == "/audit" || cmd == "/sessions" {
+                                    self.input = cmd.to_string();
+                                    self.cursor = self.input.len();
+                                    self.slash_selected = 0;
+                                    self.submit();
+                                } else {
+                                    self.input = format!("{cmd} ");
+                                    self.cursor = self.input.len();
+                                    self.slash_selected = 0;
+                                }
+                            } else {
+                                self.submit();
                             }
                         } else {
                             self.submit();
@@ -1826,8 +1921,8 @@ impl<'a> Tui<'a> {
                         self.scroll_offset = self.scroll_offset.saturating_sub(5);
                     }
                     ('\0', 1000) => {
-                        // up arrow: navigate slash dropdown if active, else scroll conversation
-                        let matches = self.matching_slash_commands();
+                        // up arrow: navigate dropdown if active, else scroll conversation
+                        let (_, matches) = self.matching_dropdown_items();
                         if !matches.is_empty() {
                             let total = matches.len();
                             self.slash_selected = (self.slash_selected + total - 1) % total;
@@ -1836,8 +1931,8 @@ impl<'a> Tui<'a> {
                         }
                     }
                     ('\0', 1001) => {
-                        // down arrow: navigate slash dropdown if active, else scroll conversation
-                        let matches = self.matching_slash_commands();
+                        // down arrow: navigate dropdown if active, else scroll conversation
+                        let (_, matches) = self.matching_dropdown_items();
                         if !matches.is_empty() {
                             let total = matches.len();
                             self.slash_selected = (self.slash_selected + 1) % total;

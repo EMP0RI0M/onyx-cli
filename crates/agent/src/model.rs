@@ -245,7 +245,7 @@ impl HttpModel {
         }
     }
 
-/// One-shot completion for non-agent callers (e.g. the guardian judge):
+    /// One-shot completion for non-agent callers (e.g. the guardian judge):
     /// post a ready-made chat-completions body, return `choices[0].message.content`.
     pub fn chat_raw(&self, body_json: &str) -> Result<String, String> {
         let auth = if self.key.is_empty() { None } else { Some(self.key.as_str()) };
@@ -259,6 +259,27 @@ impl HttpModel {
             .and_then(|c| c.as_str())
             .unwrap_or("")
             .to_string())
+    }
+
+    /// List models available on the gateway (`/v1/models`).
+    pub fn list_models(&self) -> Result<Vec<String>, String> {
+        let auth = if self.key.is_empty() { None } else { Some(self.key.as_str()) };
+        let models_path = if self.path.contains("/chat/completions") {
+            self.path.replace("/chat/completions", "/models")
+        } else {
+            "/v1/models".to_string()
+        };
+        let raw = http_request("GET", &self.host, self.port, &models_path, auth, None)?;
+        let v: Value = serde_json::from_str(&raw).map_err(|e| format!("parse models: {e}"))?;
+        let mut ids = Vec::new();
+        if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
+            for m in arr {
+                if let Some(id) = m.get("id").and_then(|i| i.as_str()) {
+                    ids.push(id.to_string());
+                }
+            }
+        }
+        Ok(ids)
     }
 
     fn build_messages(&self, history: &[Message]) -> Vec<Value> {
