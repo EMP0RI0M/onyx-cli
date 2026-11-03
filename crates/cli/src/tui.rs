@@ -509,12 +509,20 @@ struct AskState {
     pending: Option<(String, String, String)>,
     answer: Option<Approval>,
     approve_all: bool,
+    question_pending: Option<(String, Vec<String>)>,
+    question_answer: Option<Result<String, String>>,
 }
 
 impl AskCtl {
     fn new() -> Self {
         Self {
-            state: Mutex::new(AskState { pending: None, answer: None, approve_all: false }),
+            state: Mutex::new(AskState {
+                pending: None,
+                answer: None,
+                approve_all: false,
+                question_pending: None,
+                question_answer: None,
+            }),
             cv: std::sync::Condvar::new(),
         }
     }
@@ -541,6 +549,26 @@ impl AskCtl {
     fn answer(&self, reply: Approval) {
         let mut s = self.state.lock().unwrap();
         s.answer = Some(reply);
+        self.cv.notify_all();
+    }
+
+    fn request_question(&self, question: &str, options: &[String]) -> Result<String, String> {
+        let mut s = self.state.lock().unwrap();
+        s.question_pending = Some((question.to_string(), options.to_vec()));
+        s.question_answer = None;
+        while s.question_answer.is_none() {
+            s = self.cv.wait(s).unwrap();
+        }
+        let ans = s.question_answer.take().unwrap_or_else(|| Err("cancelled".into()));
+        s.question_pending = None;
+        ans
+    }
+    fn pending_question(&self) -> Option<(String, Vec<String>)> {
+        self.state.lock().unwrap().question_pending.clone()
+    }
+    fn answer_question(&self, reply: Result<String, String>) {
+        let mut s = self.state.lock().unwrap();
+        s.question_answer = Some(reply);
         self.cv.notify_all();
     }
 }
@@ -573,7 +601,7 @@ fn clean_model_text(text: &str) -> String {
             let tool_name = rest[..open_paren].trim();
             if let Some(close_paren) = rest.rfind(')') {
                 let inside = &rest[open_paren + 1..close_paren];
-                if tool_name == "ask_human" || tool_name == "terminate" {
+                if tool_name == "ask_human" || tool_name == "terminate" || tool_name == "ask_user_question" {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(inside) {
                         if let Some(q) = v.get("question").or_else(|| v.get("content")).or_else(|| v.get("answer")).and_then(|s| s.as_str()) {
                             return q.to_string();
@@ -588,7 +616,7 @@ fn clean_model_text(text: &str) -> String {
     if t.starts_with('{') && t.contains("\"tool\"") {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(t) {
             let tool = v.get("tool").and_then(|s| s.as_str()).unwrap_or("");
-            if tool == "terminate" || tool == "ask_human" {
+            if tool == "terminate" || tool == "ask_human" || tool == "ask_user_question" {
                 if let Some(args) = v.get("args") {
                     if let Some(content) = args.get("content").or_else(|| args.get("question")).or_else(|| args.get("answer")).and_then(|c| c.as_str()) {
                         return content.to_string();
@@ -655,7 +683,7 @@ fn pretty_action(name: &str, args: &str) -> String {
         }
         return "Searched web".to_string();
     }
-    if name == "ask_human" {
+    if name == "ask_human" || name == "ask_user_question" {
         return "Asked user for input".to_string();
     }
     format!("Executed {name} ({})", clip_chars(&pretty_args(name, args), 40))
@@ -672,7 +700,7 @@ fn pretty_args(name: &str, args: &str) -> String {
             return format!("$ {}", clip_chars(first_line(cmd), 90));
         }
     }
-    if name == "ask_human" {
+    if name == "ask_human" || name == "ask_user_question" {
         if let Some(q) = obj.get("question").or_else(|| obj.get("content")).and_then(|x| x.as_str()) {
             return format!("question: {}", clip_chars(first_line(q), 90));
         }
@@ -858,6 +886,7 @@ pub struct Tui<'a> {
     active_tool_start: Option<std::time::Instant>,
     workspace_dir: String,
     slash_selected: usize,
+    question_selected: usize,
     cached_models: Vec<String>,
     mcp_count: usize,
     skill_count: usize,
@@ -919,6 +948,7 @@ impl<'a> Tui<'a> {
             scroll_offset: 0,
             active_tool_start: None,
             slash_selected: 0,
+            question_selected: 0,
             cached_models,
             mcp_count,
             skill_count,
@@ -1005,9 +1035,16 @@ impl<'a> Tui<'a> {
             // Approver runs ON the worker thread (it blocks on AskCtl). It may
             // only touch Sync state — AskCtl is enough: the main thread renders
             // the approval card from `ask.pending()` while it polls keys.
+            let ask_for_gw = Arc::clone(&ask);
             gw.set_approver(move |tool: &str, args: &str, reason: &str| -> Approval {
-                ask.request(tool, args, reason)
+                ask_for_gw.request(tool, args, reason)
             });
+
+            // Register interactive hook for structured questions (ask_user_question)
+            let ask_for_hook = Arc::clone(&ask);
+            tools::implementations::grok_build::set_question_hook(Arc::new(move |q: &str, opts: &[String]| -> Result<String, String> {
+                ask_for_hook.request_question(q, opts)
+            }));
 
             while let Ok(msg) = cr.recv() {
                 match msg {
@@ -1214,7 +1251,7 @@ impl<'a> Tui<'a> {
                 out
             }
             Item::Tool { name, args, ok, denied, duration: _, output } => {
-                if name == "terminate" || name == "ask_human" {
+                if name == "terminate" || name == "ask_human" || name == "ask_user_question" {
                     return Vec::new();
                 }
                 let mut out = Vec::new();
@@ -1301,6 +1338,58 @@ impl<'a> Tui<'a> {
             out.push(format!(
                 "{YELLOW}└{RESET}  {BOLD}[y]{RESET} Approve once   {BOLD}[a]{RESET} Always approve   {BOLD}[n]{RESET} Deny"
             ));
+        }
+        out
+    }
+
+    fn question_lines_v(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let w = self.width.max(20);
+        if let Some((question, options)) = self.ask.pending_question() {
+            // Header
+            out.push(format!("{BOLD}{CYAN}Asking User{RESET}"));
+            out.push(format!("{BORDER}{}{RESET}", "─".repeat(w.saturating_sub(2))));
+
+            // Question prompt text
+            for ql in fit_lines(&question, w.saturating_sub(4)) {
+                out.push(format!(" {FG_MAIN}{ql}{RESET}"));
+            }
+            out.push(String::new());
+
+            // Options list
+            let selected = self.question_selected.min(options.len().saturating_sub(1));
+            for (idx, opt) in options.iter().enumerate() {
+                let num = idx + 1;
+                let is_sel = idx == selected;
+                let prefix = if is_sel {
+                    format!(" {CYAN}❯{RESET} {CYAN}{BOLD}{num}.{RESET}")
+                } else {
+                    format!("   {DIM}{num}.{RESET}")
+                };
+
+                let opt_lines = fit_lines(opt, w.saturating_sub(8));
+                for (li, ol) in opt_lines.into_iter().enumerate() {
+                    if li == 0 {
+                        if is_sel {
+                            out.push(format!("{prefix} {BOLD}{FG_MAIN}{ol}{RESET}"));
+                        } else {
+                            out.push(format!("{prefix} {FG_MAIN}{ol}{RESET}"));
+                        }
+                    } else {
+                        let indent = "      ";
+                        if is_sel {
+                            out.push(format!("{indent}{BOLD}{FG_MAIN}{ol}{RESET}"));
+                        } else {
+                            out.push(format!("{indent}{FG_SEC}{ol}{RESET}"));
+                        }
+                    }
+                }
+            }
+
+            // Divider & footer actions
+            out.push(String::new());
+            out.push(format!("{BORDER} {}{RESET}", "─".repeat(w.saturating_sub(4))));
+            out.push(format!(" {DIM}↑↓ navigate · Enter select · 1..9 jump · Esc cancel{RESET}"));
         }
         out
     }
@@ -1488,25 +1577,8 @@ impl<'a> Tui<'a> {
     /// Shadow-block ONYX wordmark (6 rows × 30 cols). Rendered only when the
     /// frame is wide enough; otherwise a compact one-line mark is used. The
     /// ratatui header tints each glyph with an animated cyan→blue gradient.
-    const BANNER: &'static [&'static str] = &[
-        "██████╗ ███╗   ██╗██╗   ██╗██╗  ██╗",
-        "██╔═══██╗████╗  ██║╚██╗ ██╔╝╚██╗██╔╝",
-        "██║   ██║██╔██╗ ██║ ╚████╔╝  ╚███╔╝ ",
-        "██║   ██║██║╚██╗██║  ╚██╔╝   ██╔██╗ ",
-        "╚██████╔╝██║ ╚████║   ██║   ██╔╝ ██╗",
-        " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝  ╚═╝",
-    ];
-
-    /// Antigravity-style block-glyph logo (5 rows). Sits to the left of the
-    /// identity column in the header; drawn as a single muted tint so it reads
-    /// as a solid mark rather than the shimmering wordmark.
-    const LOGO: &'static [&'static str] = &[
-        "    ▄▀▀▄",
-        "   ▀▀▀▀▀▀",
-        "  ▀▀▀▀▀▀▀▀",
-        " ▄▀▀    ▀▀▄",
-        "▄▀▀      ▀▀▄",
-    ];
+    /// Compact block-glyph mark (2 rows) for the legacy ANSI banner item.
+    const BANNER: &'static [&'static str] = &["█▀ █▀ ▄▀█ █▀", "▄█ ▄█ ▀▀█ ▄█"];
 
     fn submit(&mut self) {
         let text = self.input.clone();
@@ -1822,7 +1894,7 @@ impl<'a> Tui<'a> {
                 }
             }
             AgentEvent::ToolStart { name, args } => {
-                if name == "terminate" || name == "ask_human" {
+                if name == "terminate" || name == "ask_human" || name == "ask_user_question" {
                     // Do not print internal control calls as noisy execution cards
                     return;
                 }
@@ -1839,7 +1911,7 @@ impl<'a> Tui<'a> {
                 });
             }
             AgentEvent::ToolDone { name, ok, output } => {
-                if name == "terminate" || name == "ask_human" {
+                if name == "terminate" || name == "ask_human" || name == "ask_user_question" {
                     return;
                 }
                 let dur = self.active_tool_start.take().map(|t| t.elapsed());
@@ -1983,6 +2055,53 @@ impl<'a> Tui<'a> {
                         'n' | 'N' => self.ask.answer(Approval::Reject),
                         _ => {}
                     }
+                }
+                paint(self);
+                continue;
+            }
+
+            // Interactive Question popup swallows keys while asking user.
+            if let Some((_q, options)) = self.ask.pending_question() {
+                let first = chars[0];
+                let count = options.len();
+                match (first, code) {
+                    ('\0', 1000) => {
+                        // Up arrow
+                        if count > 0 {
+                            self.question_selected = (self.question_selected + count - 1) % count;
+                        }
+                    }
+                    ('\0', 1001) => {
+                        // Down arrow
+                        if count > 0 {
+                            self.question_selected = (self.question_selected + 1) % count;
+                        }
+                    }
+                    ('\r', _) | ('\n', _) => {
+                        // Enter select
+                        if !options.is_empty() {
+                            let idx = self.question_selected.min(count - 1);
+                            let selected_text = options[idx].clone();
+                            self.ask.answer_question(Ok(selected_text));
+                        } else {
+                            self.ask.answer_question(Ok("confirmed".to_string()));
+                        }
+                        self.question_selected = 0;
+                    }
+                    ('\x1b', _) | ('\x03', _) => {
+                        // Escape / Ctrl+C cancels question
+                        self.ask.answer_question(Err("User cancelled question".to_string()));
+                        self.question_selected = 0;
+                    }
+                    (c, 0) if c >= '1' && c <= '9' => {
+                        let num = (c as usize) - ('0' as usize);
+                        if num <= count {
+                            let selected_text = options[num - 1].clone();
+                            self.ask.answer_question(Ok(selected_text));
+                            self.question_selected = 0;
+                        }
+                    }
+                    _ => {}
                 }
                 paint(self);
                 continue;
@@ -2326,24 +2445,39 @@ impl<'a> Tui<'a> {
         f.buffer_mut().set_style(area, theme::base());
         let w = area.width.max(20) as usize;
 
-        // ── header (ONYX wordmark + intelligence engine subtitle) ──
-        let wide_header = w >= 40 && area.height >= 14;
-        let mut header_rows: Vec<RuLine> = Self::BANNER
+        // ── header (centered block-glyph ONYX banner + tagline) ──
+        let account = std::env::var("ONYX_ACCOUNT").unwrap_or_else(|_| "local".to_string());
+        let wide_header = w >= 40 && area.height >= 12;
+        const BANNER_ROWS: [&'static str; 6] = [
+            "██████╗ ███╗   ██╗██╗   ██╗██╗  ██╗",
+            "██╔═══██╗████╗  ██║╚██╗ ██╔╝╚██╗██╔╝",
+            "██║   ██║██╔██╗ ██║ ╚████╔╝  ╚███╔╝ ",
+            "██║   ██║██║╚██╗██║  ╚██╔╝   ██╔██╗ ",
+            "╚██████╔╝██║ ╚████║   ██║   ██╔╝ ██╗",
+            " ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚═╝  ╚═╝",
+        ];
+        let banner_rows: Vec<RuLine> = BANNER_ROWS
             .iter()
             .map(|row| {
-                RuLine::from(vec![RuSpan::styled(
-                    row.to_string(),
-                    theme::accent_bold(),
-                )])
+                // Graphemes, not bytes: row.len() would make the pad negative for
+                // wide UTF-8 and saturate to 0 (banner jams left).
+                RuLine::from(vec![
+                    RuSpan::raw(" ".repeat((w.saturating_sub(row.chars().count())) / 2)),
+                    RuSpan::styled(*row, theme::accent_bold()),
+                ])
             })
             .collect();
-        header_rows.push(RuLine::from(vec![
-            RuSpan::styled("ONYX ", theme::accent_bold()),
-            RuSpan::styled("· ", theme::dim()),
-            RuSpan::styled("INTELLIGENCE ENGINE", theme::strong()),
-        ]));
-        // Header height: 6 banner rows + 1 subtitle row = 7 in wide, 1 in compact
-        let header_h = if wide_header { 7u16 } else { 1u16 };
+        let model_title = title_case_model(&self.hm.model);
+        let tagline_text = format!("ONYX {account} · {model_title}");
+        let tagline = RuLine::from(vec![
+            RuSpan::raw(" ".repeat(w.saturating_sub(tagline_text.chars().count()) / 2)),
+            RuSpan::styled("ONYX ", theme::strong()),
+            RuSpan::styled(account.clone(), theme::rgb(theme::INFO)),
+            RuSpan::styled(" · ", theme::dim()),
+            RuSpan::styled(model_title, theme::dim()),
+        ]);
+        // Header: 7 rows (banner + tagline) when wide, 1 compact row otherwise.
+        let header_h = if wide_header { 8u16 } else { 1u16 };
         let compact_mark = RuLine::from(vec![
             RuSpan::styled("◆ ", theme::accent_bold()),
             RuSpan::styled("ONYX · INTELLIGENCE ENGINE", theme::strong()),
@@ -2384,6 +2518,18 @@ impl<'a> Tui<'a> {
             Vec::new()
         };
 
+        // ── interactive question popup (only when asking user) ──
+        let question_active = self.ask.pending_question().is_some();
+        let question_lines: Vec<RuLine> = if question_active {
+            self.question_lines_v()
+                .into_iter()
+                .flat_map(|l| fit_lines(&l, w))
+                .map(|l| Self::ansi_to_line(&l))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // ── slash dropdown (only when typing "/…") ──
         let (dd_title, dd_matches) = self.matching_dropdown_items();
         let dropdown_active = !dd_matches.is_empty();
@@ -2398,6 +2544,7 @@ impl<'a> Tui<'a> {
         let composer_h = 3u16; // top border + input + bottom border
         let footer_h = 1u16; // status bar only (key-hint row removed)
         let approval_h = approval_lines.len() as u16;
+        let question_h = question_lines.len() as u16;
 
         let mut constraints = vec![
             Constraint::Length(header_h),
@@ -2406,6 +2553,9 @@ impl<'a> Tui<'a> {
         ];
         if approval_active {
             constraints.push(Constraint::Length(approval_h));
+        }
+        if question_active {
+            constraints.push(Constraint::Length(question_h));
         }
         if dropdown_active {
             constraints.push(Constraint::Length(dropdown_height));
@@ -2428,6 +2578,13 @@ impl<'a> Tui<'a> {
         } else {
             Rect::ZERO
         };
+        let question_area = if question_active {
+            let q = chunks[ci];
+            ci += 1;
+            q
+        } else {
+            Rect::ZERO
+        };
         let dropdown_area = if dropdown_active {
             let d = chunks[ci];
             ci += 1;
@@ -2441,10 +2598,10 @@ impl<'a> Tui<'a> {
 
         // ── header ──
         if wide_header {
-            f.render_widget(
-                RuParagraph::new(header_rows).alignment(RuAlignment::Center),
-                header_area,
-            );
+            let mut head = banner_rows;
+            head.push(tagline);
+            head.push(RuLine::from(vec![]));
+            f.render_widget(RuParagraph::new(head), header_area);
         } else {
             f.render_widget(
                 RuParagraph::new(vec![compact_mark]).alignment(RuAlignment::Left),
@@ -2495,6 +2652,12 @@ impl<'a> Tui<'a> {
         if approval_active {
             let ap = RuParagraph::new(approval_lines);
             f.render_widget(ap, approval_area);
+        }
+
+        // ── interactive question popup ──
+        if question_active {
+            let qp = RuParagraph::new(question_lines);
+            f.render_widget(qp, question_area);
         }
 
         // ── slash dropdown ──

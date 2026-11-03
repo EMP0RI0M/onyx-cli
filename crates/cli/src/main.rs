@@ -10,6 +10,7 @@
 //! OpenAI-compatible gateway (OmniRoute on loopback by default; ONYX_BASE_URL).
 
 mod markdown;
+mod theme;
 mod tui;
 
 use agent::model::{omniroute_config, HttpModel};

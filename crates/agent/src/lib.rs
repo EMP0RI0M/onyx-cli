@@ -7,6 +7,7 @@
 //! loop is testable with zero network and zero secrets.
 
 pub mod context;
+pub mod core_bridge;
 pub mod model;
 pub mod session;
 

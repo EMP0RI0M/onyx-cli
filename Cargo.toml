@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/kernel", "crates/tools", "crates/terminal", "crates/agent", "crates/guardian", "crates/sandbox", "crates/subagent", "crates/mcp", "crates/skills", "crates/cli"]
+members = ["crates/kernel", "crates/tools", "crates/terminal", "crates/agent", "crates/guardian", "crates/sandbox", "crates/subagent", "crates/mcp", "crates/skills", "crates/core", "crates/cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,9 +10,12 @@ license = "MIT"
 [workspace.dependencies]
 kernel = { path = "crates/kernel" }
 tools = { path = "crates/tools" }
+onyx-core = { path = "crates/core" }
 libc = "0.2"
 serde_json = "1"
 tungstenite = "0.24"
+ratatui = "0.30"
+crossterm = "0.29"
 
 [profile.release]
 opt-level = 3

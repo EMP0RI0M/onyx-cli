@@ -10,7 +10,7 @@ pub mod todo;
 pub mod update_goal;
 pub mod web_fetch;
 
-pub use ask_user_question::AskUserQuestion;
+pub use ask_user_question::{clear_question_hook, set_question_hook, AskUserQuestion, QuestionHook};
 pub use enter_plan_mode::{EnterPlanMode, ExitPlanMode, PlanState};
 pub use grep::Grep;
 pub use list_dir::ListDir;
