@@ -622,6 +622,45 @@ fn clean_model_text(text: &str) -> String {
     text.to_string()
 }
 
+fn pretty_action(name: &str, args: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(args).unwrap_or_else(|_| serde_json::json!(args));
+    let obj = match v.as_object() {
+        Some(o) => o,
+        None => return format!("Ran {name} ({})", clip_chars(&v.to_string(), 40)),
+    };
+    if name == "bash" || name == "shell" {
+        if let Some(cmd) = obj.get("command").or_else(|| obj.get("cmd")).and_then(|x| x.as_str()) {
+            let first = first_line(cmd).trim();
+            return format!("Ran command ({first})");
+        }
+        return "Ran command".to_string();
+    }
+    if name == "editor" || name == "file_write" {
+        let path = obj.get("path").or_else(|| obj.get("file_path")).and_then(|x| x.as_str()).unwrap_or("file");
+        let filename = PathBuf::from(path).file_name().and_then(|f| f.to_str()).map(|s| s.to_string()).unwrap_or_else(|| path.to_string());
+        let cmd = obj.get("command").and_then(|x| x.as_str()).unwrap_or("");
+        if cmd == "create" || cmd == "write" {
+            return format!("Created 1 file ({filename})");
+        }
+        return format!("Edited 1 file ({filename})");
+    }
+    if name == "file_read" || name == "view" {
+        let path = obj.get("path").or_else(|| obj.get("file_path")).and_then(|x| x.as_str()).unwrap_or("file");
+        let filename = PathBuf::from(path).file_name().and_then(|f| f.to_str()).map(|s| s.to_string()).unwrap_or_else(|| path.to_string());
+        return format!("Explored 1 file ({filename})");
+    }
+    if name == "websearch" || name == "web_search" {
+        if let Some(q) = obj.get("query").and_then(|x| x.as_str()) {
+            return format!("Searched web ({})", clip_chars(q, 40));
+        }
+        return "Searched web".to_string();
+    }
+    if name == "ask_human" {
+        return "Asked user for input".to_string();
+    }
+    format!("Executed {name} ({})", clip_chars(&pretty_args(name, args), 40))
+}
+
 fn pretty_args(name: &str, args: &str) -> String {
     let v: serde_json::Value = serde_json::from_str(args).unwrap_or_else(|_| serde_json::json!(args));
     let obj = match v.as_object() {
@@ -1174,58 +1213,35 @@ impl<'a> Tui<'a> {
                 out.push(String::new());
                 out
             }
-            Item::Tool { name, args, ok, denied, duration, output } => {
+            Item::Tool { name, args, ok, denied, duration: _, output } => {
                 if name == "terminate" || name == "ask_human" {
                     return Vec::new();
                 }
                 let mut out = Vec::new();
-                out.push(format!("  {CYAN}◈{RESET} {BOLD}{FG_MAIN}ONYX{RESET}"));
-
-                let card_w = w.saturating_sub(6).min(58).max(30);
-                let inner_c = card_w.saturating_sub(2);
-                let (border_color, status_icon, status_label) = if *denied {
-                    (RED, format!("{RED}✗{RESET}"), "Denied by policy")
+                let dot = if *denied {
+                    format!("{RED}●{RESET}")
                 } else if *ok {
-                    (GREEN, format!("{GREEN}✓{RESET}"), "Executed successfully")
+                    format!("{GREEN}●{RESET}")
                 } else {
-                    (YELLOW, format!("{YELLOW}⠋{RESET}"), "Executing your request...")
+                    let frame = SPINNER[self.tick % SPINNER.len()];
+                    format!("{YELLOW}{frame}{RESET}")
                 };
 
-                let dur_str = match duration {
-                    Some(d) => format!(" ({:.2}s)", d.as_secs_f32()),
-                    None => String::new(),
-                };
-
-                out.push(format!("  {border_color}┌{}┐{RESET}", "─".repeat(inner_c)));
-                
-                let line_in_card = |content: &str, border_c: &str| {
-                    let vis = ansi_width(content);
-                    let pad = inner_c.saturating_sub(vis + 1);
-                    format!("  {border_c}│{RESET} {content}{}{border_c}│{RESET}", " ".repeat(pad))
-                };
-
-                out.push(line_in_card(&format!("{BOLD}{status_label}{dur_str}{RESET}"), border_color));
-                out.push(line_in_card("", border_color));
-                out.push(line_in_card(&format!("{status_icon} {BOLD}{name}{RESET} {DIM}{}{RESET}", pretty_args(name, args)), border_color));
-
-                if !output.is_empty() {
-                    if self.expanded {
-                        out.push(line_in_card("", border_color));
-                        out.push(line_in_card(&format!("{DIM}Output:{RESET}"), border_color));
-                        for ol in output.lines().take(12) {
-                            let clipped = clip_chars(ol, inner_c.saturating_sub(4));
-                            out.push(line_in_card(&format!("{FG_SEC}{clipped}{RESET}"), border_color));
-                        }
-                        if output.lines().count() > 12 {
-                            out.push(line_in_card(&format!("{DIM}… (more lines hidden){RESET}"), border_color));
-                        }
-                    } else {
-                        let lines_cnt = output.lines().count();
-                        out.push(line_in_card(&format!("{DIM}└ <{lines_cnt} lines output · ctrl+o to toggle>{RESET}"), border_color));
+                let desc = pretty_action(name, args);
+                if self.expanded && !output.is_empty() {
+                    out.push(format!("  {dot} {BOLD}{FG_MAIN}{desc}{RESET} {DIM}(ctrl+o to collapse){RESET}"));
+                    for ol in output.lines().take(15) {
+                        let clipped = clip_chars(ol, w.saturating_sub(8));
+                        out.push(format!("    {FG_SEC}{clipped}{RESET}"));
                     }
+                    if output.lines().count() > 15 {
+                        out.push(format!("    {DIM}… (more lines hidden){RESET}"));
+                    }
+                } else if !output.is_empty() {
+                    out.push(format!("  {dot} {BOLD}{FG_MAIN}{desc}{RESET} {DIM}(ctrl+o to expand){RESET}"));
+                } else {
+                    out.push(format!("  {dot} {BOLD}{FG_MAIN}{desc}{RESET}"));
                 }
-
-                out.push(format!("  {border_color}└{}┘{RESET}", "─".repeat(inner_c)));
                 out
             }
             Item::Answer(t) => {
