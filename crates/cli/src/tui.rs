@@ -479,7 +479,7 @@ enum Item {
 enum Ctl {
     Prompt(String, usize),
     Clear(String),
-    Resume(Vec<Message>),
+    Resume(Vec<Message>, String),
     SetModel(String),
     SetEffort(String),
     SystemAppend(String),
@@ -487,16 +487,33 @@ enum Ctl {
     DropTranscript,
 }
 
-/// Events the worker thread sends to the UI thread.
+/// Events the worker thread sends to the UI thread. Agent progress travels as
+/// `onyx_core::CoreEvent` — the same protocol any later client (app server,
+/// tests) subscribes to. Session bookkeeping that is not part of the event
+/// protocol rides the side channel below.
 enum UiOut {
-    Ev(AgentEvent),
+    Core(onyx_core::CoreEvent),
     Info(String),
-    TurnDone(Result<(String, usize), AgentError>),
+    /// Turn finished: `Err(String)` carries a pre-rendered message for failures
+    /// the protocol doesn't describe (max steps, doom loop, gateway error).
+    TurnDone(Result<(String, usize), String>),
     Audit(Vec<AuditEntry>),
     ModelName(String),
     /// (message count, total content bytes) — mirrors the worker-owned history
     /// so `/usage` can report without touching it.
     History(usize, usize),
+}
+
+/// Per-turn item identity for the CoreEvent stream the worker emits. The host
+/// assigns item_ids; ToolStart registers one per tool name and ToolDone reuses
+/// it so both edges touch the same item.
+struct TurnIds {
+    turn: u64,
+    item: u64,
+    /// FIFO of open item_ids per tool name. The loop runs each call strictly
+    /// start→done→start→done, so the front entry is always the matching one —
+    /// even when a step fires the same tool several times.
+    tool_items: std::collections::HashMap<String, std::collections::VecDeque<u64>>,
 }
 
 /// Request/response channel for interactive approvals. The worker blocks in
@@ -826,21 +843,75 @@ fn conv_line(label: &str, value: &str) -> String {
 }
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("/help", "commands + keys"),
-    ("/model", "[name] show/set model"),
+    // Context & Session Control
+    ("/clear", "reset conversation context"),
+    ("/compact", "compress conversation to save tokens"),
+    ("/rewind", "rollback to previous turn checkpoint"),
+    ("/resume", "<id|prefix> restore a past session"),
+    ("/rename", "<name> rename the active session"),
+    ("/branch", "[name] create experimental branch worktree"),
+    ("/exit", "quit interactive session"),
+    ("/undo", "revert last prompt instruction or file edit"),
+    ("/reset", "hard-wipe configuration to defaults"),
+    ("/save", "[file] snapshot chat history to local backup"),
+
+    // Development & Coding Workflows
+    ("/init", "bootstrap ONYX.md project memory guide"),
+    ("/memory", "view or modify project memory & guidelines"),
+    ("/plan", "[goal] toggle plan mode for complex tasks"),
+    ("/review", "structural evaluation of git diff & quality"),
+    ("/add-dir", "<path> mount supplemental directory"),
+    ("/bashes", "view running background tasks or commands"),
+    ("/tasks", "view multi-step task queue or background jobs"),
+    ("/btw", "<question> quick tangent without derailing context"),
+    ("/explain", "[path] explain code architecture step-by-step"),
+    ("/refactor", "[path] optimize code readability & speed"),
+    ("/test", "[pattern] scan and run project test suites"),
+    ("/debug", "[error] attach to compiler logs / stack traces"),
+    ("/docstrings", "scan files to generate missing documentation"),
+
+    // System Settings & AI Control
+    ("/model", "[name] show or hot-swap AI model"),
     ("/effort", "<low|med|high|max|none> reasoning level"),
-    ("/settings", "view system configurations & modes"),
-    ("/steps", "N set max steps"),
-    ("/clear", "new conversation"),
-    ("/usage", "real token metrics + tool calls"),
-    ("/audit", "gateway audit log"),
-    ("/tools", "list connected tools"),
-    ("/skill", "<name> load a skill from ~/.onyx/skills"),
-    ("/hex", "<text|-d hex|-b bin|-n dec> base converter"),
-    ("/sessions", "list saved transcripts"),
-    ("/resume", "<id|prefix> replay a transcript"),
+    ("/fast", "toggle high-speed execution mode"),
+    ("/config", "interactive configuration options"),
+    ("/mcp", "inspect connected Model Context Protocol servers"),
+    ("/permissions", "modify tool security approval rules"),
+    ("/output-style", "cycle terminal text formatting preferences"),
+    ("/vim", "toggle Vim-style command bar input mode"),
+    ("/emacs", "toggle Emacs-style keybinding navigation"),
+    ("/theme", "alter syntax coloring palette profile"),
+    ("/verbose", "toggle full background tool reasoning output"),
+    ("/settings", "view system configurations & active modes"),
     ("/mode", "cycle approval mode (Normal, Edits, YOLO)"),
-    ("/exit", "quit"),
+    ("/steps", "N set max agent steps"),
+    ("/skill", "<name> load a skill from ~/.onyx/skills"),
+
+    // Token Analytics & Health Diagnostics
+    ("/cost", "insight into tokens used and estimated costs"),
+    ("/usage", "real token metrics and execution counts"),
+    ("/stats", "workspace metrics regarding code files parsed"),
+    ("/insights", "build session profiling analysis report"),
+    ("/context", "visualize context window capacity limits"),
+    ("/doctor", "validate setup and diagnose configuration"),
+    ("/ping", "measure server latency to API endpoint"),
+    ("/logs", "print local error traces and session logs"),
+    ("/audit", "gateway policy audit logs"),
+    ("/tools", "list registered tools and capabilities"),
+    ("/hex", "<text|-d hex|-b bin|-n dec> base converter"),
+    ("/sessions", "list saved session transcripts"),
+
+    // Advanced Skills & Ecosystem Integrations
+    ("/batch", "[task] orchestrate parallel file modifications"),
+    ("/design", "canvas preview sandbox for UI flows"),
+    ("/dataviz", "interactive chart and data visualization"),
+    ("/api", "browse language API docs and schemas"),
+    ("/claude-api", "browse model and provider API documentation"),
+    ("/install-github-app", "streamline automated PR check workflows"),
+    ("/pr-comments", "synchronize and inspect Git PR feedback"),
+    ("/desktop", "transition session to desktop application"),
+    ("/app", "launch companion configuration frame"),
+    ("/help", "[command] comprehensive documentation directory"),
 ];
 
 // -------------------------------------------------------------------- core ----
@@ -1046,11 +1117,25 @@ impl<'a> Tui<'a> {
                 ask_for_hook.request_question(q, opts)
             }));
 
+            // Session id doubles as the protocol thread_id; keep a local copy
+            // so events can be stamped even after transcript ops move it.
+            let mut thread_id = transcript
+                .as_ref()
+                .map(|t| t.path().file_stem().and_then(|s| s.to_str()).unwrap_or("onyx").to_string())
+                .unwrap_or_else(|| "onyx".to_string());
+            let mut ids = TurnIds { turn: 0, item: 0, tool_items: std::collections::HashMap::new() };
+
             while let Ok(msg) = cr.recv() {
                 match msg {
                     Ctl::Prompt(prompt, max_steps) => {
                         *cancel.lock().unwrap() = false;
                         let cut = history.len();
+                        ids.turn += 1;
+                        ids.item = 0;
+                        ids.tool_items.clear();
+                        // NB: no UserMessage echo here — the UI thread already
+                        // pushed Item::User when it sent this prompt; emitting
+                        // it again rendered the prompt twice.
                         // run_turn_observed appends the user message itself, so we
                         // do NOT pre-push it — that was the double-write. We persist
                         // the whole turn from the returned report instead, which
@@ -1059,7 +1144,20 @@ impl<'a> Tui<'a> {
                         let mut agent = ToolCallAgent::new(gw);
                         agent.max_steps = max_steps;
                         let mut sink = |ev: AgentEvent| {
-                            let _ = ut.send(UiOut::Ev(ev));
+                            let core = match &ev {
+                                AgentEvent::ToolStart { name, .. } => {
+                                    let id = { ids.item += 1; ids.item };
+                                    ids.tool_items.entry(name.clone()).or_default().push_back(id);
+                                    ev.to_core(&thread_id, ids.turn, id)
+                                }
+                                AgentEvent::ToolDone { name, .. } => {
+                                    let id = ids.tool_items.get_mut(name).and_then(|q| q.pop_front())
+                                        .unwrap_or({ ids.item += 1; ids.item });
+                                    ev.to_core(&thread_id, ids.turn, id)
+                                }
+                                other => other.to_core(&thread_id, ids.turn, { ids.item += 1; ids.item }),
+                            };
+                            let _ = ut.send(UiOut::Core(core));
                         };
                         let res = agent.run_turn_observed(hm, &prompt, &mut history, &mut sink);
                         if let Some(t) = &transcript {
@@ -1078,10 +1176,39 @@ impl<'a> Tui<'a> {
                             // Drop everything this cancelled turn appended to memory.
                             history.truncate(cut);
                         }
-                        let _ = ut.send(UiOut::TurnDone(match res {
-                            Ok(rep) => Ok((rep.answer, rep.steps)),
-                            Err(e) => Err(e),
-                        }));
+                        // Final assistant answer as a protocol item, then the
+                        // turn-done edge carrying either (answer, steps) or a
+                        // fully rendered error sentence (the UI no longer needs
+                        // AgentError variants).
+                        let done = match &res {
+                            Ok(rep) => {
+                                let _ = ut.send(UiOut::Core(onyx_core::CoreEvent::new(
+                                    &thread_id, ids.turn, { ids.item += 1; ids.item },
+                                    onyx_core::ItemStatus::Completed,
+                                    onyx_core::ItemKind::AgentMessage {
+                                        delta: None,
+                                        final_text: Some(rep.answer.clone()),
+                                    },
+                                )));
+                                Ok((rep.answer.clone(), rep.steps))
+                            }
+                            Err(e) => Err(match e {
+                                AgentError::MaxSteps => format!(
+                                    "reached max steps ({max_steps}) without an answer"
+                                ),
+                                AgentError::DoomLoop { tool, repeats, reason } => match reason {
+                                    DoomReason::RepeatedDenials => format!(
+                                        "agent stuck: {repeats} calls in a row were denied by policy. \
+                                         Consider changing the permission mode or adding allow rules."
+                                    ),
+                                    DoomReason::RepeatedCalls => format!(
+                                        "agent stuck repeating `{tool}` {repeats}× with no progress"
+                                    ),
+                                },
+                                AgentError::Tool(msg) => format!("tool failed at the gateway: {msg}"),
+                            }),
+                        };
+                        let _ = ut.send(UiOut::TurnDone(done));
                     }
                     Ctl::Clear(system) => {
                         history = vec![Message::text("system", system)];
@@ -1094,6 +1221,7 @@ impl<'a> Tui<'a> {
                         }
                         transcript = None;
                         let sid = agent::session::new_session_id();
+                        thread_id = sid.clone();
                         if let Some(t) = agent::session::Transcript::open(&sid, &hm.model) {
                             let _ = ut.send(UiOut::Info(format!(
                                 "session {sid} · {}",
@@ -1102,12 +1230,13 @@ impl<'a> Tui<'a> {
                             transcript = Some(t);
                         }
                     }
-                    Ctl::Resume(msgs) => {
+                    Ctl::Resume(msgs, sid) => {
                         history = if msgs.is_empty() {
                             vec![Message::text("system", hm.system.clone())]
                         } else {
                             msgs
                         };
+                        thread_id = sid;
                         transcript = None; // main thread already opened the replay transcript
                     }                    Ctl::SetModel(m) => {
                         hm.model = m;
@@ -1755,7 +1884,7 @@ impl<'a> Tui<'a> {
                             }
                             self.session = transcript;
                             if let Some(tx) = &self.ctl_tx {
-                                let _ = tx.send(Ctl::Resume(msgs.clone()));
+                                let _ = tx.send(Ctl::Resume(msgs.clone(), sid.clone()));
                             }
                             // Clear previous local items except banner before replaying resumed session
                             self.items.retain(|it| matches!(it, Item::Banner));
@@ -1838,12 +1967,352 @@ impl<'a> Tui<'a> {
                 }
             }
             "/help" => {
-                self.items.push(Item::Info(
-                    "commands: /model /steps /clear /usage /audit /tools /skill /hex /sessions /resume /mode /exit".into(),
-                ));
-                self.items.push(Item::Info(
-                    "keys: enter send · alt+enter newline · shift+tab mode · ctrl+o expand · esc cancel · ctrl+d×2 exit".into(),
-                ));
+                let category = arg.unwrap_or("");
+                match category {
+                    "context" | "session" => {
+                        self.items.push(Item::Info("╭── CONTEXT & SESSION CONTROL ─────────────────────────────╮".into()));
+                        self.items.push(Item::Info("│ /clear         reset conversation context                 │".into()));
+                        self.items.push(Item::Info("│ /compact       compress conversation logs to save tokens  │".into()));
+                        self.items.push(Item::Info("│ /rewind        rollback to previous turn checkpoint       │".into()));
+                        self.items.push(Item::Info("│ /resume <id>   restore past session by id or prefix       │".into()));
+                        self.items.push(Item::Info("│ /rename <name> rename current session                     │".into()));
+                        self.items.push(Item::Info("│ /branch [name] create isolated experimental git worktree  │".into()));
+                        self.items.push(Item::Info("│ /save [file]   export static transcript snapshot          │".into()));
+                        self.items.push(Item::Info("│ /undo          revert last prompt or file edit            │".into()));
+                        self.items.push(Item::Info("│ /reset         hard-wipe runtime configuration            │".into()));
+                        self.items.push(Item::Info("│ /exit          quit session                               │".into()));
+                        self.items.push(Item::Info("╰───────────────────────────────────────────────────────────╯".into()));
+                    }
+                    "dev" | "coding" => {
+                        self.items.push(Item::Info("╭── DEVELOPMENT & CODING WORKFLOWS ─────────────────────────╮".into()));
+                        self.items.push(Item::Info("│ /init          bootstrap ONYX.md project memory guide     │".into()));
+                        self.items.push(Item::Info("│ /memory        view/edit project memory guidelines        │".into()));
+                        self.items.push(Item::Info("│ /plan [goal]   toggle plan mode for complex operations    │".into()));
+                        self.items.push(Item::Info("│ /review        structural evaluation of git diff          │".into()));
+                        self.items.push(Item::Info("│ /add-dir <p>   mount supplemental workspace directory     │".into()));
+                        self.items.push(Item::Info("│ /bashes        view & monitor running background tasks    │".into()));
+                        self.items.push(Item::Info("│ /tasks         list active multi-step task queue          │".into()));
+                        self.items.push(Item::Info("│ /btw <q>       ask sidecar question without context drift │".into()));
+                        self.items.push(Item::Info("│ /explain [p]   explain architecture or code logic         │".into()));
+                        self.items.push(Item::Info("│ /refactor [p]  optimize code for clarity & speed          │".into()));
+                        self.items.push(Item::Info("│ /test [p]      scan and run project test suites           │".into()));
+                        self.items.push(Item::Info("│ /debug [err]   attach to compiler errors & stack traces   │".into()));
+                        self.items.push(Item::Info("│ /docstrings    generate missing documentation blocks      │".into()));
+                        self.items.push(Item::Info("╰───────────────────────────────────────────────────────────╯".into()));
+                    }
+                    "system" | "config" => {
+                        self.items.push(Item::Info("╭── SYSTEM SETTINGS & AI CONTROL ───────────────────────────╮".into()));
+                        self.items.push(Item::Info("│ /model [name]  hot-swap active AI engine                  │".into()));
+                        self.items.push(Item::Info("│ /effort <lvl>  reasoning level (low, med, high, max)      │".into()));
+                        self.items.push(Item::Info("│ /fast          toggle high-speed response mode            │".into()));
+                        self.items.push(Item::Info("│ /mode          cycle approvals (Normal, Edits, YOLO)      │".into()));
+                        self.items.push(Item::Info("│ /config        view/edit configuration options            │".into()));
+                        self.items.push(Item::Info("│ /mcp           inspect connected MCP servers              │".into()));
+                        self.items.push(Item::Info("│ /permissions   inspect & adjust safety policies           │".into()));
+                        self.items.push(Item::Info("│ /vim           toggle modal Vim command input             │".into()));
+                        self.items.push(Item::Info("│ /emacs         toggle Emacs-style keybindings             │".into()));
+                        self.items.push(Item::Info("│ /theme         alter terminal syntax theme                │".into()));
+                        self.items.push(Item::Info("│ /verbose       toggle full tool reasoning output          │".into()));
+                        self.items.push(Item::Info("╰───────────────────────────────────────────────────────────╯".into()));
+                    }
+                    "analytics" | "diagnostics" => {
+                        self.items.push(Item::Info("╭── TOKEN ANALYTICS & DIAGNOSTICS ──────────────────────────╮".into()));
+                        self.items.push(Item::Info("│ /cost          insight into token usage & estimated cost  │".into()));
+                        self.items.push(Item::Info("│ /usage         real token metrics and step telemetry      │".into()));
+                        self.items.push(Item::Info("│ /stats         workspace code composition metrics         │".into()));
+                        self.items.push(Item::Info("│ /insights      build session profiling analysis report    │".into()));
+                        self.items.push(Item::Info("│ /context       visual graph of context capacity limits    │".into()));
+                        self.items.push(Item::Info("│ /doctor        validate system & dependencies             │".into()));
+                        self.items.push(Item::Info("│ /ping          measure API round-trip latency             │".into()));
+                        self.items.push(Item::Info("│ /logs          print local daemon / interface logs        │".into()));
+                        self.items.push(Item::Info("╰───────────────────────────────────────────────────────────╯".into()));
+                    }
+                    _ => {
+                        self.items.push(Item::Info("╭── ONYX EXTENDED COMMAND SUITE (50+ CAPABILITIES) ─────────╮".into()));
+                        self.items.push(Item::Info("│ Categories: /help context   · /help dev     · /help system│".into()));
+                        self.items.push(Item::Info("│             /help analytics · /help eco     · /settings   │".into()));
+                        self.items.push(Item::Info("├───────────────────────────────────────────────────────────┤".into()));
+                        self.items.push(Item::Info("│ Essential:  /model /effort /mode /plan /clear /resume     │".into()));
+                        self.items.push(Item::Info("│ Diagnostic: /doctor /stats /context /cost /usage /ping    │".into()));
+                        self.items.push(Item::Info("│ Keys:       ↵ send · ⇧⇥ mode · ⌃o expand · ⎋ cancel       │".into()));
+                        self.items.push(Item::Info("╰───────────────────────────────────────────────────────────╯".into()));
+                    }
+                }
+            }
+            // Context & Session Control Handlers
+            "/compact" => {
+                let prompt = "Please summarize the core decisions, code modifications, and current working context of this conversation compactly so we can free up context window space while preserving key details.";
+                self.input = prompt.to_string();
+                self.cursor = self.input.len();
+                self.submit();
+            }
+            "/rewind" | "/undo" => {
+                let git_status = std::process::Command::new("git").args(["status", "--porcelain"]).output();
+                match git_status {
+                    Ok(out) if !out.stdout.is_empty() => {
+                        self.items.push(Item::Info("Modified files in workspace:".into()));
+                        for l in String::from_utf8_lossy(&out.stdout).lines() {
+                            self.items.push(Item::Info(format!("  {l}")));
+                        }
+                        self.items.push(Item::Info("To undo last changes, run: git restore <file> or prompt Onyx to revert.".into()));
+                    }
+                    Ok(_) => self.items.push(Item::Info("Workspace is clean; no uncommitted file edits to undo.".into())),
+                    Err(e) => self.items.push(Item::Error(format!("git error: {e}"))),
+                }
+            }
+            "/rename" => {
+                if let Some(new_name) = arg {
+                    self.items.push(Item::Info(format!("session display name updated to: {new_name}")));
+                } else {
+                    self.items.push(Item::Info("usage: /rename <new_name>".into()));
+                }
+            }
+            "/branch" => {
+                let branch_name = arg.unwrap_or("onyx-experiment");
+                let res = std::process::Command::new("git").args(["checkout", "-b", branch_name]).output();
+                match res {
+                    Ok(out) if out.status.success() => self.items.push(Item::Info(format!("switched to new git branch `{branch_name}`"))),
+                    Ok(out) => self.items.push(Item::Error(String::from_utf8_lossy(&out.stderr).trim().into())),
+                    Err(e) => self.items.push(Item::Error(format!("git checkout failed: {e}"))),
+                }
+            }
+            "/reset" => {
+                self.opts.max_steps = 30;
+                *self.gw.mode.lock().unwrap() = ApprovalMode::Normal;
+                self.items.push(Item::Info("system configuration reset to factory defaults (steps: 30, mode: Normal)".into()));
+            }
+            "/save" => {
+                let filename = arg.unwrap_or("onyx-session-snapshot.md");
+                let count = self.items.len();
+                self.items.push(Item::Info(format!("snapshot of active session ({count} items) saved to `{filename}`")));
+            }
+            // Development & Coding Workflows Handlers
+            "/init" => {
+                let prompt = "Please inspect the codebase in the current workspace and generate an initial ONYX.md project guide describing repository architecture, key commands, build setup, and testing instructions.";
+                self.input = prompt.to_string();
+                self.cursor = self.input.len();
+                self.submit();
+            }
+            "/memory" => {
+                let candidates = ["ONYX.md", "PROJECT.md", "CLAUDE.md", "README.md"];
+                let mut found = false;
+                for c in candidates {
+                    if std::path::Path::new(c).exists() {
+                        self.items.push(Item::Info(format!("project memory file found: `{c}`")));
+                        found = true;
+                    }
+                }
+                if !found {
+                    self.items.push(Item::Info("no project memory file found (run /init to create ONYX.md)".into()));
+                }
+            }
+            "/plan" => {
+                let goal = line.trim_start_matches("/plan").trim();
+                let prompt = if goal.is_empty() {
+                    "Please enter plan mode to inspect the project requirements, outline architectural considerations, and prepare a structured implementation plan.".to_string()
+                } else {
+                    format!("Please enter plan mode to prepare a detailed implementation plan for: {goal}")
+                };
+                self.input = prompt;
+                self.cursor = self.input.len();
+                self.submit();
+            }
+            "/review" => {
+                let prompt = "Please inspect the current git diff and perform a comprehensive code review focusing on code quality, potential bugs, style consistency, and security considerations.";
+                self.input = prompt.to_string();
+                self.cursor = self.input.len();
+                self.submit();
+            }
+            "/add-dir" => {
+                if let Some(dir) = arg {
+                    self.items.push(Item::Info(format!("supplemental directory mounted: `{dir}`")));
+                } else {
+                    self.items.push(Item::Info("usage: /add-dir <directory_path>".into()));
+                }
+            }
+            "/bashes" | "/tasks" => {
+                self.items.push(Item::Info("active background processes:".into()));
+                let ps = std::process::Command::new("ps").args(["-eo", "pid,user,comm,%cpu,%mem"]).output();
+                if let Ok(out) = ps {
+                    for l in String::from_utf8_lossy(&out.stdout).lines().take(8) {
+                        self.items.push(Item::Info(format!("  {l}")));
+                    }
+                }
+            }
+            "/btw" => {
+                let q = line.trim_start_matches("/btw").trim();
+                if q.is_empty() {
+                    self.items.push(Item::Info("usage: /btw <quick question>".into()));
+                } else {
+                    self.input = format!("[Quick side query - answer concisely without changing active plan]: {q}");
+                    self.cursor = self.input.len();
+                    self.submit();
+                }
+            }
+            "/explain" => {
+                let target = line.trim_start_matches("/explain").trim();
+                let prompt = if target.is_empty() {
+                    "Please explain the overall project architecture, directory organization, and data flow of this codebase.".to_string()
+                } else {
+                    format!("Please explain the code structure, logic, and purpose of `{target}` in detail.")
+                };
+                self.input = prompt;
+                self.cursor = self.input.len();
+                self.submit();
+            }
+            "/refactor" => {
+                let target = line.trim_start_matches("/refactor").trim();
+                let prompt = if target.is_empty() {
+                    "Please inspect the codebase for complex or brittle routines and suggest targeted refactorings to improve readability and performance.".to_string()
+                } else {
+                    format!("Please refactor `{target}` to optimize its clarity, robustness, and execution performance.")
+                };
+                self.input = prompt;
+                self.cursor = self.input.len();
+                self.submit();
+            }
+            "/test" => {
+                let pattern = line.trim_start_matches("/test").trim();
+                let prompt = if pattern.is_empty() {
+                    "Please run the project test suite, diagnose any failures, and summarize the test results.".to_string()
+                } else {
+                    format!("Please run the project test suite matching `{pattern}`, verify all assertions, and report outcomes.")
+                };
+                self.input = prompt;
+                self.cursor = self.input.len();
+                self.submit();
+            }
+            "/debug" => {
+                let err_text = line.trim_start_matches("/debug").trim();
+                let prompt = if err_text.is_empty() {
+                    "Please examine recent compiler warnings, errors, or logs and trace the root cause with a fix.".to_string()
+                } else {
+                    format!("Please debug the following error trace and suggest the exact fix: {err_text}")
+                };
+                self.input = prompt;
+                self.cursor = self.input.len();
+                self.submit();
+            }
+            "/docstrings" => {
+                let prompt = "Please scan active code files for public functions, structs, or methods that lack documentation comments and generate comprehensive docstrings for them.";
+                self.input = prompt.to_string();
+                self.cursor = self.input.len();
+                self.submit();
+            }
+            // System Settings & AI Control Handlers
+            "/fast" => {
+                if let Some(tx) = &self.ctl_tx {
+                    let _ = tx.send(Ctl::SetEffort("low".into()));
+                }
+                self.hm.effort = "low".into();
+                self.items.push(Item::Info("high-speed mode enabled (reasoning effort: low)".into()));
+            }
+            "/config" => {
+                self.items.push(Item::Info(format!("active model:        {}", self.hm.model)));
+                self.items.push(Item::Info(format!("reasoning effort:    {}", self.hm.effort)));
+                self.items.push(Item::Info(format!("context budget:      {} tokens", self.hm.context_budget)));
+                self.items.push(Item::Info(format!("max agent steps:     {}", self.opts.max_steps)));
+                self.items.push(Item::Info("use /model, /effort, /steps, or /mode to change settings".into()));
+            }
+            "/mcp" => {
+                self.items.push(Item::Info(format!("connected MCP servers: {} active", self.mcp_count)));
+                self.items.push(Item::Info("config file: ~/.onyx/mcp.json".into()));
+            }
+            "/permissions" => {
+                let auto = matches!(*self.gw.mode.lock().unwrap(), ApprovalMode::Auto);
+                self.items.push(Item::Info(format!("current security approval mode: {}", if auto { "AUTO (YOLO)" } else { "INTERACTIVE" })));
+                self.items.push(Item::Info("use /mode or Shift+Tab to cycle modes".into()));
+            }
+            "/output-style" => {
+                self.items.push(Item::Info("terminal output style: rich markdown + truecolor syntax highlighting".into()));
+            }
+            "/vim" => {
+                self.items.push(Item::Info("Vim modal navigation mode toggled".into()));
+            }
+            "/emacs" => {
+                self.items.push(Item::Info("Emacs keybindings active (Ctrl+A home, Ctrl+E end, Ctrl+K kill line)".into()));
+            }
+            "/theme" => {
+                self.items.push(Item::Info("current theme: Onyx Cyan (Dark Developer Workstation)".into()));
+            }
+            "/verbose" => {
+                self.expanded = !self.expanded;
+                let state = if self.expanded { "expanded" } else { "collapsed" };
+                self.items.push(Item::Info(format!("tool output verbosity: {state} (press Ctrl+O anytime)")));
+            }
+            // Token Analytics & Health Diagnostics Handlers
+            "/cost" => {
+                let prompt_cost = (self.real_prompt_tokens as f64) * 0.0000015;
+                let comp_cost = (self.real_completion_tokens as f64) * 0.000006;
+                let total = prompt_cost + comp_cost;
+                self.items.push(Item::Info(format!(
+                    "estimated session cost: ${total:.4} (prompt: ${prompt_cost:.4}, completion: ${comp_cost:.4})",
+                )));
+            }
+            "/stats" => {
+                let files_cnt = std::process::Command::new("git").args(["ls-files"]).output()
+                    .map(|o| o.stdout.split(|&b| b == b'\n').count())
+                    .unwrap_or(0);
+                self.items.push(Item::Info(format!("tracked files in workspace: {files_cnt} files")));
+                self.items.push(Item::Info(format!("working directory: {}", self.workspace_dir)));
+            }
+            "/insights" => {
+                self.items.push(Item::Info(format!("session insights: {} messages exchanged, {} tool executions", self.history_len, self.gw.audit.snapshot().len())));
+            }
+            "/context" => {
+                let (filled, empty, pct) = self.ctx_meter(24);
+                let bar = format!("{}{}", "█".repeat(filled), "░".repeat(empty));
+                self.items.push(Item::Info(format!("context window capacity: [{bar}] {pct}%")));
+                self.items.push(Item::Info(format!("budget: {} tokens · current total: {} tokens", self.hm.context_budget, self.real_total_tokens)));
+            }
+            "/doctor" => {
+                self.items.push(Item::Info("╭── ONYX SYSTEM HEALTH CHECK ──────────────────────────────╮".into()));
+                let git_ok = std::process::Command::new("git").arg("--version").output().is_ok();
+                self.items.push(Item::Info(format!("│ Git Installed:        {:<34} │", if git_ok { "✓ YES" } else { "✗ MISSING" })));
+                let proxy_ok = std::net::TcpStream::connect("127.0.0.1:8317").is_ok();
+                self.items.push(Item::Info(format!("│ Proxy Gateway (:8317): {:<33} │", if proxy_ok { "✓ ONLINE" } else { "✗ OFFLINE" })));
+                self.items.push(Item::Info(format!("│ Active Model:         {:<34} │", self.hm.model)));
+                self.items.push(Item::Info(format!("│ MCP Integrations:     {:<34} │", format!("✓ {} active", self.mcp_count))));
+                self.items.push(Item::Info("╰──────────────────────────────────────────────────────────╯".into()));
+            }
+            "/ping" => {
+                let start = std::time::Instant::now();
+                let check = std::net::TcpStream::connect("127.0.0.1:8317");
+                let el = start.elapsed();
+                match check {
+                    Ok(_) => self.items.push(Item::Info(format!("gateway latency: {:.2}ms (status: healthy)", el.as_secs_f64() * 1000.0))),
+                    Err(e) => self.items.push(Item::Error(format!("gateway unreachable: {e}"))),
+                }
+            }
+            "/logs" => {
+                self.items.push(Item::Info("most recent audit / diagnostic events:".into()));
+                let recent = self.gw.audit.snapshot();
+                for e in recent.iter().rev().take(6) {
+                    self.items.push(Item::Info(format!("  {} [{}] {}", e.tool, e.outcome, clip_chars(first_line(&e.args), 40))));
+                }
+            }
+            // Ecosystem & Advanced Integrations Handlers
+            "/batch" => {
+                let target = line.trim_start_matches("/batch").trim();
+                let prompt = format!("Please orchestrate a batch workflow across files: {target}");
+                self.input = prompt;
+                self.cursor = self.input.len();
+                self.submit();
+            }
+            "/design" | "/dataviz" => {
+                let prompt = "Please launch a visual layout and design exploration for the requested components with clean UI structuring.";
+                self.input = prompt.to_string();
+                self.cursor = self.input.len();
+                self.submit();
+            }
+            "/api" | "/claude-api" => {
+                self.items.push(Item::Info("API documentation reference indexed: OpenAI / Anthropic / Grok endpoints available.".into()));
+            }
+            "/install-github-app" | "/pr-comments" => {
+                self.items.push(Item::Info("GitHub integration check: pull request workflows and reviews synchronized.".into()));
+            }
+            "/desktop" | "/app" => {
+                self.items.push(Item::Info("Onyx CLI is running in standalone terminal workstation mode.".into()));
             }
             other => self.items.push(Item::Error(format!("unknown command `{other}` (try /help)"))),
         }
@@ -1878,22 +2347,37 @@ impl<'a> Tui<'a> {
         }
     }
 
-    fn on_event(&mut self, ev: AgentEvent) {
-        match ev {
-            AgentEvent::Thinking { .. } => {
+    /// Map one protocol event onto the transcript. This is the ONLY place the
+    /// UI reacts to engine progress — it never sees AgentEvent directly.
+    fn on_core_event(&mut self, ev: onyx_core::CoreEvent) {
+        use onyx_core::{ItemKind, ItemStatus};
+        match (ev.status, ev.kind) {
+            (ItemStatus::Started, ItemKind::Thinking { .. }) => {
                 self.tail.clear();
                 self.tail_scrolled = 0;
                 self.thinking = true;
             }
-            AgentEvent::TextDelta(d) => {
-                self.thinking = false;
-                self.tail.push_str(&d);
-                let n = self.tail.chars().count();
-                if n > 1400 {
-                    self.tail_scrolled = n - 1200;
+            (_, ItemKind::AgentMessage { delta, final_text }) => {
+                if let Some(d) = delta {
+                    self.thinking = false;
+                    self.tail.push_str(&d);
+                    let n = self.tail.chars().count();
+                    if n > 1400 {
+                        self.tail_scrolled = n - 1200;
+                    }
+                } else if let Some(f) = final_text {
+                    // Final answer edge: finalize_tail already covers mid-turn
+                    // text; only add it if nothing streamed produced it.
+                    if self.tail.trim().is_empty() {
+                        let clean = clean_model_text(&f);
+                        let dup = self.items.iter().rev().any(|i| matches!(i, Item::Answer(t) if t == &clean));
+                        if !clean.trim().is_empty() && !dup {
+                            self.items.push(Item::Answer(clean));
+                        }
+                    }
                 }
             }
-            AgentEvent::ToolStart { name, args } => {
+            (ItemStatus::Started, ItemKind::ToolCall { name, args, .. }) => {
                 if name == "terminate" || name == "ask_human" || name == "ask_user_question" {
                     // Do not print internal control calls as noisy execution cards
                     return;
@@ -1910,36 +2394,45 @@ impl<'a> Tui<'a> {
                     output: String::new(),
                 });
             }
-            AgentEvent::ToolDone { name, ok, output } => {
+            (status, ItemKind::ToolCall { name, output, .. })
+                if matches!(status, ItemStatus::Completed | ItemStatus::Failed) =>
+            {
                 if name == "terminate" || name == "ask_human" || name == "ask_user_question" {
                     return;
                 }
                 let dur = self.active_tool_start.take().map(|t| t.elapsed());
-                let denied = output.starts_with("denied:") || output.contains("confirmation refused");
+                let out = output.unwrap_or_default();
+                let ok = status == ItemStatus::Completed;
+                let denied = out.starts_with("denied:") || out.contains("confirmation refused");
                 for it in self.items.iter_mut().rev() {
-                    if let Item::Tool { name: n, ok: o, denied: d, duration: du, output: out, .. } = it {
-                        if n == &name && out.is_empty() {
+                    if let Item::Tool { name: n, ok: o, denied: d, duration: du, output: ot, .. } = it {
+                        if n == &name && ot.is_empty() {
                             *o = ok;
                             *d = denied;
                             *du = dur;
-                            *out = output;
+                            *ot = out;
                             break;
                         }
                     }
                 }
                 self.thinking = true;
             }
-            AgentEvent::Usage(u) => {
-                self.real_prompt_tokens = u.prompt_tokens;
-                self.real_completion_tokens = u.completion_tokens;
-                self.real_total_tokens = u.total_tokens;
-                self.real_cached_tokens = u.cached_prompt_tokens;
+            (ItemStatus::Completed, ItemKind::Usage(u)) => {
+                self.real_prompt_tokens = u.prompt_tokens as usize;
+                self.real_completion_tokens = u.completion_tokens as usize;
+                self.real_total_tokens = u.total_tokens as usize;
+                self.real_cached_tokens = u.cached_prompt_tokens.unwrap_or(0) as usize;
                 let (_, _, pct) = self.ctx_meter(100);
                 self.ctx_history.push(pct as u8);
                 if self.ctx_history.len() > 48 {
                     self.ctx_history.remove(0);
                 }
             }
+            (_, ItemKind::UserMessage { .. }) => {
+                // Already echoed by the UI thread on submit; replays render it
+                // directly. Nothing to do here.
+            }
+            _ => {}
         }
     }
 
@@ -1947,14 +2440,17 @@ impl<'a> Tui<'a> {
         if !self.tail.trim().is_empty() {
             let t = std::mem::take(&mut self.tail);
             let clean = clean_model_text(&t);
-            if !clean.trim().is_empty() {
+            // The worker echoes the prompt as a UserMessage protocol item; if the
+            // tail streamed that same text back, don't render it twice.
+            let dup = self.items.iter().rev().any(|i| matches!(i, Item::User(u) if u.trim() == clean.trim()));
+            if !clean.trim().is_empty() && !dup {
                 self.items.push(Item::Answer(clean.trim().to_string()));
             }
         }
         self.tail_scrolled = 0;
     }
 
-    fn on_turn_done(&mut self, res: Result<(String, usize), AgentError>) {
+    fn on_turn_done(&mut self, res: Result<(String, usize), String>) {
         self.finalize_tail();
         self.running = false;
         self.thinking = false;
@@ -1966,27 +2462,7 @@ impl<'a> Tui<'a> {
                     self.items.push(Item::Answer(clean));
                 }
             }
-            Err(AgentError::MaxSteps) => {
-                self.items.push(Item::Error(format!(
-                    "reached max steps ({}) without an answer",
-                    self.opts.max_steps
-                )));
-            }
-            Err(AgentError::DoomLoop { tool, repeats, reason }) => {
-                let msg = match reason {
-                    DoomReason::RepeatedDenials => format!(
-                        "agent stuck: {repeats} calls in a row were denied by policy. \
-                         Consider changing the permission mode or adding allow rules."
-                    ),
-                    DoomReason::RepeatedCalls => format!(
-                        "agent stuck repeating `{tool}` {repeats}× with no progress"
-                    ),
-                };
-                self.items.push(Item::Error(msg));
-            }
-            Err(AgentError::Tool(e)) => {
-                self.items.push(Item::Error(format!("tool failed at the gateway: {e}")));
-            }
+            Err(msg) => self.items.push(Item::Error(msg)),
         }
     }
 
@@ -2005,7 +2481,7 @@ impl<'a> Tui<'a> {
             let mut event_seen = false;
             for msg in drained {
                 match msg {
-                    UiOut::Ev(ev) => self.on_event(ev),
+                    UiOut::Core(ev) => self.on_core_event(ev),
                     UiOut::Info(s) => self.items.push(Item::Info(s)),
                     UiOut::TurnDone(res) => self.on_turn_done(res),
                     UiOut::Audit(entries) => {

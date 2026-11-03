@@ -809,6 +809,7 @@ dependencies = [
  "guardian",
  "libc",
  "mcp",
+ "onyx-core",
  "ratatui",
  "sandbox",
  "serde_json",
