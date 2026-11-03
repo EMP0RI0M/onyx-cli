@@ -1,5 +1,10 @@
-//! Task and Background Process tools: TaskOutputTool and KillTaskTool.
+//! Task and Background Process tools: TaskOutputTool, KillTaskTool, and WaitTasksTool.
+pub mod terminal_command;
+pub mod wait_tasks;
+
 use crate::{Args, Output, Tool, ToolError};
+use terminal_command::GLOBAL_PROCESS_MANAGER;
+pub use wait_tasks::WaitTasksTool;
 
 pub struct TaskOutputTool;
 
@@ -17,24 +22,28 @@ impl Tool for TaskOutputTool {
     }
 
     fn execute(&self, args: &Args) -> Result<Output, ToolError> {
-        let task_id = args.get("task_id").and_then(|v| v.as_str()).ok_or_else(|| {
-            ToolError::BadArgs("missing 'task_id'".into())
-        })?;
+        let task_id = args.get("task_id")
+            .or_else(|| args.get("task_ids").and_then(|v| v.as_array()).and_then(|a| a.first()))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::BadArgs("missing 'task_id'".into()))?;
 
-        // Checks running processes or task outputs
-        let ps = std::process::Command::new("ps")
-            .arg("-p")
-            .arg(task_id)
-            .output();
+        let timeout_ms = args.get("timeout_ms").and_then(|v| v.as_u64());
 
-        match ps {
-            Ok(out) if out.status.success() => {
-                Ok(Output::ok(format!("Task {task_id} is running.\n{}", String::from_utf8_lossy(&out.stdout))))
-            }
-            _ => {
-                Ok(Output::ok(format!("Task {task_id} completed or not active.")))
+        if let Some(ms) = timeout_ms {
+            if ms > 0 {
+                let timeout = std::time::Duration::from_millis(ms.min(300_000));
+                let _ = GLOBAL_PROCESS_MANAGER.wait_all(&[task_id.to_string()], timeout);
             }
         }
+
+        let (is_running, content, truncated) = GLOBAL_PROCESS_MANAGER.get_output(task_id, 32_768);
+        let status = if is_running { "running" } else { "completed/stopped" };
+
+        let mut msg = format!("Task {task_id} status: {status}\n\n{content}");
+        if truncated {
+            msg.push_str("\n\n[Output truncated to 32KB]");
+        }
+        Ok(Output::ok(msg))
     }
 }
 
@@ -58,20 +67,9 @@ impl Tool for KillTaskTool {
             ToolError::BadArgs("missing 'task_id'".into())
         })?;
 
-        let res = std::process::Command::new("kill")
-            .arg("-15")
-            .arg(task_id)
-            .output();
-
-        match res {
-            Ok(out) if out.status.success() => {
-                Ok(Output::ok(format!("Successfully terminated task {task_id}")))
-            }
-            Ok(out) => {
-                let err = String::from_utf8_lossy(&out.stderr);
-                Err(ToolError::Other(format!("Failed to terminate task {task_id}: {err}")))
-            }
-            Err(e) => Err(ToolError::Io(e)),
+        match GLOBAL_PROCESS_MANAGER.kill(task_id) {
+            Ok(msg) => Ok(Output::ok(msg)),
+            Err(e) => Err(ToolError::Other(e)),
         }
     }
 }

@@ -485,6 +485,11 @@ enum Ctl {
     SystemAppend(String),
     Audit,
     DropTranscript,
+    /// Rebuild the worker's history from a fresh source (title rename,
+    /// checkpoint rewind, /compact). The worker owns `history`, so these
+    /// reads/writes must round-trip through it; `DropTranscript` hands
+    /// transcript ownership back to the UI thread for the rewrite.
+    ReplaceHistory(Vec<Message>),
 }
 
 /// Events the worker thread sends to the UI thread. Agent progress travels as
@@ -966,6 +971,15 @@ pub struct Tui<'a> {
     real_total_tokens: usize,
     real_cached_tokens: usize,
     ctx_history: Vec<u8>, // recent context-usage % samples for the status sparkline
+    session_title: Option<String>,
+    turns: u64,
+    turn_start: Option<std::time::Instant>,
+    theme_idx: usize,
+    extra_dirs: Vec<String>,
+    vim_normal: bool,
+    vim_pending_d: bool,
+    vim_clipboard: String,
+    emacs_keys: bool,
 }
 
 
@@ -990,6 +1004,22 @@ impl<'a> Tui<'a> {
             cat.scan_dir(&home.join(".onyx/skills"));
             cat.skills.len()
         } else { 0 };
+
+        // Restore the persisted /theme choice (ONYX_THEME env wins).
+        let theme_idx = ["onyx-cyan", "amber-term", "emerald"]
+            .iter()
+            .position(|n| {
+                std::env::var("ONYX_THEME").ok().as_deref() == Some(*n)
+                    || std::env::var_os("HOME")
+                        .map(PathBuf::from)
+                        .and_then(|h| std::fs::read_to_string(h.join(".onyx/theme")).ok())
+                        .map(|s| s.trim() == *n)
+                        .unwrap_or(false)
+            })
+            .unwrap_or(0);
+        if theme_idx != 0 {
+            theme::set_palette(theme_idx);
+        }
 
         Self {
             gw,
@@ -1028,6 +1058,15 @@ impl<'a> Tui<'a> {
             real_total_tokens: 0,
             real_cached_tokens: 0,
             ctx_history: Vec::new(),
+            session_title: None,
+            turns: 0,
+            turn_start: None,
+            theme_idx,
+            extra_dirs: Vec::new(),
+            vim_normal: false,
+            vim_pending_d: false,
+            vim_clipboard: String::new(),
+            emacs_keys: false,
             workspace_dir: std::env::current_dir()
                 .map(|p| {
                     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
@@ -1049,6 +1088,9 @@ impl<'a> Tui<'a> {
     }
 
     fn session_label(&self) -> String {
+        if let Some(title) = &self.session_title {
+            return title.clone();
+        }
         self.session
             .as_ref()
             .and_then(|t| t.path().file_stem().and_then(|s| s.to_str()))
@@ -1253,6 +1295,9 @@ impl<'a> Tui<'a> {
                     }
                     Ctl::DropTranscript => {
                         transcript = None; // main thread owns the replacement
+                    }
+                    Ctl::ReplaceHistory(msgs) => {
+                        history = msgs;
                     }
                 }
                 // Cheap copy for /usage-style reads; the worker owns history.
@@ -1731,6 +1776,10 @@ impl<'a> Tui<'a> {
         self.tail_scrolled = 0;
         self.thinking = true;
         self.running = true;
+        self.turns += 1;
+        self.turn_start = Some(std::time::Instant::now());
+        // Checkpoint BEFORE the turn mutates anything: /rewind restores this.
+        self.write_checkpoint();
         let ms = self.opts.max_steps;
         if let Some(tx) = &self.ctl_tx {
             let _ = tx.send(Ctl::Prompt(text, ms));
@@ -1749,6 +1798,449 @@ impl<'a> Tui<'a> {
         self.items.push(Item::Info(conv_line("BASE64", &bytes_to_b64(bytes))));
         self.items.push(Item::Info(conv_line("LEN", &format!("{} byte(s)", bytes.len()))));
         self.items.push(Item::Info(conv_line("SUM", &format!("{sum:02X}"))));
+    }
+
+    // ------------------------------------------------------ command helpers --
+
+    fn checkpoints_dir() -> Option<PathBuf> {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|h| h.join(".onyx/checkpoints"))
+    }
+
+    /// Snapshot the current transcript file into `~/.onyx/checkpoints/<sid>.ckpt.jsonl`.
+    fn write_checkpoint(&self) {
+        let Some(t) = self.session.as_ref() else { return };
+        let Some(dir) = Self::checkpoints_dir() else { return };
+        let _ = std::fs::create_dir_all(&dir);
+        let sid = t.path().file_stem().and_then(|s| s.to_str()).unwrap_or("onyx");
+        let dst = dir.join(format!("{sid}.ckpt.jsonl"));
+        let _ = std::fs::copy(t.path(), &dst);
+    }
+
+    fn read_checkpoint(sid: &str) -> Option<Vec<Message>> {
+        let dir = Self::checkpoints_dir()?;
+        let path = dir.join(format!("{sid}.ckpt.jsonl"));
+        if path.exists() {
+            Some(agent::session::load_messages(&path))
+        } else {
+            None
+        }
+    }
+
+    /// Two-tier compaction against the transcript on disk: prune stale tool
+    /// outputs, then fold older turns into a digest. Rewrites the session file
+    /// and swaps the worker's history through `Ctl::ReplaceHistory`.
+    fn do_compact(&mut self) {
+        let Some(t) = self.session.as_ref() else {
+            self.items.push(Item::Info("no session transcript to compact".into()));
+            return;
+        };
+        let path = t.path().clone();
+        let msgs = agent::session::load_messages(&path);
+        if msgs.len() < 4 {
+            self.items.push(Item::Info("conversation too short to compact meaningfully".into()));
+            return;
+        }
+        let before: usize = msgs.iter().map(|m| agent::context::estimate_tokens(&m.content)).sum();
+        let budget = if self.hm.context_budget > 0 { self.hm.context_budget * 3 / 4 } else { before / 2 };
+        let mut pinned = vec![Message::text(
+            "system",
+            "[Context checkpoint] Earlier turns of this session were compacted; the summary below preserves decisions and state.",
+        )];
+        let mut for_compact = pinned.clone();
+        for_compact.extend(msgs);
+        match agent::context::compact_history(&for_compact, budget) {
+            None => self.items.push(Item::Info(format!(
+                "compaction not needed yet (~{before} tokens under a {budget}-token target)"
+            ))),
+            Some(compacted) => {
+                let after: usize = compacted.iter().map(|m| agent::context::estimate_tokens(&m.content)).sum();
+                // Rewrite the transcript: meta header + compacted messages.
+                use std::io::Write;
+                let tmp = path.with_extension("jsonl.compacting");
+                if let Ok(mut f) = std::fs::File::create(&tmp) {
+                    let meta = serde_json::json!({
+                        "kind": "meta", "model": self.hm.model,
+                        "ts": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+                        "compacted": true
+                    });
+                    let _ = writeln!(f, "{}", meta);
+                    for m in &compacted {
+                        if m.role == "system" && pinned.iter().any(|p| p.content == m.content) {
+                            continue;
+                        }
+                        let rec = match &m.tool_call {
+                            Some(tc) => serde_json::json!({"kind":"message","role":m.role,"content":m.content,"tool_call":{"name":tc.name,"args":tc.args}}),
+                            None => serde_json::json!({"kind":"message","role":m.role,"content":m.content}),
+                        };
+                        let _ = writeln!(f, "{rec}");
+                    }
+                    if f.flush().is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+                        if let Some(tx) = &self.ctl_tx {
+                            let _ = tx.send(Ctl::ReplaceHistory(compacted));
+                        }
+                        self.items.push(Item::Info(format!(
+                            "compacted context: ~{before} → ~{after} tokens (transcript rewritten on disk)"
+                        )));
+                    } else {
+                        let _ = std::fs::remove_file(&tmp);
+                        self.items.push(Item::Error("compaction rewrite failed; transcript unchanged".into()));
+                    }
+                } else {
+                    self.items.push(Item::Error("could not open temp file for compaction".into()));
+                }
+            }
+        }
+    }
+
+    /// Persist a human title into the transcript's meta record.
+    fn set_session_title(&mut self, title: &str) {
+        let Some(t) = self.session.as_ref() else {
+            self.items.push(Item::Info("no active session to rename".into()));
+            return;
+        };
+        let path = t.path().clone();
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            self.items.push(Item::Error("cannot read transcript to rename".into()));
+            return;
+        };
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(content.len() + 64);
+        let mut injected = false;
+        for line in content.lines() {
+            if !injected {
+                if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(line) {
+                    if v.get("kind").and_then(|k| k.as_str()) == Some("meta") {
+                        v["title"] = serde_json::json!(title);
+                        let _ = writeln!(out, "{v}");
+                        injected = true;
+                        continue;
+                    }
+                }
+            }
+            out.push_str(line);
+            out.push('\n');
+            if !injected && line.contains("\"kind\":\"message\"") {
+                let meta = serde_json::json!({"kind":"meta","model":self.hm.model,"title":title});
+                // meta belongs first; prepend by swapping (cheap: rare path)
+                out = format!("{}\n{}", meta, out);
+                injected = true;
+            }
+        }
+        if !injected {
+            let meta = serde_json::json!({"kind":"meta","model":self.hm.model,"title":title});
+            out = format!("{meta}\n{content}");
+        }
+        match std::fs::write(&path, out) {
+            Ok(()) => {
+                self.session_title = Some(title.to_string());
+                self.items.push(Item::Info(format!("session renamed to “{title}” (persisted)")));
+            }
+            Err(e) => self.items.push(Item::Error(format!("rename failed: {e}"))),
+        }
+    }
+
+    fn do_save(&mut self, filename: &str) {
+        let Some(t) = self.session.as_ref() else {
+            self.items.push(Item::Info("no active session to save".into()));
+            return;
+        };
+        let src = t.path().clone();
+        let dst = PathBuf::from(filename);
+        match std::fs::copy(&src, &dst) {
+            Ok(n) => self.items.push(Item::Info(format!(
+                "session snapshot: {n} bytes → {}", dst.display()
+            ))),
+            Err(e) => self.items.push(Item::Error(format!("save failed: {e}"))),
+        }
+    }
+
+    /// One-shot TCP+HTTP latency probe against the configured gateway.
+    fn do_ping(&mut self) {
+        let host = self.hm.host.clone();
+        let port = self.hm.port;
+        let path = if self.hm.path.is_empty() { "/".to_string() } else { self.hm.path.clone() };
+        let start = std::time::Instant::now();
+        match std::net::TcpStream::connect((host.as_str(), port)) {
+            Ok(mut s) => {
+                use std::io::{Read, Write};
+                let req = format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
+                let _ = s.write_all(req.as_bytes());
+                let mut buf = [0u8; 16];
+                let _ = s.read(&mut buf);
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                self.items.push(Item::Info(format!(
+                    "gateway {host}:{port}{path} responded in {ms:.1}ms"
+                )));
+            }
+            Err(e) => self.items.push(Item::Error(format!("gateway {host}:{port} unreachable: {e}"))),
+        }
+    }
+
+    fn do_doctor(&mut self) {
+        let has_key = !self.hm.key.is_empty();
+        let start = std::time::Instant::now();
+        let gw_ok = std::net::TcpStream::connect((self.hm.host.as_str(), self.hm.port)).is_ok();
+        let latency = start.elapsed();
+        let git = std::process::Command::new("git").arg("--version").output().is_ok();
+        let rg = std::process::Command::new("rg").arg("--version").output().is_ok();
+        let sessions = agent::session::list_sessions(usize::MAX).len();
+        let state_dir = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|h| h.join(".onyx"))
+            .filter(|d| d.exists());
+        self.items.push(Item::Info("╭── ONYX DOCTOR ──────────────────────────────────────────────╮".into()));
+        let rows: [(&str, String); 10] = [
+            ("git", if git { "✓ present".to_string() } else { "✗ missing (some tools degrade)".to_string() }),
+            ("ripgrep", if rg { "✓ present".to_string() } else { "— optional (grep fallback used)".to_string() }),
+            ("API key", if has_key { "✓ set (value hidden)".to_string() } else { "✗ ONYX_API_KEY missing".to_string() }),
+            (
+                "gateway",
+                if gw_ok {
+                    format!("✓ {}:{} · {:.1}ms", self.hm.host, self.hm.port, latency.as_secs_f64() * 1000.0)
+                } else {
+                    format!("✗ {}:{} unreachable", self.hm.host, self.hm.port)
+                },
+            ),
+            ("model", self.hm.model.clone()),
+            ("effort", if self.hm.effort.is_empty() { "(default)".into() } else { self.hm.effort.clone() }),
+            ("MCP servers", format!("{}", self.mcp_count)),
+            ("skills", format!("{}", self.skill_count)),
+            ("sessions", format!("{sessions} saved")),
+            ("state dir", state_dir.map(|d| d.display().to_string()).unwrap_or_else(|| "✗ ~/.onyx missing".into())),
+        ];
+        for (label, value) in rows {
+            self.items.push(Item::Info(format!("│ {:<13} {:<43} │", label, clip_chars(&value, 43))));
+        }
+        self.items.push(Item::Info("╰──────────────────────────────────────────────────────────────╯".into()));
+    }
+
+    fn set_theme(&mut self, idx: usize) {
+        const NAMES: [&str; 3] = ["onyx-cyan", "amber-term", "emerald"];
+        theme::set_palette(idx);
+        self.theme_idx = idx;
+        let name = NAMES[idx];
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            let dir = home.join(".onyx");
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(dir.join("theme"), name);
+        }
+        self.items.push(Item::Info(format!("theme `{name}` active — accents re-tinted (persisted to ~/.onyx/theme)")));
+    }
+
+    // ------------------------------------------------------------- vim ------
+
+    /// NOTE on coordinates: `self.cursor` is a BYTE offset into `self.input`
+    /// (every insert/remove site uses `len_utf8`). These helpers convert via
+    /// `char_indices`; the composer's own arrow handlers agree.
+
+    /// Byte offset just past the last non-newline char of the current line.
+    fn vim_line_end_byte(&self) -> usize {
+        let mut byte = self.cursor;
+        while byte < self.input.len() {
+            match self.input[byte..].chars().next() {
+                Some(c) if c != '\n' => byte += c.len_utf8(),
+                _ => break,
+            }
+        }
+        byte
+    }
+    /// Column (in chars) of the cursor within its line.
+    fn vim_line_start_col(&self) -> usize {
+        self.input[..self.cursor].chars().count()
+            - self.input[..self.cursor]
+                .rfind('\n')
+                .map(|k| self.input[..k + 1].chars().count())
+                .unwrap_or(0)
+    }
+    /// Byte offset where the cursor's line begins.
+    fn vim_line_start_byte(&self) -> usize {
+        self.input[..self.cursor].rfind('\n').map(|k| k + 1).unwrap_or(0)
+    }
+    /// Byte offset of the nth char at or after `start` (clamped to `end`).
+    fn byte_of_char(&self, start: usize, end: usize, n: usize) -> usize {
+        let mut count = 0;
+        for (boff, _) in self.input[start..end].char_indices() {
+            if count == n {
+                return start + boff;
+            }
+            count += 1;
+        }
+        end
+    }
+    fn vim_move_left(&mut self) {
+        if self.cursor > 0 {
+            let prev = self.input[..self.cursor].chars().next_back().map(|c| c.len_utf8()).unwrap_or(0);
+            self.cursor -= prev;
+        }
+    }
+    fn vim_move_right(&mut self) {
+        if let Some(next) = self.input[self.cursor..].chars().next() {
+            self.cursor += next.len_utf8();
+        }
+    }
+    /// Move down one line, preserving the column where possible.
+    fn vim_down(&mut self) {
+        let col = self.vim_line_start_col();
+        let le = self.vim_line_end_byte();
+        if le >= self.input.len() {
+            self.cursor = le;
+            return;
+        }
+        let next_start = le + 1; // skip the '\n'
+        let next_end = self.input[next_start..]
+            .find('\n')
+            .map(|k| next_start + k)
+            .unwrap_or(self.input.len());
+        let width = self.input[next_start..next_end].chars().count();
+        self.cursor = if width == 0 {
+            next_start
+        } else {
+            self.byte_of_char(next_start, next_end, col.min(width - 1))
+        };
+    }
+    /// Move up one line, preserving the column where possible.
+    fn vim_up(&mut self) {
+        let col = self.vim_line_start_col();
+        let cur_ls = self.vim_line_start_byte();
+        if cur_ls == 0 {
+            self.cursor = 0;
+            return;
+        }
+        let prev_end = cur_ls - 1; // byte of the '\n' ending the previous line
+        let prev_start = self.input[..prev_end].rfind('\n').map(|k| k + 1).unwrap_or(0);
+        let width = self.input[prev_start..prev_end].chars().count();
+        self.cursor = if width == 0 {
+            prev_start
+        } else {
+            self.byte_of_char(prev_start, prev_end, col.min(width - 1))
+        };
+    }
+    fn vim_word_forward(&mut self, count: usize) {
+        let mut pos = self.cursor;
+        for _ in 0..count {
+            let rest: Vec<char> = self.input[pos..].chars().collect();
+            let mut i = 0;
+            while i < rest.len() && (rest[i].is_alphanumeric() || rest[i] == '_') {
+                i += 1;
+            }
+            while i < rest.len() && !rest[i].is_alphanumeric() && rest[i] != '_' {
+                i += 1;
+            }
+            if i == 0 {
+                i = 1; // progress guarantee on punctuation-only stretches
+            }
+            pos += rest.iter().take(i).map(|c| c.len_utf8()).sum::<usize>();
+            pos = pos.min(self.input.len());
+        }
+        self.cursor = pos;
+    }
+    fn vim_word_back(&mut self, count: usize) {
+        for _ in 0..count {
+            let mut pos = self.cursor;
+            while pos > 0 {
+                let prev = self.input[..pos].chars().next_back().unwrap();
+                pos -= prev.len_utf8();
+                if prev.is_alphanumeric() || prev == '_' {
+                    continue;
+                }
+                if pos == 0 {
+                    break;
+                }
+                let p2 = self.input[..pos].chars().next_back().unwrap();
+                if p2.is_alphanumeric() || p2 == '_' {
+                    break;
+                }
+            }
+            self.cursor = pos;
+        }
+    }
+    /// One normal-mode key press against the composer buffer. Returns false
+    /// when the char is not a vim command (caller falls through).
+    fn vim_normal_key(&mut self, c: char) -> bool {
+        if self.vim_pending_d {
+            self.vim_pending_d = false;
+            match c {
+                'd' => {
+                    let le = self.vim_line_end_byte();
+                    let ls = self.input[..self.cursor].rfind('\n').map(|k| k + 1).unwrap_or(0);
+                    self.vim_clipboard = self.input[ls..le].to_string();
+                    self.input.replace_range(ls..le, "");
+                    self.cursor = ls.min(self.input.len());
+                }
+                '$' => {
+                    let le = self.vim_line_end_byte();
+                    self.vim_clipboard = self.input[self.cursor..le].to_string();
+                    self.input.replace_range(self.cursor..le, "");
+                }
+                'w' => {
+                    let start = self.cursor;
+                    self.vim_word_forward(1);
+                    self.vim_clipboard = self.input[start..self.cursor].to_string();
+                    self.input.replace_range(start..self.cursor, "");
+                    self.cursor = start;
+                }
+                _ => {}
+            }
+            return true;
+        }
+        match c {
+            'h' => self.vim_move_left(),
+            'l' => self.vim_move_right(),
+            'j' => self.vim_down(),
+            'k' => self.vim_up(),
+            '0' => self.cursor = self.input[..self.cursor].rfind('\n').map(|k| k + 1).unwrap_or(0),
+            '^' => {
+                let ls = self.vim_line_start_byte();
+                let mut byte = ls;
+                for c in self.input[ls..].chars() {
+                    if c == '\n' || c != ' ' {
+                        break;
+                    }
+                    byte += c.len_utf8();
+                }
+                self.cursor = byte;
+            }
+            '$' => self.cursor = self.vim_line_end_byte().saturating_sub(1),
+            'w' => self.vim_word_forward(1),
+            'b' => self.vim_word_back(1),
+            'x' => {
+                if let Some(next) = self.input[self.cursor..].chars().next() {
+                    self.input.replace_range(self.cursor..self.cursor + next.len_utf8(), "");
+                    self.cursor = self.cursor.min(self.input.len());
+                }
+            }
+            'd' => {
+                self.vim_pending_d = true;
+                return true;
+            }
+            'i' | 'a' => self.vim_normal = false,
+            'A' => {
+                self.cursor = self.input.len();
+                self.vim_normal = false;
+            }
+            'D' => {
+                let le = self.vim_line_end_byte();
+                self.input.truncate(le);
+                self.cursor = self.cursor.min(le);
+                self.vim_normal = false;
+            }
+            'C' => {
+                let le = self.vim_line_end_byte();
+                self.input.replace_range(self.cursor..le, "");
+                self.vim_normal = false;
+            }
+            'p' => {
+                if !self.vim_clipboard.is_empty() {
+                    let clip = self.vim_clipboard.clone();
+                    self.input.insert_str(self.cursor, &clip);
+                    self.cursor += clip.len();
+                }
+            }
+            _ => return false,
+        }
+        true
     }
 
     fn slash(&mut self, line: &str) {

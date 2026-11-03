@@ -156,11 +156,11 @@ pub fn default_collection(editor_base: std::path::PathBuf) -> ToolCollection {
     c.add(control::Terminate);
     c.add(control::AskHuman);
 
-    // Grok-build tools: read_file, list_dir, grep, search_replace, todo, plan mode, web_fetch, update_goal, task_output, kill_task, ask_user_question
+    // Grok-build tools: read_file, list_dir, grep, search_replace, todo, plan mode, web_fetch, update_goal, task_output, kill_task, wait_tasks, ask_user_question, web_search, send_feedback, send_subagent_message, lsp
     c.add(implementations::grok_build::ReadFile::new(editor_base.clone()));
     c.add(implementations::grok_build::ListDir::new(editor_base.clone()));
     c.add(implementations::grok_build::Grep::new(editor_base.clone()));
-    c.add(implementations::grok_build::SearchReplace::new(editor_base));
+    c.add(implementations::grok_build::SearchReplace::new(editor_base.clone()));
     c.add(implementations::grok_build::TodoTool::new());
     let plan_state = Arc::new(std::sync::Mutex::new(implementations::grok_build::PlanState::default()));
     c.add(implementations::grok_build::EnterPlanMode::new(plan_state.clone()));
@@ -169,7 +169,12 @@ pub fn default_collection(editor_base: std::path::PathBuf) -> ToolCollection {
     c.add(implementations::grok_build::UpdateGoalTool::default());
     c.add(implementations::grok_build::TaskOutputTool);
     c.add(implementations::grok_build::KillTaskTool);
+    c.add(implementations::grok_build::WaitTasksTool::default());
     c.add(implementations::grok_build::AskUserQuestion);
+    c.add(implementations::grok_build::WebSearchTool::default());
+    c.add(implementations::grok_build::SendFeedbackTool::default());
+    c.add(implementations::grok_build::SendSubagentMessageTool::default());
+    c.add(implementations::grok_build::LspTool::new(editor_base));
     let mem_store = Arc::new(std::sync::Mutex::new(implementations::grok_build::HermesMemoryStore::default_paths()));
     c.add(implementations::grok_build::HermesMemoryTool::new(mem_store));
 
