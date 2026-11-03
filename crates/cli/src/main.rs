@@ -374,6 +374,12 @@ fn main() {
     let catalog = catalog_for(&gw);
     let defs = tools::tool_schemas(&gw.tools);
     let mut hm = build_model(&cfg, &opts, catalog, defs);
+    // Inject Hermes persistent memory snapshot into system prompt
+    let hermes_mem = tools::implementations::grok_build::HermesMemoryStore::default_paths();
+    let mem_snapshot = hermes_mem.compile_snapshot();
+    if !mem_snapshot.is_empty() {
+        hm.system.push_str(&mem_snapshot);
+    }
     if let Some(ins) = skill_instructions.take() {
         hm.system.push_str("\n\n");
         hm.system.push_str(&ins);

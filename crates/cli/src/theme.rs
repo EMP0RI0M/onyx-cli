@@ -25,6 +25,51 @@ pub const WARNING: (u8, u8, u8) = (255, 202, 104); // #FFCA68 pending/attention
 pub const PANEL_BG: (u8, u8, u8) = (9, 12, 18); //   near-black surface
 pub const SELECTION_BG: (u8, u8, u8) = (30, 38, 50); // highlighted row bg
 
+/// Accent token slots a palette fills. PRIMARY/INFO/SUCCESS/WARNING are the
+/// four colors `/theme` actually swaps; body text and surfaces stay constant
+/// so every theme keeps the workstation's readability contract.
+#[derive(Debug, Clone, Copy)]
+pub struct Palette {
+    pub name: &'static str,
+    pub primary: (u8, u8, u8),
+    pub info: (u8, u8, u8),
+    pub success: (u8, u8, u8),
+    pub warning: (u8, u8, u8),
+}
+
+pub const PALETTES: [Palette; 3] = [
+    Palette { name: "onyx-cyan", primary: (0, 229, 255), info: (56, 189, 248), success: (32, 217, 154), warning: (255, 202, 104) },
+    Palette { name: "amber-term", primary: (255, 180, 84), info: (255, 140, 60), success: (140, 220, 120), warning: (255, 214, 102) },
+    Palette { name: "emerald", primary: (52, 211, 153), info: (45, 212, 191), success: (134, 239, 172), warning: (253, 224, 71) },
+];
+
+/// The active accent set. `PRIMARY`/`INFO`/`SUCCESS`/`WARNING` consts above are
+/// the onyx-cyan defaults; the renderer reads THIS for anything tinted, and
+/// `/theme` mutates it through `set_palette`.
+pub static ACTIVE_PALETTE: std::sync::RwLock<Palette> =
+    std::sync::RwLock::new(PALETTES[0]);
+
+pub fn set_palette(idx: usize) -> &'static Palette {
+    let p = PALETTES[idx % PALETTES.len()];
+    *ACTIVE_PALETTE.write().unwrap() = p;
+    &PALETTES[idx % PALETTES.len()]
+}
+
+pub fn accent() -> (u8, u8, u8) {
+    ACTIVE_PALETTE.read().unwrap().primary
+}
+
+/// ANSI truecolor escape for the current accent — transcript builders that
+/// still emit raw escapes (legacy banner/info lines) tint from here.
+pub fn accent_escape() -> String {
+    let (r, g, b) = accent();
+    format!("\x1b[38;2;{r};{g};{b}m")
+}
+
+pub fn theme_name() -> &'static str {
+    ACTIVE_PALETTE.read().unwrap().name
+}
+
 pub const fn rgb(t: (u8, u8, u8)) -> Color {
     Color::Rgb(t.0, t.1, t.2)
 }
@@ -58,8 +103,14 @@ pub fn base() -> Style {
 }
 
 /// Bold primary-accent text (brand marks, prompts, selected command names).
+/// Reads the ACTIVE palette so `/theme` re-tints every accent without a restart.
 pub fn accent_bold() -> Style {
-    Style::default().fg(C_PRIMARY).add_modifier(Modifier::BOLD)
+    Style::default().fg(rgb(accent())).add_modifier(Modifier::BOLD)
+}
+
+/// Plain (non-bold) primary-accent text for status rows and meters.
+pub fn accent_style() -> Style {
+    Style::default().fg(rgb(accent()))
 }
 
 /// Muted secondary text (dim labels, hints, timestamps).

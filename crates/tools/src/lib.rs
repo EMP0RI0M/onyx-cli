@@ -170,6 +170,8 @@ pub fn default_collection(editor_base: std::path::PathBuf) -> ToolCollection {
     c.add(implementations::grok_build::TaskOutputTool);
     c.add(implementations::grok_build::KillTaskTool);
     c.add(implementations::grok_build::AskUserQuestion);
+    let mem_store = Arc::new(std::sync::Mutex::new(implementations::grok_build::HermesMemoryStore::default_paths()));
+    c.add(implementations::grok_build::HermesMemoryTool::new(mem_store));
 
     c
 }

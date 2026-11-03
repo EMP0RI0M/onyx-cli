@@ -137,6 +137,14 @@ impl Default for BashGuard {
     }
 }
 
+impl BashGuard {
+    /// The static deny substrings this guard refuses regardless of approval
+    /// mode — surfaced for `/permissions` so operators can see the hard rules.
+    pub fn dangerous_patterns(&self) -> &[String] {
+        &self.deny_substrings
+    }
+}
+
 impl Policy for BashGuard {
     fn decide(&self, tool: &str, args: &Args) -> Decision {
         if tool != "bash" {

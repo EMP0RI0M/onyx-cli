@@ -95,6 +95,7 @@ pub fn capability_of(name: &str) -> Capability {
         "enter_plan_mode" | "exit_plan_mode" => Capability::Planning,
         "spawn_subagent" | "swarm" => Capability::Orchestration,
         "terminate" | "ask_human" | "ask_user_question" => Capability::Meta,
+        "memory" => Capability::Filesystem,
         "get_task_output" | "kill_task" => Capability::Shell,
         _ if is_mcp_tool(name) => Capability::Remote,
         _ => Capability::Unknown,

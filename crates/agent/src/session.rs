@@ -129,8 +129,23 @@ pub struct SessionInfo {
     pub id: String,
     pub preview: String,
     pub messages: usize,
+    /// Analyst-set title from the meta record (`/rename`), if any.
+    pub title: Option<String>,
     #[allow(dead_code)]
     pub modified: u64,
+}
+
+/// Read the `title` field from a transcript's meta header, if present.
+pub fn session_title(path: &PathBuf) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    for line in BufReader::new(file).lines().take(4) {
+        let Ok(line) = line else { break };
+        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        if v.get("kind").and_then(Value::as_str) == Some("meta") {
+            return v.get("title").and_then(Value::as_str).map(|s| s.to_string());
+        }
+    }
+    None
 }
 
 /// List stored sessions, most-recently-modified first, capped at `limit`.
@@ -155,7 +170,7 @@ pub fn list_sessions(limit: usize) -> Vec<SessionInfo> {
             .and_then(|m| m.modified())
             .map(|t| t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0))
             .unwrap_or(0);
-        infos.push(SessionInfo { id, preview, messages: msgs.len(), modified });
+        infos.push(SessionInfo { id, preview, messages: msgs.len(), title: session_title(&path), modified });
     }
     infos.sort_by(|a, b| b.modified.cmp(&a.modified));
     infos.truncate(limit);
