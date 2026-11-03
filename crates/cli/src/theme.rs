@@ -59,6 +59,12 @@ pub fn accent() -> (u8, u8, u8) {
     ACTIVE_PALETTE.read().unwrap().primary
 }
 
+/// The active palette's success color — status dots that must agree with the
+/// current theme read this instead of the onyx-cyan `SUCCESS` const.
+pub fn active_success() -> (u8, u8, u8) {
+    ACTIVE_PALETTE.read().unwrap().success
+}
+
 /// ANSI truecolor escape for the current accent — transcript builders that
 /// still emit raw escapes (legacy banner/info lines) tint from here.
 pub fn accent_escape() -> String {

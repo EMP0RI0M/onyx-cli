@@ -329,6 +329,13 @@ fn decode_key(buf: &[u8]) -> (Vec<char>, u32) {
         [0x0e] => (one('\x0e'), 0), // ctrl+n: next suggestion
         [0x10] => (one('\x10'), 0), // ctrl+p: prev suggestion
         [0x0f] => (one('\x0f'), 0), // ctrl+o: expand/collapse
+        [0x01] => (one('\x01'), 0), // ctrl+a (emacs: line start)
+        [0x05] => (one('\x05'), 0), // ctrl+e (emacs: line end)
+        [0x06] => (one('\x06'), 0), // ctrl+f (emacs: forward char)
+        [0x02] => (one('\x02'), 0), // ctrl+b (emacs: back char)
+        [0x15] => (one('\x15'), 0), // ctrl+u (emacs: clear input)
+        [0x0b] => (one('\x0b'), 0), // ctrl+k (emacs: kill to end)
+        [0x17] => (one('\x17'), 0), // ctrl+w (emacs: delete word back)
         [b] if *b >= 0x20 && *b < 0x7f => {
             if buf.iter().all(|b| *b >= 0x20) {
                 let s = String::from_utf8_lossy(buf);
@@ -485,6 +492,14 @@ enum Ctl {
     SystemAppend(String),
     Audit,
     DropTranscript,
+    /// Hand a UI-thread-owned transcript (opened by /rename, /save, /rewind) to
+    /// the worker so subsequent turn messages append to it. Fire-and-forget:
+    /// queued behind every earlier Ctl, so ordering with SetTranscript holds.
+    SetTranscript(agent::session::Transcript),
+    /// Ask the worker to return its current transcript (it may be None). The
+    /// ack sender answers even when the worker holds none, so the caller never
+    /// waits on a busy turn — only on the worker reaching this command.
+    TakeTranscript(Sender<Option<agent::session::Transcript>>),
     /// Rebuild the worker's history from a fresh source (title rename,
     /// checkpoint rewind, /compact). The worker owns `history`, so these
     /// reads/writes must round-trip through it; `DropTranscript` hands
@@ -980,6 +995,8 @@ pub struct Tui<'a> {
     vim_pending_d: bool,
     vim_clipboard: String,
     emacs_keys: bool,
+    settings_active: bool,
+    settings_selected: usize,
 }
 
 
@@ -1021,6 +1038,26 @@ impl<'a> Tui<'a> {
             theme::set_palette(theme_idx);
         }
 
+        let cfg = Self::load_persisted_config();
+        if let Some(steps) = cfg.get("max_steps").and_then(|v| v.as_u64()) {
+            if opts.max_steps == 8 && steps > 0 {
+                opts.max_steps = steps as usize;
+            }
+        }
+        if let Some(eff) = cfg.get("reasoning_effort").and_then(|v| v.as_str()) {
+            if hm.effort == "medium" || hm.effort.is_empty() {
+                hm.effort = eff.to_string();
+            }
+        }
+        if let Some(auto) = cfg.get("auto_mode").and_then(|v| v.as_bool()) {
+            if auto {
+                *gw.mode.lock().unwrap() = ApprovalMode::Auto;
+            }
+        }
+        let vim_normal = cfg.get("vim_mode").and_then(|v| v.as_bool()).unwrap_or(false);
+        let emacs_keys = cfg.get("emacs_mode").and_then(|v| v.as_bool()).unwrap_or(false);
+        let expanded = cfg.get("verbose").and_then(|v| v.as_bool()).unwrap_or(false);
+
         Self {
             gw,
             hm,
@@ -1030,7 +1067,7 @@ impl<'a> Tui<'a> {
             items: vec![Item::Banner],
             input: String::new(),
             cursor: 0,
-            expanded: false,
+            expanded,
             tick: 0,
             thinking: false,
             tail: String::new(),
@@ -1063,10 +1100,12 @@ impl<'a> Tui<'a> {
             turn_start: None,
             theme_idx,
             extra_dirs: Vec::new(),
-            vim_normal: false,
+            vim_normal,
             vim_pending_d: false,
             vim_clipboard: String::new(),
-            emacs_keys: false,
+            emacs_keys,
+            settings_active: false,
+            settings_selected: 0,
             workspace_dir: std::env::current_dir()
                 .map(|p| {
                     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
@@ -1295,6 +1334,12 @@ impl<'a> Tui<'a> {
                     }
                     Ctl::DropTranscript => {
                         transcript = None; // main thread owns the replacement
+                    }
+                    Ctl::SetTranscript(t) => {
+                        transcript = Some(t);
+                    }
+                    Ctl::TakeTranscript(ack) => {
+                        let _ = ack.send(transcript.take());
                     }
                     Ctl::ReplaceHistory(msgs) => {
                         history = msgs;
@@ -1808,6 +1853,174 @@ impl<'a> Tui<'a> {
             .map(|h| h.join(".onyx/checkpoints"))
     }
 
+    /// Read config from ~/.onyx/config.json
+    fn load_persisted_config() -> serde_json::Value {
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            let p = home.join(".onyx/config.json");
+            if let Ok(c) = std::fs::read_to_string(p) {
+                if let Ok(v) = serde_json::from_str(&c) {
+                    return v;
+                }
+            }
+        }
+        serde_json::json!({})
+    }
+
+    /// Save updated config to ~/.onyx/config.json
+    fn save_persisted_config(&self) {
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            let dir = home.join(".onyx");
+            let _ = std::fs::create_dir_all(&dir);
+            let p = dir.join("config.json");
+            let auto = matches!(*self.gw.mode.lock().unwrap(), ApprovalMode::Auto);
+            const THEMES: [&str; 3] = ["onyx-cyan", "amber-term", "emerald"];
+            let theme_name = THEMES.get(self.theme_idx).unwrap_or(&"onyx-cyan");
+            let val = serde_json::json!({
+                "theme": theme_name,
+                "reasoning_effort": self.hm.effort,
+                "auto_mode": auto,
+                "max_steps": self.opts.max_steps,
+                "default_model": self.hm.model,
+                "vim_mode": self.vim_normal,
+                "emacs_mode": self.emacs_keys,
+                "verbose": self.expanded,
+            });
+            let _ = std::fs::write(p, serde_json::to_string_pretty(&val).unwrap_or_default());
+        }
+    }
+
+    /// Produce structured list of settings items: (ID, Label, Current Value, Description)
+    fn settings_items(&self) -> Vec<(&'static str, &'static str, String, &'static str)> {
+        let auto = matches!(*self.gw.mode.lock().unwrap(), ApprovalMode::Auto);
+        const THEMES: [&str; 3] = ["onyx-cyan", "amber-term", "emerald"];
+        let theme_str = THEMES.get(self.theme_idx).unwrap_or(&"onyx-cyan").to_string();
+        vec![
+            ("model", "Model Engine", self.hm.model.clone(), "Active LLM engine (Enter to cycle available models)"),
+            ("effort", "Reasoning Effort", self.hm.effort.clone(), "Reasoning depth: none, low, medium, high, max"),
+            ("approval", "Approval Mode", if auto { "AUTO (YOLO)".into() } else { "Interactive".into() }, "Security approval policy (cycle with Enter or Shift+Tab)"),
+            ("theme", "Syntax Theme", theme_str, "Terminal UI styling palette (Enter to cycle)"),
+            ("steps", "Max Steps", format!("{}", self.opts.max_steps), "Maximum tool invocation loops per prompt"),
+            ("budget", "Context Budget", format!("{} tokens", self.hm.context_budget), "Context truncation threshold"),
+            ("vim", "Vim Modal Editing", if self.vim_normal { "Enabled".into() } else { "Disabled".into() }, "Modal command and text navigation in composer"),
+            ("emacs", "Emacs Keybindings", if self.emacs_keys { "Enabled".into() } else { "Disabled".into() }, "Readline-style keybindings (Ctrl+A, Ctrl+E, Ctrl+K)"),
+            ("verbose", "Verbose Output", if self.expanded { "Expanded".into() } else { "Collapsed".into() }, "Detailed tool output and reason traces"),
+        ]
+    }
+
+    /// Toggle or advance the currently selected setting item
+    fn cycle_selected_setting(&mut self) {
+        let items = self.settings_items();
+        if items.is_empty() { return; }
+        let idx = self.settings_selected.min(items.len().saturating_sub(1));
+        let (key, _, _, _) = items[idx];
+        match key {
+            "model" => {
+                let mut models = self.cached_models.clone();
+                if models.is_empty() {
+                    models = vec![
+                        "gpt-oss-120b-medium".into(),
+                        "claude-opus-4-6-thinking".into(),
+                        "claude-sonnet-4-6".into(),
+                        "gemini-3.1-flash-lite".into(),
+                        "gemini-3.5-flash-lite".into(),
+                    ];
+                }
+                if let Some(pos) = models.iter().position(|m| m == &self.hm.model) {
+                    let next = (pos + 1) % models.len();
+                    self.hm.model = models[next].clone();
+                    self.opts.model = Some(models[next].clone());
+                } else if !models.is_empty() {
+                    self.hm.model = models[0].clone();
+                    self.opts.model = Some(models[0].clone());
+                }
+                if let Some(tx) = &self.ctl_tx {
+                    let _ = tx.send(Ctl::SetModel(self.hm.model.clone()));
+                }
+            }
+            "effort" => {
+                let effs = ["low", "medium", "high", "max", "none"];
+                let pos = effs.iter().position(|&e| e == self.hm.effort).unwrap_or(1);
+                let next = (pos + 1) % effs.len();
+                let next_eff = effs[next].to_string();
+                if let Some(tx) = &self.ctl_tx {
+                    let _ = tx.send(Ctl::SetEffort(next_eff.clone()));
+                }
+                self.hm.effort = next_eff;
+            }
+            "approval" => {
+                self.cycle_mode();
+            }
+            "theme" => {
+                let next = (self.theme_idx + 1) % 3;
+                self.set_theme(next);
+            }
+            "steps" => {
+                let choices = [8, 16, 24, 30, 50, 100];
+                let pos = choices.iter().position(|&s| s == self.opts.max_steps).unwrap_or(3);
+                let next = (pos + 1) % choices.len();
+                self.opts.max_steps = choices[next];
+            }
+            "budget" => {
+                let choices = [64_000, 128_000, 200_000, 500_000, 1_000_000];
+                let pos = choices.iter().position(|&b| b == self.hm.context_budget).unwrap_or(1);
+                let next = (pos + 1) % choices.len();
+                self.hm.context_budget = choices[next];
+            }
+            "vim" => {
+                self.vim_normal = !self.vim_normal;
+                self.vim_pending_d = false;
+            }
+            "emacs" => {
+                self.emacs_keys = !self.emacs_keys;
+            }
+            "verbose" => {
+                self.expanded = !self.expanded;
+            }
+            _ => {}
+        }
+        self.save_persisted_config();
+    }
+
+    fn settings_lines_v(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let w = self.width.max(20);
+        let items = self.settings_items();
+        let card_w = w.saturating_sub(6).min(78).max(36);
+        let inner_c = card_w.saturating_sub(2);
+
+        out.push(format!("{BOLD}{CYAN}⚙ ONYX SETTINGS & PREFERENCES{RESET}"));
+        out.push(format!("{BORDER}┌{}┐{RESET}", "─".repeat(inner_c)));
+
+        let sel = self.settings_selected.min(items.len().saturating_sub(1));
+        for (i, (_, label, val, desc)) in items.iter().enumerate() {
+            let is_sel = i == sel;
+            let marker = if is_sel {
+                format!("{CYAN}❯{RESET}")
+            } else {
+                " ".to_string()
+            };
+
+            let row_line = if is_sel {
+                format!("{marker} {BOLD}{FG_MAIN}{:<18}{RESET} {BOLD}{CYAN}{:<22}{RESET}", label, val)
+            } else {
+                format!("{marker} {FG_SEC}{:<18}{RESET} {FG_MAIN}{:<22}{RESET}", label, val)
+            };
+
+            let pad = (card_w + 2).saturating_sub(ansi_width(&row_line) + 3);
+            out.push(format!(" {BORDER}│{RESET} {}{}{BORDER}│{RESET}", row_line, " ".repeat(pad)));
+
+            if is_sel {
+                let d_line = format!("    {DIM}{desc}{RESET}");
+                let d_pad = (card_w + 2).saturating_sub(ansi_width(&d_line) + 3);
+                out.push(format!(" {BORDER}│{RESET} {}{}{BORDER}│{RESET}", d_line, " ".repeat(d_pad)));
+            }
+        }
+
+        out.push(format!("{BORDER}└{}┘{RESET}", "─".repeat(inner_c)));
+        out.push(format!(" {DIM}↑↓ navigate · Enter toggle/cycle · Esc / q close · Persisted to ~/.onyx/config.json{RESET}"));
+        out
+    }
+
     /// Snapshot the current transcript file into `~/.onyx/checkpoints/<sid>.ckpt.jsonl`.
     fn write_checkpoint(&self) {
         let Some(t) = self.session.as_ref() else { return };
@@ -1844,7 +2057,7 @@ impl<'a> Tui<'a> {
         }
         let before: usize = msgs.iter().map(|m| agent::context::estimate_tokens(&m.content)).sum();
         let budget = if self.hm.context_budget > 0 { self.hm.context_budget * 3 / 4 } else { before / 2 };
-        let mut pinned = vec![Message::text(
+        let pinned = vec![Message::text(
             "system",
             "[Context checkpoint] Earlier turns of this session were compacted; the summary below preserves decisions and state.",
         )];
@@ -1894,9 +2107,27 @@ impl<'a> Tui<'a> {
         }
     }
 
+    /// The active transcript path, taking ownership back from the worker if it
+    /// still holds one. Session-mutating commands (/rename, /save, /rewind)
+    /// call this; after it returns Some, `self.session` is the live transcript
+    /// and the worker has none (re-hand it with Ctl::SetTranscript when done).
+    fn active_transcript(&mut self) -> Option<&agent::session::Transcript> {
+        let want_take = self.session.is_none() && !self.running;
+        if want_take {
+            let Some(ctl) = &self.ctl_tx else { return None };
+            let (ack_tx, ack_rx) = channel::<Option<agent::session::Transcript>>();
+            let _ = ctl.send(Ctl::TakeTranscript(ack_tx));
+            match ack_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                Ok(Some(t)) => self.session = Some(t),
+                Ok(None) | Err(_) => {}
+            }
+        }
+        self.session.as_ref()
+    }
+
     /// Persist a human title into the transcript's meta record.
     fn set_session_title(&mut self, title: &str) {
-        let Some(t) = self.session.as_ref() else {
+        let Some(t) = self.active_transcript() else {
             self.items.push(Item::Info("no active session to rename".into()));
             return;
         };
@@ -1932,7 +2163,12 @@ impl<'a> Tui<'a> {
             let meta = serde_json::json!({"kind":"meta","model":self.hm.model,"title":title});
             out = format!("{meta}\n{content}");
         }
-        match std::fs::write(&path, out) {
+        let res = std::fs::write(&path, out);
+        // Re-hand the transcript either way so the worker keeps appending.
+        if let (Some(tx), Some(t)) = (&self.ctl_tx, self.session.take()) {
+            let _ = tx.send(Ctl::SetTranscript(t));
+        }
+        match res {
             Ok(()) => {
                 self.session_title = Some(title.to_string());
                 self.items.push(Item::Info(format!("session renamed to “{title}” (persisted)")));
@@ -1942,13 +2178,18 @@ impl<'a> Tui<'a> {
     }
 
     fn do_save(&mut self, filename: &str) {
-        let Some(t) = self.session.as_ref() else {
+        let Some(t) = self.active_transcript() else {
             self.items.push(Item::Info("no active session to save".into()));
             return;
         };
         let src = t.path().clone();
         let dst = PathBuf::from(filename);
-        match std::fs::copy(&src, &dst) {
+        let res = std::fs::copy(&src, &dst);
+        // Read-only op: hand the transcript back to the worker either way.
+        if let (Some(tx), Some(t)) = (&self.ctl_tx, self.session.take()) {
+            let _ = tx.send(Ctl::SetTranscript(t));
+        }
+        match res {
             Ok(n) => self.items.push(Item::Info(format!(
                 "session snapshot: {n} bytes → {}", dst.display()
             ))),
@@ -2138,23 +2379,29 @@ impl<'a> Tui<'a> {
     }
     fn vim_word_back(&mut self, count: usize) {
         for _ in 0..count {
-            let mut pos = self.cursor;
-            while pos > 0 {
-                let prev = self.input[..pos].chars().next_back().unwrap();
-                pos -= prev.len_utf8();
-                if prev.is_alphanumeric() || prev == '_' {
-                    continue;
-                }
-                if pos == 0 {
-                    break;
-                }
-                let p2 = self.input[..pos].chars().next_back().unwrap();
-                if p2.is_alphanumeric() || p2 == '_' {
-                    break;
-                }
-            }
-            self.cursor = pos;
+            let start = self.vim_word_back_one();
+            self.cursor = start;
         }
+    }
+    /// Byte offset reached by moving one word backwards from the cursor
+    /// (does not move it). Used by `b` and emacs ctrl+w.
+    fn vim_word_back_one(&self) -> usize {
+        let mut pos = self.cursor;
+        while pos > 0 {
+            let prev = self.input[..pos].chars().next_back().unwrap();
+            pos -= prev.len_utf8();
+            if prev.is_alphanumeric() || prev == '_' {
+                continue;
+            }
+            if pos == 0 {
+                break;
+            }
+            let p2 = self.input[..pos].chars().next_back().unwrap();
+            if p2.is_alphanumeric() || p2 == '_' {
+                break;
+            }
+        }
+        pos
     }
     /// One normal-mode key press against the composer buffer. Returns false
     /// when the char is not a vim command (caller falls through).
@@ -2305,16 +2552,8 @@ impl<'a> Tui<'a> {
                 }
             }
             "/settings" => {
-                let auto = matches!(*self.gw.mode.lock().unwrap(), ApprovalMode::Auto);
-                self.items.push(Item::Info("╭── ONYX SETTINGS ──────────────────────────────────────╮".into()));
-                self.items.push(Item::Info(format!("│ Model:            {:<36} │", self.hm.model)));
-                self.items.push(Item::Info(format!("│ Reasoning Effort: {:<36} │", self.hm.effort)));
-                self.items.push(Item::Info(format!("│ Mode:             {:<36} │", if auto { "YOLO (Auto-approve all)" } else { "Interactive Approval" })));
-                self.items.push(Item::Info(format!("│ Context Budget:   {:<36} │", format!("{} tokens", self.hm.context_budget))));
-                self.items.push(Item::Info(format!("│ MCP Servers:      {:<36} │", format!("{} active", self.mcp_count))));
-                self.items.push(Item::Info(format!("│ Installed Skills: {:<36} │", format!("{} available", self.skill_count))));
-                self.items.push(Item::Info(format!("│ Max Steps:        {:<36} │", self.opts.max_steps)));
-                self.items.push(Item::Info("╰───────────────────────────────────────────────────────╯".into()));
+                self.settings_active = true;
+                self.settings_selected = 0;
             }
             "/audit" => {
                 if let Some(tx) = &self.ctl_tx {
@@ -2532,31 +2771,101 @@ impl<'a> Tui<'a> {
                 }
             }
             // Context & Session Control Handlers
-            "/compact" => {
-                let prompt = "Please summarize the core decisions, code modifications, and current working context of this conversation compactly so we can free up context window space while preserving key details.";
-                self.input = prompt.to_string();
-                self.cursor = self.input.len();
-                self.submit();
-            }
+            "/compact" => self.do_compact(),
             "/rewind" | "/undo" => {
-                let git_status = std::process::Command::new("git").args(["status", "--porcelain"]).output();
-                match git_status {
-                    Ok(out) if !out.stdout.is_empty() => {
-                        self.items.push(Item::Info("Modified files in workspace:".into()));
-                        for l in String::from_utf8_lossy(&out.stdout).lines() {
-                            self.items.push(Item::Info(format!("  {l}")));
+                if arg == Some("--list") {
+                    let dir = Self::checkpoints_dir();
+                    match dir.filter(|d| d.exists()) {
+                        None => self.items.push(Item::Info("no checkpoints yet (~/.onyx/checkpoints does not exist)".into())),
+                        Some(dir) => {
+                            let mut n = 0usize;
+                            if let Ok(rd) = std::fs::read_dir(&dir) {
+                                for e in rd.flatten() {
+                                    let p = e.path();
+                                    if p.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+                                        let sid = p.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
+                                        let msgs = agent::session::load_messages(&p);
+                                        self.items.push(Item::Info(format!(
+                                            "  {} · {} message(s)",
+                                            sid.trim_end_matches(".ckpt"),
+                                            msgs.len()
+                                        )));
+                                        n += 1;
+                                    }
+                                }
+                            }
+                            self.items.push(Item::Info(format!("{n} checkpoint(s) — /rewind restores the current session's last one")));
                         }
-                        self.items.push(Item::Info("To undo last changes, run: git restore <file> or prompt Onyx to revert.".into()));
                     }
-                    Ok(_) => self.items.push(Item::Info("Workspace is clean; no uncommitted file edits to undo.".into())),
-                    Err(e) => self.items.push(Item::Error(format!("git error: {e}"))),
+                    return;
+                }
+                let Some(t) = self.active_transcript() else {
+                    self.items.push(Item::Info("no active session to rewind".into()));
+                    return;
+                };
+                let sid = t.path().file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                match Self::read_checkpoint(&sid) {
+                    None => self.items.push(Item::Info(
+                        "no checkpoint recorded yet this session (one is written before every turn)".into(),
+                    )),
+                    Some(msgs) => {
+                        // Same fork discipline as /resume: seal the old transcript,
+                        // open a new one seeded with the checkpoint, swap worker history.
+                        if let Some(tx) = &self.ctl_tx {
+                            let _ = tx.send(Ctl::DropTranscript);
+                        }
+                        self.session = None;
+                        let new_sid = agent::session::new_session_id();
+                        let transcript = agent::session::Transcript::open(&new_sid, &self.hm.model);
+                        if let Some(t) = &transcript {
+                            for m in &msgs {
+                                t.push(m);
+                            }
+                        }
+                        self.session = transcript;
+                        if let Some(tx) = &self.ctl_tx {
+                            let _ = tx.send(Ctl::Resume(msgs.clone(), new_sid.clone()));
+                        }
+                        self.items.retain(|it| matches!(it, Item::Banner));
+                        for m in &msgs {
+                            match m.role.as_str() {
+                                "user" => self.items.push(Item::User(m.content.clone())),
+                                "assistant" => {
+                                    if let Some(tc) = &m.tool_call {
+                                        if tc.name != "terminate" && tc.name != "ask_human" {
+                                            self.items.push(Item::Tool {
+                                                name: tc.name.clone(),
+                                                args: tc.args.to_string(),
+                                                ok: true,
+                                                denied: false,
+                                                duration: None,
+                                                output: String::new(),
+                                            });
+                                        }
+                                    } else if !m.content.is_empty() {
+                                        let clean = clean_model_text(&m.content);
+                                        if !clean.trim().is_empty() {
+                                            self.items.push(Item::Answer(clean));
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        self.items.push(Item::Info(format!(
+                            "rewound conversation to checkpoint · restored {} message(s) into new session {new_sid}\n\
+                             note: file edits made by earlier turns are NOT reverted — use git restore for those",
+                            msgs.len()
+                        )));
+                    }
                 }
             }
             "/rename" => {
-                if let Some(new_name) = arg {
-                    self.items.push(Item::Info(format!("session display name updated to: {new_name}")));
+                let rest = line.trim_start_matches("/rename").trim();
+                if rest.is_empty() {
+                    self.items.push(Item::Info("usage: /rename <new name>".into()));
                 } else {
-                    self.items.push(Item::Info("usage: /rename <new_name>".into()));
+                    self.set_session_title(rest);
                 }
             }
             "/branch" => {
@@ -2574,9 +2883,8 @@ impl<'a> Tui<'a> {
                 self.items.push(Item::Info("system configuration reset to factory defaults (steps: 30, mode: Normal)".into()));
             }
             "/save" => {
-                let filename = arg.unwrap_or("onyx-session-snapshot.md");
-                let count = self.items.len();
-                self.items.push(Item::Info(format!("snapshot of active session ({count} items) saved to `{filename}`")));
+                let filename = arg.unwrap_or("onyx-session-snapshot.jsonl");
+                self.do_save(filename);
             }
             // Development & Coding Workflows Handlers
             "/init" => {
@@ -2616,19 +2924,69 @@ impl<'a> Tui<'a> {
                 self.submit();
             }
             "/add-dir" => {
-                if let Some(dir) = arg {
-                    self.items.push(Item::Info(format!("supplemental directory mounted: `{dir}`")));
-                } else {
-                    self.items.push(Item::Info("usage: /add-dir <directory_path>".into()));
+                match arg {
+                    None => self.items.push(Item::Info("usage: /add-dir <directory_path>".into())),
+                    Some(dir) => {
+                        let path = PathBuf::from(dir);
+                        if !path.exists() {
+                            self.items.push(Item::Error(format!("no such directory: `{dir}`")));
+                        } else if !path.is_dir() {
+                            self.items.push(Item::Error(format!("not a directory: `{dir}`")));
+                        } else {
+                            let abs = std::fs::canonicalize(&path).unwrap_or(path.clone());
+                            let key = abs.display().to_string();
+                            if self.extra_dirs.iter().any(|d| d == &key) {
+                                self.items.push(Item::Info(format!("{key} is already added this session")));
+                            } else {
+                                // Tools run in the process cwd; the honest way to
+                                // widen scope is telling the model where to look.
+                                let add = format!(
+                                    "\n\n[Additional workspace directory] {}\nFiles there are readable and writable by absolute path.",
+                                    key
+                                );
+                                if let Some(tx) = &self.ctl_tx {
+                                    let _ = tx.send(Ctl::SystemAppend(add));
+                                }
+                                self.extra_dirs.push(key.clone());
+                                self.items.push(Item::Info(format!(
+                                    "added {key} to the model's awareness (system prompt appended; tools still run from {ws})",
+                                    ws = self.workspace_dir
+                                )));
+                            }
+                        }
+                    }
                 }
             }
             "/bashes" | "/tasks" => {
-                self.items.push(Item::Info("active background processes:".into()));
-                let ps = std::process::Command::new("ps").args(["-eo", "pid,user,comm,%cpu,%mem"]).output();
-                if let Ok(out) = ps {
-                    for l in String::from_utf8_lossy(&out.stdout).lines().take(8) {
-                        self.items.push(Item::Info(format!("  {l}")));
+                // Honest inventory: onyx has no detached background-task runner,
+                // so list THIS user's processes as the closest live truth.
+                self.items.push(Item::Info(
+                    "onyx has no detached background tasks yet — every tool call runs inside its turn.".into(),
+                ));
+                let me = std::env::var("USER").or_else(|_| std::env::var("LOGNAME")).unwrap_or_default();
+                self.items.push(Item::Info(format!("processes owned by `{me}`:")));
+                let ps = std::process::Command::new("ps")
+                    .args(["-o", "pid,user,etime,comm"])
+                    .output();
+                match ps {
+                    Ok(out) => {
+                        let mut shown = 0usize;
+                        for l in String::from_utf8_lossy(&out.stdout).lines().skip(1) {
+                            let owner = l.split_whitespace().nth(1).unwrap_or("");
+                            if !me.is_empty() && owner != me {
+                                continue;
+                            }
+                            self.items.push(Item::Info(format!("  {}", l.trim())));
+                            shown += 1;
+                            if shown >= 10 {
+                                break;
+                            }
+                        }
+                        if shown == 0 {
+                            self.items.push(Item::Info("  (none visible)".into()));
+                        }
                     }
+                    Err(_) => self.items.push(Item::Info("  ps unavailable".into())),
                 }
             }
             "/btw" => {
@@ -2711,21 +3069,64 @@ impl<'a> Tui<'a> {
                 self.items.push(Item::Info("config file: ~/.onyx/mcp.json".into()));
             }
             "/permissions" => {
-                let auto = matches!(*self.gw.mode.lock().unwrap(), ApprovalMode::Auto);
-                self.items.push(Item::Info(format!("current security approval mode: {}", if auto { "AUTO (YOLO)" } else { "INTERACTIVE" })));
-                self.items.push(Item::Info("use /mode or Shift+Tab to cycle modes".into()));
+                let mode = *self.gw.mode.lock().unwrap();
+                self.items.push(Item::Info(format!("approval mode: {} (shift+tab or /mode cycles)", mode.label())));
+                self.items.push(Item::Info("hard deny rules (bypass even AUTO):".into()));
+                for pat in tools::policy::BashGuard::default().dangerous_patterns() {
+                    self.items.push(Item::Info(format!("  bash ~ {pat}")));
+                }
+                self.items.push(Item::Info(
+                    "sandbox capability gates ask before network/exec-escalating tools; approving a prompt with `a` (always) promotes a session rule so that exact pattern stops asking.".into(),
+                ));
+                if !self.extra_dirs.is_empty() {
+                    self.items.push(Item::Info(format!("extra directories this session: {}", self.extra_dirs.join(", "))));
+                }
             }
             "/output-style" => {
-                self.items.push(Item::Info("terminal output style: rich markdown + truecolor syntax highlighting".into()));
+                let state = if self.expanded { "expanded tool output" } else { "collapsed tool output (ctrl+o toggles)" };
+                self.items.push(Item::Info(format!(
+                    "output style is fixed: markdown + truecolor syntax highlighting, inline tool rows · currently {state}"
+                )));
+                self.items.push(Item::Info("use /verbose to toggle detail level — there is no separate style catalogue yet".into()));
             }
             "/vim" => {
-                self.items.push(Item::Info("Vim modal navigation mode toggled".into()));
+                self.vim_normal = !self.vim_normal;
+                if self.vim_normal {
+                    // Normal mode sits ON a character, not after it.
+                    self.cursor = self.cursor.min(self.input.len().saturating_sub(1));
+                    self.items.push(Item::Info(
+                        "vim normal mode ON — h j k l 0 ^ $ w b x · dd d$ dw cut, p paste · i/a/A insert · Esc exits".into(),
+                    ));
+                } else {
+                    self.vim_pending_d = false;
+                    self.items.push(Item::Info("vim normal mode OFF — insert typing restored".into()));
+                }
             }
             "/emacs" => {
-                self.items.push(Item::Info("Emacs keybindings active (Ctrl+A home, Ctrl+E end, Ctrl+K kill line)".into()));
+                self.emacs_keys = !self.emacs_keys;
+                if self.emacs_keys {
+                    self.items.push(Item::Info(
+                        "emacs keys ON: ctrl+a line start · ctrl+e line end · ctrl+b/f char · ctrl+k kill to end · ctrl+u clear line · ctrl+w delete word".into(),
+                    ));
+                } else {
+                    self.items.push(Item::Info("emacs keys OFF — plain arrow editing".into()));
+                }
             }
             "/theme" => {
-                self.items.push(Item::Info("current theme: Onyx Cyan (Dark Developer Workstation)".into()));
+                const NAMES: [&str; 3] = ["onyx-cyan", "amber-term", "emerald"];
+                match arg {
+                    None => {
+                        let next = (self.theme_idx + 1) % NAMES.len();
+                        self.set_theme(next);
+                    }
+                    Some(name) => match NAMES.iter().position(|n| *n == name) {
+                        Some(idx) => self.set_theme(idx),
+                        None => self.items.push(Item::Info(format!(
+                            "unknown theme `{name}` — choose from: {}",
+                            NAMES.join(", ")
+                        ))),
+                    },
+                }
             }
             "/verbose" => {
                 self.expanded = !self.expanded;
@@ -2734,12 +3135,28 @@ impl<'a> Tui<'a> {
             }
             // Token Analytics & Health Diagnostics Handlers
             "/cost" => {
-                let prompt_cost = (self.real_prompt_tokens as f64) * 0.0000015;
-                let comp_cost = (self.real_completion_tokens as f64) * 0.000006;
+                // Rates are per-token estimates for a gpt-oss-class model through a
+                // local proxy; cached prompt tokens are billed at ~10% of input rate.
+                const IN: f64 = 0.000_000_15;
+                const OUT: f64 = 0.000_000_60;
+                let fresh_in = self.real_prompt_tokens.saturating_sub(self.real_cached_tokens) as f64;
+                let cache_read = (self.real_cached_tokens as f64) * IN * 0.10;
+                let prompt_cost = fresh_in * IN + cache_read;
+                let comp_cost = (self.real_completion_tokens as f64) * OUT;
                 let total = prompt_cost + comp_cost;
                 self.items.push(Item::Info(format!(
-                    "estimated session cost: ${total:.4} (prompt: ${prompt_cost:.4}, completion: ${comp_cost:.4})",
+                    "estimated session cost: ${total:.5} (prompt ${prompt_cost:.5}, completion ${comp_cost:.5})"
                 )));
+                self.items.push(Item::Info(format!(
+                    "tokens: {} in ({} cached) · {} out · {} total",
+                    self.real_prompt_tokens, self.real_cached_tokens,
+                    self.real_completion_tokens, self.real_total_tokens
+                )));
+                if self.hm.host == "127.0.0.1" || self.hm.host == "localhost" {
+                    self.items.push(Item::Info(
+                        "note: loopback gateway — your proxy may meter or bill differently than these list-price estimates".into(),
+                    ));
+                }
             }
             "/stats" => {
                 let files_cnt = std::process::Command::new("git").args(["ls-files"]).output()
@@ -2749,38 +3166,75 @@ impl<'a> Tui<'a> {
                 self.items.push(Item::Info(format!("working directory: {}", self.workspace_dir)));
             }
             "/insights" => {
-                self.items.push(Item::Info(format!("session insights: {} messages exchanged, {} tool executions", self.history_len, self.gw.audit.snapshot().len())));
+                use std::collections::BTreeMap;
+                let audit = self.gw.audit.snapshot();
+                let mut mix: BTreeMap<&str, usize> = BTreeMap::new();
+                let mut denials = 0usize;
+                let mut errors = 0usize;
+                for e in &audit {
+                    *mix.entry(e.tool.as_str()).or_default() += 1;
+                    if e.outcome.starts_with("DENY") {
+                        denials += 1;
+                    } else if e.outcome.starts_with("ERR") || e.outcome.starts_with("FAIL") {
+                        errors += 1;
+                    }
+                }
+                self.items.push(Item::Info(format!(
+                    "session insights — {} turn(s), {} message(s), {} tool call(s)",
+                    self.turns, self.history_len, audit.len()
+                )));
+                if !mix.is_empty() {
+                    let top: Vec<_> = mix.iter().take(8).map(|(t, n)| format!("{t}:{n}")).collect();
+                    self.items.push(Item::Info(format!("tool mix: {}", top.join("  "))));
+                }
+                self.items.push(Item::Info(format!(
+                    "policy denials: {denials} · tool errors: {errors}"
+                )));
+                if let Some(start) = self.turn_start {
+                    self.items.push(Item::Info(format!("current turn running for {:.1}s", start.elapsed().as_secs_f64())));
+                }
+                if self.ctx_history.len() >= 2 {
+                    let first = self.ctx_history[0] as i32;
+                    let last = *self.ctx_history.last().unwrap() as i32;
+                    let trend = match (last - first).cmp(&0) {
+                        std::cmp::Ordering::Greater => "growing",
+                        std::cmp::Ordering::Less => "shrinking",
+                        std::cmp::Ordering::Equal => "flat",
+                    };
+                    self.items.push(Item::Info(format!(
+                        "context usage {} over the last {} turns ({first}% → {last}%)",
+                        trend, self.ctx_history.len()
+                    )));
+                }
             }
+            "/doctor" => self.do_doctor(),
+            "/ping" => self.do_ping(),
             "/context" => {
                 let (filled, empty, pct) = self.ctx_meter(24);
                 let bar = format!("{}{}", "█".repeat(filled), "░".repeat(empty));
                 self.items.push(Item::Info(format!("context window capacity: [{bar}] {pct}%")));
                 self.items.push(Item::Info(format!("budget: {} tokens · current total: {} tokens", self.hm.context_budget, self.real_total_tokens)));
             }
-            "/doctor" => {
-                self.items.push(Item::Info("╭── ONYX SYSTEM HEALTH CHECK ──────────────────────────────╮".into()));
-                let git_ok = std::process::Command::new("git").arg("--version").output().is_ok();
-                self.items.push(Item::Info(format!("│ Git Installed:        {:<34} │", if git_ok { "✓ YES" } else { "✗ MISSING" })));
-                let proxy_ok = std::net::TcpStream::connect("127.0.0.1:8317").is_ok();
-                self.items.push(Item::Info(format!("│ Proxy Gateway (:8317): {:<33} │", if proxy_ok { "✓ ONLINE" } else { "✗ OFFLINE" })));
-                self.items.push(Item::Info(format!("│ Active Model:         {:<34} │", self.hm.model)));
-                self.items.push(Item::Info(format!("│ MCP Integrations:     {:<34} │", format!("✓ {} active", self.mcp_count))));
-                self.items.push(Item::Info("╰──────────────────────────────────────────────────────────╯".into()));
-            }
-            "/ping" => {
-                let start = std::time::Instant::now();
-                let check = std::net::TcpStream::connect("127.0.0.1:8317");
-                let el = start.elapsed();
-                match check {
-                    Ok(_) => self.items.push(Item::Info(format!("gateway latency: {:.2}ms (status: healthy)", el.as_secs_f64() * 1000.0))),
-                    Err(e) => self.items.push(Item::Error(format!("gateway unreachable: {e}"))),
-                }
-            }
             "/logs" => {
-                self.items.push(Item::Info("most recent audit / diagnostic events:".into()));
+                self.items.push(Item::Info("recent audit trail (local time):".into()));
                 let recent = self.gw.audit.snapshot();
-                for e in recent.iter().rev().take(6) {
-                    self.items.push(Item::Info(format!("  {} [{}] {}", e.tool, e.outcome, clip_chars(first_line(&e.args), 40))));
+                for e in recent.iter().rev().take(12) {
+                    let secs = e.ts_ms / 1000;
+                    let hhmmss = {
+                        let hours = (secs / 3600) % 24;
+                        let mins = (secs / 60) % 60;
+                        let ss = secs % 60;
+                        format!("{hours:02}:{mins:02}:{ss:02}")
+                    };
+                    self.items.push(Item::Info(format!(
+                        "  {hhmmss}  {} [{}] {}",
+                        e.tool,
+                        e.outcome,
+                        clip_chars(first_line(&e.args), 40)
+                    )));
+                }
+                if recent.is_empty() {
+                    self.items.push(Item::Info("  (no tool calls audited yet)".into()));
                 }
             }
             // Ecosystem & Advanced Integrations Handlers
@@ -2797,14 +3251,21 @@ impl<'a> Tui<'a> {
                 self.cursor = self.input.len();
                 self.submit();
             }
-            "/api" | "/claude-api" => {
-                self.items.push(Item::Info("API documentation reference indexed: OpenAI / Anthropic / Grok endpoints available.".into()));
+            "/api" => {
+                self.items.push(Item::Info(format!(
+                    "onyx speaks the OpenAI-compatible chat API to {}:{}{} — model `{}`, tools via function-calling schemas.",
+                    self.hm.host, self.hm.port,
+                    if self.hm.path.is_empty() { "" } else { self.hm.path.as_str() },
+                    self.hm.model
+                )));
+                self.items.push(Item::Info("there is no bundled vendor-doc browser; ask onyx to read an SDK file in the workspace instead".into()));
             }
-            "/install-github-app" | "/pr-comments" => {
-                self.items.push(Item::Info("GitHub integration check: pull request workflows and reviews synchronized.".into()));
-            }
-            "/desktop" | "/app" => {
-                self.items.push(Item::Info("Onyx CLI is running in standalone terminal workstation mode.".into()));
+            "/claude-api" | "/install-github-app" | "/pr-comments" | "/desktop" | "/app" => {
+                self.items.push(Item::Info(format!(
+                    "`{cmd}` is a vendor-specific integration that onyx does not ship — refusing rather than pretending.",
+                    cmd = cmd
+                )));
+                self.items.push(Item::Info("equivalent reach lives in MCP servers (~/.onyx/mcp.json) and workspace tools; run /mcp to see what's connected".into()));
             }
             other => self.items.push(Item::Error(format!("unknown command `{other}` (try /help)"))),
         }
@@ -3075,8 +3536,73 @@ impl<'a> Tui<'a> {
                 continue;
             }
 
+            // Interactive Settings Modal swallows keys while open.
+            if self.settings_active {
+                let first = chars[0];
+                let count = self.settings_items().len();
+                match (first, code) {
+                    ('\0', 1000) => {
+                        // Up arrow
+                        if count > 0 {
+                            self.settings_selected = (self.settings_selected + count - 1) % count;
+                        }
+                    }
+                    ('\0', 1001) => {
+                        // Down arrow
+                        if count > 0 {
+                            self.settings_selected = (self.settings_selected + 1) % count;
+                        }
+                    }
+                    ('\r', _) | ('\n', _) | (' ', _) => {
+                        // Enter or Space: cycle selected setting
+                        self.cycle_selected_setting();
+                    }
+                    ('\x1b', _) | ('q', 0) | ('Q', 0) | ('\x03', _) => {
+                        // Escape, q, or Ctrl+C: close settings modal
+                        self.settings_active = false;
+                        self.items.push(Item::Info("settings saved to ~/.onyx/config.json".into()));
+                    }
+                    (c, 0) if c >= '1' && c <= '9' => {
+                        let num = (c as usize) - ('0' as usize);
+                        if num <= count {
+                            self.settings_selected = num - 1;
+                            self.cycle_selected_setting();
+                        }
+                    }
+                    _ => {}
+                }
+                paint(self);
+                continue;
+            }
+
             // Special keys arrive alone; printable runs carry several chars.
             let first = chars[0];
+
+            // Vim normal mode: single printable chars edit the composer through
+            // the vim state machine instead of inserting themselves. Control
+            // bytes keep their global meanings (exit, cancel, clear, expand).
+            if self.vim_normal && code == 0 && chars.len() == 1 {
+                match first {
+                    '\r' | '\n' | '\x03' | '\x04' | '\x0c' | '\x0f' => {}
+                    '\x1b' => {
+                        self.vim_normal = false;
+                        self.vim_pending_d = false;
+                        self.items.push(Item::Info("vim: insert mode (Esc pressed)".into()));
+                    }
+                    c if !c.is_control() => {
+                        if !self.vim_normal_key(c) {
+                            // Non-command key in normal mode: ignore (no beep).
+                        }
+                    }
+                    _ => {}
+                }
+                if self.quit {
+                    break;
+                }
+                paint(self);
+                continue;
+            }
+
             if chars.len() == 1 || code != 0 {
                 match (first, code) {
                     ('\x04', _) => {
@@ -3252,6 +3778,31 @@ impl<'a> Tui<'a> {
                     }
                     ('\0', 1006) => self.cursor = 0,
                     ('\0', 1007) => self.cursor = self.input.len(),
+                    // Emacs-style bindings, armed by /emacs. Line semantics:
+                    // ctrl+a/e jump within the current line, not buffer ends.
+                    ('\x01', _) if self.emacs_keys => {
+                        self.cursor = self.vim_line_start_byte();
+                    }
+                    ('\x05', _) if self.emacs_keys => {
+                        self.cursor = self.vim_line_end_byte();
+                    }
+                    ('\x02', _) if self.emacs_keys => self.vim_move_left(),
+                    ('\x06', _) if self.emacs_keys => self.vim_move_right(),
+                    ('\x0b', _) if self.emacs_keys => {
+                        let le = self.vim_line_end_byte();
+                        self.input.replace_range(self.cursor..le, "");
+                        self.cursor = self.cursor.min(self.input.len());
+                    }
+                    ('\x15', _) if self.emacs_keys => {
+                        self.input.clear();
+                        self.cursor = 0;
+                        self.slash_selected = 0;
+                    }
+                    ('\x17', _) if self.emacs_keys => {
+                        let start = self.vim_word_back_one();
+                        self.input.replace_range(start..self.cursor, "");
+                        self.cursor = start;
+                    }
                     (c, 0) if !c.is_control() => {
                         self.scroll_offset = 0; // jump back to bottom when user begins typing
                         self.input.insert(self.cursor, c);
@@ -3457,7 +4008,7 @@ impl<'a> Tui<'a> {
             RuSpan::styled(" ID ", theme::dim()),
             RuSpan::styled(self.session_label(), theme::strong()),
             RuSpan::styled("   MODEL ", theme::dim()),
-            RuSpan::styled(self.hm.model.clone(), theme::rgb(theme::PRIMARY)),
+            RuSpan::styled(self.hm.model.clone(), theme::rgb(theme::accent())),
             RuSpan::styled("   CTX ", theme::dim()),
             RuSpan::styled(format!("{pct}%"), theme::rgb(theme::FG_MAIN)),
         ]);
@@ -3466,13 +4017,25 @@ impl<'a> Tui<'a> {
         let footer_status = RuLine::from(vec![
             RuSpan::styled("◈ ", theme::accent_bold()),
             RuSpan::styled("ONYX", theme::strong()),
-            RuSpan::styled("  ● ", theme::rgb(theme::SUCCESS)),
+            RuSpan::styled("  ● ", theme::rgb(theme::active_success())),
             RuSpan::styled(format!("{}", self.mcp_count), theme::strong()),
             RuSpan::styled(" MCP   ◇ ", theme::dim()),
             RuSpan::styled(format!("{}", self.skill_count), theme::strong()),
             RuSpan::styled(" SKILLS   ", theme::dim()),
             RuSpan::styled(self.hm.model.to_uppercase(), theme::dim()),
         ]);
+
+        // ── settings modal (only when /settings active) ──
+        let settings_lines: Vec<RuLine> = if self.settings_active {
+            self.settings_lines_v()
+                .into_iter()
+                .flat_map(|l| fit_lines(&l, w))
+                .map(|l| Self::ansi_to_line(&l))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let settings_active = !settings_lines.is_empty();
 
         // ── approval card (only when pending) ──
         let approval_active = self.ask.pending().is_some();
@@ -3511,6 +4074,7 @@ impl<'a> Tui<'a> {
         let strip_h = 1u16;
         let composer_h = 3u16; // top border + input + bottom border
         let footer_h = 1u16; // status bar only (key-hint row removed)
+        let settings_h = settings_lines.len() as u16;
         let approval_h = approval_lines.len() as u16;
         let question_h = question_lines.len() as u16;
 
@@ -3519,6 +4083,9 @@ impl<'a> Tui<'a> {
             Constraint::Length(strip_h),
             Constraint::Min(1), // transcript
         ];
+        if settings_active {
+            constraints.push(Constraint::Length(settings_h));
+        }
         if approval_active {
             constraints.push(Constraint::Length(approval_h));
         }
@@ -3539,6 +4106,13 @@ impl<'a> Tui<'a> {
         ci += 1;
         let transcript_area = chunks[ci];
         ci += 1;
+        let settings_area = if settings_active {
+            let s = chunks[ci];
+            ci += 1;
+            s
+        } else {
+            Rect::ZERO
+        };
         let approval_area = if approval_active {
             let a = chunks[ci];
             ci += 1;
@@ -3614,6 +4188,12 @@ impl<'a> Tui<'a> {
                 .track_style(theme::border())
                 .thumb_style(theme::accent_bold())
                 .render(transcript_area, f.buffer_mut(), &mut sb_state);
+        }
+
+        // ── settings modal ──
+        if settings_active {
+            let sp = RuParagraph::new(settings_lines);
+            f.render_widget(sp, settings_area);
         }
 
         // ── approval card ──
