@@ -3725,7 +3725,7 @@ impl<'a> Tui<'a> {
                         if !matches.is_empty() {
                             let idx = self.slash_selected.min(matches.len() - 1);
                             let target = &matches[idx].0;
-                            if title.contains("Resume") {
+                            if title.contains("Conversations") || title.contains("Resume") {
                                 self.input = format!("/resume {target}");
                             } else if title.contains("Model") {
                                 self.input = format!("/model {target}");
@@ -3752,7 +3752,7 @@ impl<'a> Tui<'a> {
                         if !matches.is_empty() {
                             let idx = self.slash_selected.min(matches.len() - 1);
                             let target = &matches[idx].0;
-                            if title.contains("Resume") {
+                            if title.contains("Conversations") || title.contains("Resume") {
                                 // Resume immediately!
                                 self.input = format!("/resume {target}");
                                 self.cursor = self.input.len();

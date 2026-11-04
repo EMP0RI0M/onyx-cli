@@ -256,7 +256,7 @@ pub fn list_sessions(limit: usize) -> Vec<SessionInfo> {
     infos
 }
 
-/// Resolve a resume target by exact id, prefix, or suffix; returns the message list.
+/// Resolve a resume target by exact id, prefix, suffix, title, or query; returns the message list.
 pub fn resolve_session(query: &str) -> Option<(PathBuf, Vec<Message>)> {
     let q = query.trim().trim_end_matches(".jsonl");
     if q.is_empty() {
@@ -267,7 +267,7 @@ pub fn resolve_session(query: &str) -> Option<(PathBuf, Vec<Message>)> {
     if exact.exists() {
         return Some((exact.clone(), load_messages(&exact)));
     }
-    // Prefix or suffix match (e.g. `343c481b` from `1793621685-343c481b`)
+    // Prefix or suffix match on ID (e.g. `343c481b` from `1793621685-343c481b`)
     let all = list_sessions(usize::MAX);
     let prefix_matches: Vec<PathBuf> = all
         .iter()
@@ -284,10 +284,27 @@ pub fn resolve_session(query: &str) -> Option<(PathBuf, Vec<Message>)> {
         .filter(|s| s.id.ends_with(q) || s.id.contains(q))
         .map(|s| dir.join(format!("{}.jsonl", s.id)))
         .collect();
-    if suffix_or_substr_matches.len() == 1 {
+    if !suffix_or_substr_matches.is_empty() {
+        // Return first/most recent match
         let p = suffix_or_substr_matches.into_iter().next().unwrap();
         return Some((p.clone(), load_messages(&p)));
     }
+
+    // Match by session title or user preview text
+    let q_lower = q.to_lowercase();
+    let title_matches: Vec<PathBuf> = all
+        .iter()
+        .filter(|s| {
+            s.title.as_deref().map(|t| t.to_lowercase().contains(&q_lower)).unwrap_or(false)
+                || s.preview.to_lowercase().contains(&q_lower)
+        })
+        .map(|s| dir.join(format!("{}.jsonl", s.id)))
+        .collect();
+    if !title_matches.is_empty() {
+        let p = title_matches.into_iter().next().unwrap();
+        return Some((p.clone(), load_messages(&p)));
+    }
+
     None
 }
 
