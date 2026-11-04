@@ -1651,28 +1651,26 @@ impl<'a> Tui<'a> {
             } else {
                 ""
             };
-            let sessions = agent::session::list_sessions(20);
+            let sessions = agent::session::list_sessions(30);
             let mut items = Vec::new();
             for s in sessions {
-                let id_short = if s.id.len() > 16 {
-                    format!("…{}", &s.id[s.id.len().saturating_sub(12)..])
-                } else {
-                    s.id.clone()
-                };
-                let title = if s.preview.is_empty() {
-                    "(empty session)".to_string()
-                } else {
-                    s.preview.clone()
-                };
-                let desc = format!("{title} ({msg} msgs)", msg = s.messages);
+                let display_title = s.title.clone().unwrap_or_else(|| {
+                    if !s.preview.is_empty() {
+                        agent::session::derive_title(&s.preview)
+                    } else {
+                        "Untitled Session".to_string()
+                    }
+                });
+                let time_ago = Self::format_relative_time(s.modified);
+                let desc = format!("{:>4} msgs · {:>7}", s.messages, time_ago);
                 if arg.is_empty()
                     || s.id.to_lowercase().contains(&arg.to_lowercase())
-                    || title.to_lowercase().contains(&arg.to_lowercase())
+                    || display_title.to_lowercase().contains(&arg.to_lowercase())
                 {
-                    items.push((s.id, id_short, desc));
+                    items.push((s.id, display_title, desc));
                 }
             }
-            return (" Resume Session (↑/↓ to choose, tab/enter to resume) ".into(), items);
+            return (" Conversations (↑/↓ to choose, tab/enter to resume) ".into(), items);
         }
 
         // Subcommand dropdown for /model or /models
@@ -1817,14 +1815,17 @@ impl<'a> Tui<'a> {
             return;
         }
         self.items.push(Item::User(text.clone()));
+        // Checkpoint BEFORE the turn mutates anything: /rewind restores this.
+        // Runs before `running` flips so any UI-side transcript is used while
+        // still held; write_checkpoint falls back to the on-disk file when the
+        // worker owns the handle.
+        self.write_checkpoint();
         self.tail.clear();
         self.tail_scrolled = 0;
         self.thinking = true;
         self.running = true;
         self.turns += 1;
         self.turn_start = Some(std::time::Instant::now());
-        // Checkpoint BEFORE the turn mutates anything: /rewind restores this.
-        self.write_checkpoint();
         let ms = self.opts.max_steps;
         if let Some(tx) = &self.ctl_tx {
             let _ = tx.send(Ctl::Prompt(text, ms));
@@ -1851,6 +1852,31 @@ impl<'a> Tui<'a> {
         std::env::var_os("HOME")
             .map(PathBuf::from)
             .map(|h| h.join(".onyx/checkpoints"))
+    }
+
+    /// Format relative timestamp (e.g. "13h ago", "1d ago", "Oct 30")
+    fn format_relative_time(ts_secs: u64) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if ts_secs == 0 || ts_secs > now {
+            return "just now".to_string();
+        }
+        let diff = now - ts_secs;
+        if diff < 60 {
+            "just now".to_string()
+        } else if diff < 3600 {
+            format!("{}m ago", diff / 60)
+        } else if diff < 86400 {
+            format!("{}h ago", diff / 3600)
+        } else if diff < 604800 {
+            format!("{}d ago", diff / 86400)
+        } else {
+            // Format approximate date e.g. Oct 28
+            let days_ago = diff / 86400;
+            format!("{days_ago}d ago")
+        }
     }
 
     /// Read config from ~/.onyx/config.json
@@ -2021,14 +2047,39 @@ impl<'a> Tui<'a> {
         out
     }
 
-    /// Snapshot the current transcript file into `~/.onyx/checkpoints/<sid>.ckpt.jsonl`.
-    fn write_checkpoint(&self) {
-        let Some(t) = self.session.as_ref() else { return };
+    /// Snapshot the current session's transcript into
+    /// `~/.onyx/checkpoints/<sid>.ckpt.jsonl`. Reads the on-disk file directly
+    /// (the worker owns the Transcript handle but pushes are flushed per
+    /// message), so this never disturbs transcript ownership mid-turn.
+    fn write_checkpoint(&mut self) {
         let Some(dir) = Self::checkpoints_dir() else { return };
+        let sid = match self.session.as_ref() {
+            Some(t) => t.path().file_stem().and_then(|s| s.to_str()).unwrap_or("onyx").to_string(),
+            None => self.current_sid(),
+        };
+        let src = agent::session::sessions_dir().join(format!("{sid}.jsonl"));
+        if !src.exists() {
+            return; // nothing recorded yet for this session
+        }
         let _ = std::fs::create_dir_all(&dir);
-        let sid = t.path().file_stem().and_then(|s| s.to_str()).unwrap_or("onyx");
         let dst = dir.join(format!("{sid}.ckpt.jsonl"));
-        let _ = std::fs::copy(t.path(), &dst);
+        let _ = std::fs::copy(&src, &dst);
+    }
+
+    /// Session id from the most recent "session <sid> ·" info item the worker
+    /// reported (startup, /clear, or a new turn). Used when the UI thread does
+    /// not hold the Transcript handle itself.
+    fn current_sid(&self) -> String {
+        for item in self.items.iter().rev() {
+            if let Item::Info(s) = item {
+                if let Some(rest) = s.strip_prefix("session ") {
+                    if let Some(sid) = rest.split(' ').next() {
+                        return sid.to_string();
+                    }
+                }
+            }
+        }
+        String::new()
     }
 
     fn read_checkpoint(sid: &str) -> Option<Vec<Message>> {
@@ -2045,10 +2096,19 @@ impl<'a> Tui<'a> {
     /// outputs, then fold older turns into a digest. Rewrites the session file
     /// and swaps the worker's history through `Ctl::ReplaceHistory`.
     fn do_compact(&mut self) {
-        let Some(t) = self.session.as_ref() else {
+        if self.active_transcript().is_some() {
+            self.compact_inner();
+        } else {
             self.items.push(Item::Info("no session transcript to compact".into()));
-            return;
-        };
+        }
+        // Re-hand the transcript so the worker keeps appending, on every exit path.
+        if let (Some(tx), Some(t)) = (&self.ctl_tx, self.session.take()) {
+            let _ = tx.send(Ctl::SetTranscript(t));
+        }
+    }
+
+    fn compact_inner(&mut self) {
+        let Some(t) = self.session.as_ref() else { return };
         let path = t.path().clone();
         let msgs = agent::session::load_messages(&path);
         if msgs.len() < 4 {
@@ -3578,30 +3638,50 @@ impl<'a> Tui<'a> {
             // Special keys arrive alone; printable runs carry several chars.
             let first = chars[0];
 
-            // Vim normal mode: single printable chars edit the composer through
-            // the vim state machine instead of inserting themselves. Control
-            // bytes keep their global meanings (exit, cancel, clear, expand).
-            if self.vim_normal && code == 0 && chars.len() == 1 {
-                match first {
-                    '\r' | '\n' | '\x03' | '\x04' | '\x0c' | '\x0f' => {}
-                    '\x1b' => {
+            // Vim modal editing in the composer. `vim_normal` is the NORMAL
+            // (command) mode; printable keys run through the state machine
+            // instead of inserting. Esc toggles: normal -> insert, and from
+            // insert it returns to normal without a message. Control bytes and
+            // Enter keep their global meanings (exit, cancel, submit).
+            if self.vim_normal && code == 0 {
+                let mut handled_any = false;
+                for &c in &chars {
+                    if !c.is_control() {
+                        handled_any = true;
+                        self.vim_normal_key(c);
+                    } else if c == '\x1b' {
+                        // Lone Esc: drop into INSERT so typed text inserts.
                         self.vim_normal = false;
                         self.vim_pending_d = false;
                         self.items.push(Item::Info("vim: insert mode (Esc pressed)".into()));
+                        break;
                     }
-                    c if !c.is_control() => {
-                        if !self.vim_normal_key(c) {
-                            // Non-command key in normal mode: ignore (no beep).
-                        }
+                }
+                if handled_any {
+                    if self.quit {
+                        break;
                     }
-                    _ => {}
+                    paint(self);
+                    continue;
                 }
-                if self.quit {
-                    break;
-                }
+            } else if !self.vim_normal && code == 0 && chars.len() == 1 && chars[0] == '\x1b' {
+                // Insert-mode Esc: return to NORMAL (no message — vim itself is
+                // silent here; the next printable key will act as a command).
+                self.vim_normal = true;
+                self.vim_pending_d = false;
                 paint(self);
                 continue;
             }
+
+            let insert_run = |s: &mut Self, chars: &[char]| {
+                s.scroll_offset = 0; // jump back to bottom on paste/multi-character input
+                for &c in chars {
+                    s.input.insert(s.cursor, c);
+                    s.cursor += c.len_utf8();
+                }
+                s.slash_selected = 0;
+                s.last_ctrl_d = None;
+            };
 
             if chars.len() == 1 || code != 0 {
                 match (first, code) {
@@ -3804,22 +3884,12 @@ impl<'a> Tui<'a> {
                         self.cursor = start;
                     }
                     (c, 0) if !c.is_control() => {
-                        self.scroll_offset = 0; // jump back to bottom when user begins typing
-                        self.input.insert(self.cursor, c);
-                        self.cursor += c.len_utf8();
-                        self.slash_selected = 0;
-                        self.last_ctrl_d = None;
+                        insert_run(self, std::slice::from_ref(&c));
                     }
                     _ => {}
                 }
             } else {
-                self.scroll_offset = 0; // jump back to bottom on paste/multi-character input
-                for &c in &chars {
-                    self.input.insert(self.cursor, c);
-                    self.cursor += c.len_utf8();
-                }
-                self.slash_selected = 0;
-                self.last_ctrl_d = None;
+                insert_run(self, &chars);
             }
             if self.quit {
                 break;

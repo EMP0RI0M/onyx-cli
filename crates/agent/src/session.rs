@@ -68,6 +68,12 @@ impl Transcript {
     /// Append one message as its own record. Best-effort: write errors are
     /// swallowed so a full disk degrades to "no persistence", not a crash.
     pub fn push(&self, msg: &Message) {
+        // If this is the first user prompt and meta header has no title, generate and update title
+        if msg.role == "user" && session_title(&self.path).is_none() {
+            let title = derive_title(&msg.content);
+            let _ = update_session_title(&self.path, &title);
+        }
+
         let mut rec = json!({
             "kind": "message",
             "role": msg.role,
@@ -148,7 +154,67 @@ pub fn session_title(path: &PathBuf) -> Option<String> {
     None
 }
 
+/// Update or insert a `title` into a transcript's meta header record.
+pub fn update_session_title(path: &PathBuf, title: &str) -> Option<()> {
+    let content = fs::read_to_string(path).ok()?;
+    let mut out = String::with_capacity(content.len() + 64);
+    let mut injected = false;
+    for line in content.lines() {
+        if !injected {
+            if let Ok(mut v) = serde_json::from_str::<Value>(line) {
+                if v.get("kind").and_then(Value::as_str) == Some("meta") {
+                    v["title"] = json!(title);
+                    if let Ok(serialized) = serde_json::to_string(&v) {
+                        out.push_str(&serialized);
+                        out.push('\n');
+                        injected = true;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+        if !injected && line.contains("\"kind\":\"message\"") {
+            let meta = json!({ "kind": "meta", "title": title, "ts": now_secs() });
+            out = format!("{}\n{}", meta, out);
+            injected = true;
+        }
+    }
+    if !injected {
+        let meta = json!({ "kind": "meta", "title": title, "ts": now_secs() });
+        out = format!("{meta}\n{content}");
+    }
+    fs::write(path, out).ok()
+}
+
+/// Generate a title from a user prompt.
+pub fn derive_title(text: &str) -> String {
+    let first_line = text.lines().next().unwrap_or("").trim();
+    let words: Vec<&str> = first_line.split_whitespace().collect();
+    if words.is_empty() {
+        return "Untitled Conversation".to_string();
+    }
+    let take = words.len().min(6);
+    let mut out = Vec::new();
+    for &w in &words[..take] {
+        let clean: String = w.chars().filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_').collect();
+        if !clean.is_empty() {
+            let mut chars = clean.chars();
+            let first = chars.next().unwrap().to_uppercase().collect::<String>();
+            let rest = chars.as_str().to_lowercase();
+            out.push(format!("{first}{rest}"));
+        }
+    }
+    if out.is_empty() {
+        "Untitled Conversation".to_string()
+    } else {
+        out.join(" ")
+    }
+}
+
 /// List stored sessions, most-recently-modified first, capped at `limit`.
+/// Empty sessions (0 messages) are skipped and cleaned up.
 pub fn list_sessions(limit: usize) -> Vec<SessionInfo> {
     let dir = sessions_dir();
     let Ok(entries) = fs::read_dir(&dir) else { return Vec::new() };
@@ -160,6 +226,11 @@ pub fn list_sessions(limit: usize) -> Vec<SessionInfo> {
         }
         let id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?").to_string();
         let msgs = load_messages(&path);
+        // If session has no user messages, remove empty artifact and skip
+        if msgs.is_empty() {
+            let _ = fs::remove_file(&path);
+            continue;
+        }
         let preview = msgs
             .iter()
             .find(|m| m.role == "user")
@@ -170,7 +241,15 @@ pub fn list_sessions(limit: usize) -> Vec<SessionInfo> {
             .and_then(|m| m.modified())
             .map(|t| t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0))
             .unwrap_or(0);
-        infos.push(SessionInfo { id, preview, messages: msgs.len(), title: session_title(&path), modified });
+        
+        let title = session_title(&path).or_else(|| {
+            if !preview.is_empty() {
+                Some(derive_title(&preview))
+            } else {
+                None
+            }
+        });
+        infos.push(SessionInfo { id, preview, messages: msgs.len(), title, modified });
     }
     infos.sort_by(|a, b| b.modified.cmp(&a.modified));
     infos.truncate(limit);
