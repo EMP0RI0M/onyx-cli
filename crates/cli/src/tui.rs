@@ -1295,6 +1295,7 @@ impl<'a> Tui<'a> {
                         history = vec![Message::text("system", system)];
                         // Fresh conversation: seal the old transcript, start a new one.
                         if let Some(t) = &transcript {
+                            t.purge_if_empty();
                             let _ = ut.send(UiOut::Info(format!(
                                 "archived session {}",
                                 t.path().file_stem().and_then(|s| s.to_str()).unwrap_or("?")
@@ -1355,10 +1356,15 @@ impl<'a> Tui<'a> {
     /// Tear down the worker: close its control channel, let it finish the
     /// current recv, and join so the raw-pointer borrow ends before return.
     pub fn finish(&mut self) {
+        if let Some(t) = &self.session {
+            t.purge_if_empty();
+        }
         self.ctl_tx = None;
         if let Some(h) = self.worker.take() {
             let _ = h.join();
         }
+        // Also cleanup any active sessions that have 0 messages
+        let _ = agent::session::list_sessions(1);
     }
 
 
@@ -2562,6 +2568,17 @@ impl<'a> Tui<'a> {
                 if let Some(tx) = &self.ctl_tx {
                     let _ = tx.send(Ctl::Clear(self.hm.system.clone()));
                 }
+                self.items.retain(|it| matches!(it, Item::Banner));
+                self.scroll_offset = 0;
+                self.tail.clear();
+                self.tail_scrolled = 0;
+                self.session_title = None;
+                self.real_total_tokens = 0;
+                self.real_prompt_tokens = 0;
+                self.real_completion_tokens = 0;
+                self.history_len = 0;
+                self.history_bytes = 0;
+                self.ctx_history.clear();
                 self.items.push(Item::Info("conversation cleared".into()));
             }
             "/model" | "/models" => {

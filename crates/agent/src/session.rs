@@ -94,6 +94,13 @@ impl Transcript {
         &self.path
     }
 
+    /// Delete transcript file if it contains 0 messages.
+    pub fn purge_if_empty(&self) {
+        if load_messages(&self.path).is_empty() {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+
     /// True when the last message record already carries this exact user turn.
     /// The TUI persists the prompt before the loop runs; the loop re-checks
     /// against the file so a resumed or replayed prompt never double-writes.
