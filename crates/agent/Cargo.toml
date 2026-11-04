@@ -19,4 +19,5 @@ path = "src/agentd.rs"
 [dependencies]
 tools = { workspace = true }
 onyx-core = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }

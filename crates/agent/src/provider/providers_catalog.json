@@ -1,0 +1,2586 @@
+[
+  {
+    "id": "a2a",
+    "name": "A2A",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "abliteration",
+    "name": "Abliteration",
+    "base_url": "https://api.abliteration.ai/v1",
+    "env_var": "ABLITERATION_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "ai21",
+    "name": "AI21",
+    "base_url": "https://api.ai21.com/studio/v1",
+    "env_var": "AI21_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "j2-",
+      "jamba-"
+    ],
+    "model_count": 12,
+    "function_calling": true,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "ai21_chat",
+    "name": "AI21 Chat",
+    "base_url": "https://api.ai21.com/studio/v1",
+    "env_var": "AI21_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "aihubmix",
+    "name": "AIHubMix",
+    "base_url": "https://aihubmix.com/v1",
+    "env_var": "AIHUBMIX_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "aihubmix/"
+    ],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "aiml",
+    "name": "AI/ML API",
+    "base_url": "https://api.aimlapi.com/v1",
+    "env_var": "AIML_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "aiml/",
+      "aiml/dall-",
+      "aiml/flux-"
+    ],
+    "model_count": 12,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "amazon_nova",
+    "name": "Amazon Nova",
+    "base_url": "https://api.nova.amazon.com/v1",
+    "env_var": "AMAZON_NOVA_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "amazon-",
+      "amazon-nova/"
+    ],
+    "model_count": 4,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "anthropic",
+    "name": "Anthropic",
+    "base_url": "https://api.anthropic.com/v1",
+    "env_var": "ANTHROPIC_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "claude-"
+    ],
+    "model_count": 18,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "anthropic_text",
+    "name": "Anthropic Text",
+    "base_url": "https://api.anthropic.com/v1",
+    "env_var": "ANTHROPIC_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": false,
+    "reasoning": true
+  },
+  {
+    "id": "apertis",
+    "name": "Apertis",
+    "base_url": "https://api.stima.tech/v1",
+    "env_var": "STIMA_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "assemblyai",
+    "name": "AssemblyAI",
+    "base_url": "https://api.assemblyai.com",
+    "env_var": "ASSEMBLYAI_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "assemblyai/"
+    ],
+    "model_count": 2,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "auto_router",
+    "name": "Auto Router",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "aws_polly",
+    "name": "AWS - Polly",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "aws_polly/"
+    ],
+    "model_count": 4,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "azure",
+    "name": "Azure OpenAI Service",
+    "base_url": "https://{resource}.openai.azure.com",
+    "env_var": "AZURE_OPENAI_API_KEY",
+    "auth_type": "api_key",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "azure/"
+    ],
+    "model_count": 25,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "azure_ai",
+    "name": "Azure AI",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "azure_ai/",
+      "azure_ai/Cohere-",
+      "azure_ai/Llama-"
+    ],
+    "model_count": 75,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "azure_ai/agents",
+    "name": "Azure AI Foundry Agents",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "azure_ai/doc-intelligence",
+    "name": "Azure AI Document Intelligence",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "azure_text",
+    "name": "Azure Text",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "azure/",
+      "azure/gpt-"
+    ],
+    "model_count": 3,
+    "function_calling": true,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "baseten",
+    "name": "Baseten",
+    "base_url": "https://inference.baseten.co/v1",
+    "env_var": "BASETEN_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "bedrock",
+    "name": "AWS - Bedrock",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "aws_event_stream",
+    "model_prefixes": [
+      "1024-",
+      "1024-x-1024/",
+      "512-"
+    ],
+    "model_count": 245,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "bedrock_mantle",
+    "name": "AWS - Bedrock Mantle",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "aws_event_stream",
+    "model_prefixes": [
+      "bedrock_mantle/"
+    ],
+    "model_count": 13,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "black_forest_labs",
+    "name": "Black Forest Labs",
+    "base_url": "https://api.bfl.ai",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "black_forest_labs/"
+    ],
+    "model_count": 8,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "brave",
+    "name": "Brave Search",
+    "base_url": "https://api.search.brave.com/res/v1",
+    "env_var": "BRAVE_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "bytez",
+    "name": "Bytez",
+    "base_url": "https://api.bytez.com/models/v2",
+    "env_var": "BYTEZ_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "cerebras",
+    "name": "Cerebras",
+    "base_url": "https://api.cerebras.ai/v1",
+    "env_var": "CEREBRAS_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "cerebras/",
+      "cerebras/llama3.1-",
+      "cerebras/zai-"
+    ],
+    "model_count": 7,
+    "function_calling": true,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "charity_engine",
+    "name": "Charity Engine",
+    "base_url": "https://api.charityengine.services/remotejobs/v2/inference",
+    "env_var": "CHARITY_ENGINE_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "charity_engine/"
+    ],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "chatgpt",
+    "name": "ChatGPT Subscription",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "chatgpt/",
+      "chatgpt/gpt-"
+    ],
+    "model_count": 10,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "chutes",
+    "name": "Chutes",
+    "base_url": "https://llm.chutes.ai/v1",
+    "env_var": "CHUTES_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "clarifai",
+    "name": "Clarifai",
+    "base_url": "https://api.clarifai.com",
+    "env_var": "CLARIFAI_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "cloudflare",
+    "name": "Cloudflare AI Workers",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "cloudflare/",
+      "cloudflare/@cf/meta/llama-"
+    ],
+    "model_count": 4,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "codestral",
+    "name": "Codestral",
+    "base_url": "https://codestral.mistral.ai/v1",
+    "env_var": "CODESTRAL_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "codestral/",
+      "codestral/codestral-"
+    ],
+    "model_count": 2,
+    "function_calling": true,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "cognition",
+    "name": "Cognition",
+    "base_url": "https://api.cognition.ai/v1",
+    "env_var": "COGNITION_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "cognition/"
+    ],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "cohere",
+    "name": "Cohere",
+    "base_url": "https://api.cohere.com/v1",
+    "env_var": "COHERE_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "embed-",
+      "rerank-"
+    ],
+    "model_count": 15,
+    "function_calling": true,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "cohere_chat",
+    "name": "Cohere Chat",
+    "base_url": "https://api.cohere.com/v2",
+    "env_var": "COHERE_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "command-"
+    ],
+    "model_count": 7,
+    "function_calling": true,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "cometapi",
+    "name": "CometAPI",
+    "base_url": "https://api.cometapi.com/v1",
+    "env_var": "COMETAPI_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "compactifai",
+    "name": "CompactifAI",
+    "base_url": "https://api.compactif.ai/v1",
+    "env_var": "COMPACTIFAI_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "cortecs",
+    "name": "Cortecs",
+    "base_url": "https://api.cortecs.ai/v1",
+    "env_var": "CORTECS_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "cortecs/"
+    ],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "crusoe",
+    "name": "Crusoe",
+    "base_url": "https://managed-inference-api-proxy.crusoecloud.com/v1",
+    "env_var": "CRUSOE_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "crusoe/"
+    ],
+    "model_count": 7,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "cursor",
+    "name": "Cursor BYOK",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "custom",
+    "name": "Custom",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "custom_openai",
+    "name": "Custom OpenAI-Compatible (Local / Gateway)",
+    "base_url": "http://127.0.0.1:8317/v1",
+    "env_var": "OPENAI_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "*"
+    ],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "darkbloom",
+    "name": "Darkbloom",
+    "base_url": "https://api.darkbloom.dev/v1",
+    "env_var": "DARKBLOOM_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "darkbloom/"
+    ],
+    "model_count": 2,
+    "function_calling": true,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "dashscope",
+    "name": "Dashscope",
+    "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+    "env_var": "DASHSCOPE_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "dashscope/",
+      "dashscope/qwen-",
+      "dashscope/qwen3-"
+    ],
+    "model_count": 32,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "databricks",
+    "name": "Databricks",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "databricks/",
+      "databricks/databricks-"
+    ],
+    "model_count": 28,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "dataforseo",
+    "name": "DataForSEO",
+    "base_url": "https://api.dataforseo.com/v3",
+    "env_var": "DATAFORSEO_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 1,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "datarobot",
+    "name": "DataRobot",
+    "base_url": "https://app.datarobot.com",
+    "env_var": "DATAROBOT_API_TOKEN",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "deepgram",
+    "name": "Deepgram",
+    "base_url": "https://api.deepgram.com/v1",
+    "env_var": "DEEPGRAM_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "deepgram/",
+      "deepgram/base-",
+      "deepgram/enhanced-"
+    ],
+    "model_count": 36,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "deepinfra",
+    "name": "DeepInfra",
+    "base_url": "https://api.deepinfra.com/v1/openai",
+    "env_var": "DEEPINFRA_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "deepinfra/",
+      "deepinfra/NousResearch/Hermes-",
+      "deepinfra/Qwen/Qwen2.5-"
+    ],
+    "model_count": 67,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "deepseek",
+    "name": "Deepseek",
+    "base_url": "https://api.deepseek.com/v1",
+    "env_var": "DEEPSEEK_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "deepseek-",
+      "deepseek/",
+      "deepseek/deepseek-"
+    ],
+    "model_count": 8,
+    "function_calling": true,
+    "vision": false,
+    "reasoning": true
+  },
+  {
+    "id": "docker_model_runner",
+    "name": "Docker Model Runner",
+    "base_url": "http://localhost:22088/engines/llama.cpp",
+    "env_var": null,
+    "auth_type": "none",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "duckduckgo",
+    "name": "DuckDuckGo",
+    "base_url": "https://api.duckduckgo.com",
+    "env_var": null,
+    "auth_type": "none",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 1,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "edenai",
+    "name": "Eden AI",
+    "base_url": "https://api.edenai.run/v3",
+    "env_var": "EDENAI_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "edenai/"
+    ],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "elevenlabs",
+    "name": "ElevenLabs",
+    "base_url": "https://api.elevenlabs.io/v1",
+    "env_var": "ELEVENLABS_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "elevenlabs/"
+    ],
+    "model_count": 4,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "empiriolabs",
+    "name": "Empiriolabs",
+    "base_url": "https://api.empiriolabs.ai/v1",
+    "env_var": "EMPIRIOLABS_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "empiriolabs/"
+    ],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "empower",
+    "name": "Empower",
+    "base_url": "https://app.empower.dev/api/v1",
+    "env_var": "EMPOWER_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "exa_ai",
+    "name": "Exa AI",
+    "base_url": "https://api.exa.ai",
+    "env_var": "EXA_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 1,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "fal_ai",
+    "name": "Fal AI",
+    "base_url": "https://fal.run",
+    "env_var": "FAL_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "fal_ai/",
+      "fal_ai/fal-"
+    ],
+    "model_count": 12,
+    "function_calling": false,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "featherless_ai",
+    "name": "Featherless AI",
+    "base_url": "https://api.featherless.ai/v1",
+    "env_var": "FEATHERLESS_AI_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "featherless_ai/",
+      "featherless_ai/featherless-"
+    ],
+    "model_count": 2,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "firecrawl",
+    "name": "Firecrawl",
+    "base_url": "https://api.firecrawl.dev/v1",
+    "env_var": "FIRECRAWL_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 1,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "fireworks_ai",
+    "name": "Fireworks AI",
+    "base_url": "https://api.fireworks.ai/inference/v1",
+    "env_var": "FIREWORKS_AI_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "fireworks-",
+      "fireworks_ai/",
+      "fireworks_ai/accounts/fireworks/models/code-"
+    ],
+    "model_count": 269,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "friendliai",
+    "name": "FriendliAI",
+    "base_url": "https://inference.friendli.ai/v1",
+    "env_var": "FRIENDLI_TOKEN",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "friendliai/",
+      "friendliai/meta-"
+    ],
+    "model_count": 2,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "galadriel",
+    "name": "Galadriel",
+    "base_url": "https://api.galadriel.com/v1",
+    "env_var": "GALADRIEL_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "gdc",
+    "name": "Google - Distributed Cloud (Gemini)",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "gdc/"
+    ],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "gemini",
+    "name": "Google AI Studio - Gemini",
+    "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+    "env_var": "GEMINI_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "gemini-",
+      "gemini/",
+      "gemini/gemini-"
+    ],
+    "model_count": 60,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "gigachat",
+    "name": "GigaChat",
+    "base_url": "https://gigachat.devices.sberbank.ru/api/v1",
+    "env_var": "GIGACHAT_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "gigachat/",
+      "gigachat/GigaChat-"
+    ],
+    "model_count": 6,
+    "function_calling": true,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "github",
+    "name": "GitHub Models",
+    "base_url": "https://models.inference.ai.azure.com",
+    "env_var": "GITHUB_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "github_copilot",
+    "name": "GitHub Copilot (OAuth Device Flow)",
+    "base_url": "https://api.github.com/copilot_internal/v2/token",
+    "env_var": "GITHUB_COPILOT_TOKEN",
+    "auth_type": "oauth_device",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "gpt-4o",
+      "claude-3.5-sonnet",
+      "o1"
+    ],
+    "model_count": 10,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "gmi",
+    "name": "GMI Cloud",
+    "base_url": "https://inference.gmicloud.ai/v1",
+    "env_var": "GMI_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "gmi/",
+      "gmi/anthropic/claude-",
+      "gmi/deepseek-"
+    ],
+    "model_count": 17,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "google_pse",
+    "name": "Google PSE",
+    "base_url": "https://customsearch.googleapis.com/customsearch/v1",
+    "env_var": "GOOGLE_PSE_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 1,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "gradient_ai",
+    "name": "GradientAI",
+    "base_url": "https://inference.do-ai.run",
+    "env_var": "GRADIENT_AI_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "gradient_ai/",
+      "gradient_ai/anthropic-",
+      "gradient_ai/openai-"
+    ],
+    "model_count": 13,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "groq",
+    "name": "Groq AI",
+    "base_url": "https://api.groq.com/openai/v1",
+    "env_var": "GROQ_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "groq/",
+      "groq/llama-",
+      "groq/meta-"
+    ],
+    "model_count": 14,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "helicone",
+    "name": "Helicone",
+    "base_url": "https://gateway.helicone.ai/v1",
+    "env_var": "HELICONE_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "heroku",
+    "name": "Heroku",
+    "base_url": "https://us.inference.heroku.com",
+    "env_var": "HEROKU_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "heroku/",
+      "heroku/claude-"
+    ],
+    "model_count": 4,
+    "function_calling": true,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "hosted_vllm",
+    "name": "Hosted VLLM",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "huggingface",
+    "name": "Huggingface",
+    "base_url": "https://router.huggingface.co/v1",
+    "env_var": "HUGGINGFACE_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "hyperbolic",
+    "name": "Hyperbolic",
+    "base_url": "https://api.hyperbolic.xyz/v1",
+    "env_var": "HYPERBOLIC_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "hyperbolic/",
+      "hyperbolic/Qwen/Qwen2.5-",
+      "hyperbolic/deepseek-"
+    ],
+    "model_count": 16,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "inception",
+    "name": "Inception Labs",
+    "base_url": "https://api.inceptionlabs.ai/v1",
+    "env_var": "INCEPTION_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "inception/"
+    ],
+    "model_count": 1,
+    "function_calling": true,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "infinity",
+    "name": "Infinity",
+    "base_url": "http://localhost:7997",
+    "env_var": null,
+    "auth_type": "none",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "jina_ai",
+    "name": "Jina AI",
+    "base_url": "https://api.jina.ai/v1",
+    "env_var": "JINA_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 1,
+    "function_calling": false,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "lambda_ai",
+    "name": "Lambda AI",
+    "base_url": "https://api.lambda.ai/v1",
+    "env_var": "LAMBDA_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "lambda_ai/",
+      "lambda_ai/deepseek-",
+      "lambda_ai/hermes3-"
+    ],
+    "model_count": 20,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "langgraph",
+    "name": "LangGraph",
+    "base_url": "http://localhost:2024",
+    "env_var": "LANGGRAPH_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "lemonade",
+    "name": "Lemonade",
+    "base_url": "http://localhost:8000/api/v1",
+    "env_var": null,
+    "auth_type": "none",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "lemonade/",
+      "lemonade/Qwen3-",
+      "lemonade/gpt-"
+    ],
+    "model_count": 5,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "libertai",
+    "name": "LibertAI",
+    "base_url": "https://api.libertai.io/v1",
+    "env_var": "LIBERTAI_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "libertai/"
+    ],
+    "model_count": 12,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "linkup",
+    "name": "Linkup",
+    "base_url": "https://api.linkup.so/v1",
+    "env_var": "LINKUP_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "linkup/"
+    ],
+    "model_count": 2,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "litellm_proxy",
+    "name": "LiteLLM Proxy",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "llamacpp",
+    "name": "llama.cpp",
+    "base_url": "http://localhost:8080/v1",
+    "env_var": null,
+    "auth_type": "none",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "llamacpp/"
+    ],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "llamafile",
+    "name": "Llamafile",
+    "base_url": "http://localhost:8080/v1",
+    "env_var": null,
+    "auth_type": "none",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "llamagate",
+    "name": "LlamaGate",
+    "base_url": "https://api.llamagate.dev/v1",
+    "env_var": "LLAMAGATE_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "llamagate/",
+      "llamagate/deepseek-",
+      "llamagate/llama-"
+    ],
+    "model_count": 16,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "lmstudio",
+    "name": "LM Studio",
+    "base_url": "http://localhost:1234/v1",
+    "env_var": null,
+    "auth_type": "none",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "lmstudio/"
+    ],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "localai",
+    "name": "LocalAI",
+    "base_url": "http://localhost:8080/v1",
+    "env_var": null,
+    "auth_type": "none",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "localai/"
+    ],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "manus",
+    "name": "Manus",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "maritalk",
+    "name": "Maritalk",
+    "base_url": "https://chat.maritaca.ai/api",
+    "env_var": "MARITALK_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "meta",
+    "name": "Meta - Model API",
+    "base_url": "https://api.meta.ai/v1",
+    "env_var": "META_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "meta/"
+    ],
+    "model_count": 1,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "meta_llama",
+    "name": "Meta - Llama API",
+    "base_url": "https://api.llama.com/compat/v1",
+    "env_var": "LLAMA_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "meta_llama/",
+      "meta_llama/Llama-"
+    ],
+    "model_count": 4,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "milvus",
+    "name": "Milvus",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "minimax",
+    "name": "Minimax",
+    "base_url": "https://api.minimax.io/v1",
+    "env_var": "MINIMAX_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "minimax/",
+      "minimax/MiniMax-",
+      "minimax/speech-"
+    ],
+    "model_count": 9,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "mistral",
+    "name": "Mistral AI API",
+    "base_url": "https://api.mistral.ai/v1",
+    "env_var": "MISTRAL_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "mistral/",
+      "mistral/codestral-",
+      "mistral/devstral-"
+    ],
+    "model_count": 51,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "modelscope",
+    "name": "ModelScope",
+    "base_url": "https://api-inference.modelscope.cn/v1",
+    "env_var": "MODELSCOPE_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "modelscope/"
+    ],
+    "model_count": 35,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "moonshot",
+    "name": "Moonshot",
+    "base_url": "https://api.moonshot.ai/v1",
+    "env_var": "MOONSHOT_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "moonshot/",
+      "moonshot/kimi-",
+      "moonshot/moonshot-"
+    ],
+    "model_count": 21,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "morph",
+    "name": "Morph",
+    "base_url": "https://api.morphllm.com/v1",
+    "env_var": "MORPH_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "morph/",
+      "morph/morph-"
+    ],
+    "model_count": 2,
+    "function_calling": true,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "nadir",
+    "name": "Nadir",
+    "base_url": "https://api.getnadir.com/v1",
+    "env_var": "NADIR_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "nadir/"
+    ],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "nanogpt",
+    "name": "NanoGPT",
+    "base_url": "https://nano-gpt.com/api/v1",
+    "env_var": "NANOGPT_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "nebius",
+    "name": "Nebius AI Studio",
+    "base_url": "https://api.studio.nebius.ai/v1",
+    "env_var": "NEBIUS_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "nebius/",
+      "nebius/BAAI/bge-",
+      "nebius/Qwen/Qwen2-"
+    ],
+    "model_count": 30,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "neosantara",
+    "name": "Neosantara",
+    "base_url": "https://api.neosantara.xyz/v1",
+    "env_var": "NEOSANTARA_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "neosantara/"
+    ],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "nlp_cloud",
+    "name": "NLP Cloud",
+    "base_url": "https://api.nlpcloud.io/v1",
+    "env_var": "NLP_CLOUD_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 2,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "novita",
+    "name": "Novita AI",
+    "base_url": "https://api.novita.ai/v3/openai",
+    "env_var": "NOVITA_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "novita/",
+      "novita/baai/bge-",
+      "novita/baidu/ernie-"
+    ],
+    "model_count": 85,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "nscale",
+    "name": "Nscale",
+    "base_url": "https://inference.api.nscale.com/v1",
+    "env_var": "NSCALE_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "nscale/",
+      "nscale/Qwen/Qwen2.5-",
+      "nscale/deepseek-"
+    ],
+    "model_count": 16,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "nvidia_nim",
+    "name": "Nvidia NIM",
+    "base_url": "https://integrate.api.nvidia.com/v1",
+    "env_var": "NVIDIA_NIM_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "nvidia_nim/"
+    ],
+    "model_count": 3,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "nvidia_riva",
+    "name": "Nvidia Riva",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "nvidia_riva/"
+    ],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "oci",
+    "name": "OCI",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "oci/",
+      "oci/cohere.command-",
+      "oci/meta.llama-"
+    ],
+    "model_count": 13,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "ollama",
+    "name": "Ollama",
+    "base_url": "http://localhost:11434",
+    "env_var": null,
+    "auth_type": "none",
+    "streaming_format": "ndjson",
+    "model_prefixes": [
+      "ollama/",
+      "ollama_chat/"
+    ],
+    "model_count": 29,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "oobabooga",
+    "name": "Oobabooga",
+    "base_url": "http://localhost:5000/v1",
+    "env_var": null,
+    "auth_type": "none",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "openai",
+    "name": "OpenAI",
+    "base_url": "https://api.openai.com/v1",
+    "env_var": "OPENAI_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "1024-",
+      "1024-x-1024/",
+      "1024-x-1536/"
+    ],
+    "model_count": 203,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "openai_like",
+    "name": "OpenAI-like",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "opencode",
+    "name": "OpenCode Zen",
+    "base_url": "https://opencode.ai/zen/v1",
+    "env_var": "OPENCODE_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "opencode/"
+    ],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "opencode-go",
+    "name": "OpenCode Go",
+    "base_url": "https://opencode.ai/zen/go/v1",
+    "env_var": "OPENCODE_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "opencode-go/"
+    ],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "openrouter",
+    "name": "OpenRouter",
+    "base_url": "https://openrouter.ai/api/v1",
+    "env_var": "OPENROUTER_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "openrouter/",
+      "openrouter/anthropic/claude-",
+      "openrouter/deepseek/deepseek-"
+    ],
+    "model_count": 89,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "ovhcloud",
+    "name": "OVHCloud AI Endpoints",
+    "base_url": "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1",
+    "env_var": "OVH_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "ovhcloud/",
+      "ovhcloud/Meta-",
+      "ovhcloud/Mistral-"
+    ],
+    "model_count": 15,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "parallel_ai",
+    "name": "Parallel AI",
+    "base_url": "https://api.parallel.ai/v1",
+    "env_var": "PARALLEL_AI_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "parallel_ai/"
+    ],
+    "model_count": 2,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "parasail",
+    "name": "Parasail",
+    "base_url": "https://api.parasail.io/v1",
+    "env_var": "PARASAIL_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "parasail/"
+    ],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "perplexity",
+    "name": "Perplexity AI",
+    "base_url": "https://api.perplexity.ai",
+    "env_var": "PERPLEXITYAI_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "perplexity/",
+      "perplexity/anthropic/claude-",
+      "perplexity/codellama-"
+    ],
+    "model_count": 40,
+    "function_calling": false,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "petals",
+    "name": "Petals",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "pg_vector",
+    "name": "PG Vector",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "pinstripes",
+    "name": "Pinstripes",
+    "base_url": "https://pinstripes.io/v1",
+    "env_var": "PINSTRIPES_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "pinstripes/"
+    ],
+    "model_count": 6,
+    "function_calling": true,
+    "vision": false,
+    "reasoning": true
+  },
+  {
+    "id": "poe",
+    "name": "Poe",
+    "base_url": "https://api.poe.com/bot",
+    "env_var": "POE_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "predibase",
+    "name": "Predibase",
+    "base_url": "https://serving.app.predibase.com",
+    "env_var": "PREDIBASE_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "prism",
+    "name": "Prism",
+    "base_url": "https://api.prisminference.com/v1",
+    "env_var": "PRISM_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "prism/"
+    ],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "publicai",
+    "name": "PublicAI",
+    "base_url": "https://api.publicai.co/v1",
+    "env_var": "PUBLICAI_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "publicai/",
+      "publicai/BSC-",
+      "publicai/allenai/Olmo-"
+    ],
+    "model_count": 9,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "pydantic_ai_agents",
+    "name": "Pydantic AI Agents",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "qwen_ai_platform",
+    "name": "Qianwen AI Platform",
+    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "env_var": "QWEN_AI_PLATFORM_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "qwen_ai_platform/"
+    ],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "ragflow",
+    "name": "RAGFlow",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "recraft",
+    "name": "Recraft",
+    "base_url": "https://external.api.recraft.ai/v1",
+    "env_var": "RECRAFT_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "recraft/"
+    ],
+    "model_count": 2,
+    "function_calling": false,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "reducto",
+    "name": "Reducto",
+    "base_url": "https://platform.reducto.ai",
+    "env_var": "REDUCTO_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "reducto/"
+    ],
+    "model_count": 2,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "reka",
+    "name": "Reka",
+    "base_url": "https://api.reka.ai/v1",
+    "env_var": "REKA_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "reka/"
+    ],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "replicate",
+    "name": "Replicate",
+    "base_url": "https://api.replicate.com/v1",
+    "env_var": "REPLICATE_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "replicate/",
+      "replicate/anthropic/claude-",
+      "replicate/deepseek-"
+    ],
+    "model_count": 40,
+    "function_calling": false,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "runwayml",
+    "name": "RunwayML",
+    "base_url": "https://api.dev.runwayml.com/v1",
+    "env_var": "RUNWAYML_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "runwayml/"
+    ],
+    "model_count": 6,
+    "function_calling": false,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "s3_vectors",
+    "name": "AWS S3 Vectors",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "sagemaker",
+    "name": "AWS - Sagemaker",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "sagemaker/",
+      "sagemaker/meta-"
+    ],
+    "model_count": 6,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "sagemaker_chat",
+    "name": "Sagemaker Chat",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "sail",
+    "name": "Sail",
+    "base_url": "https://api.sailresearch.com/v1",
+    "env_var": "SAIL_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "sail/"
+    ],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "sambanova",
+    "name": "Sambanova",
+    "base_url": "https://api.sambanova.ai/v1",
+    "env_var": "SAMBANOVA_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "sambanova/",
+      "sambanova/DeepSeek-",
+      "sambanova/Llama-"
+    ],
+    "model_count": 16,
+    "function_calling": true,
+    "vision": false,
+    "reasoning": true
+  },
+  {
+    "id": "sap",
+    "name": "SAP Generative AI Hub",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "sarvam",
+    "name": "Sarvam",
+    "base_url": "https://api.sarvam.ai/v1",
+    "env_var": "SARVAM_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 1,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "scaleway",
+    "name": "Scaleway",
+    "base_url": "https://api.scaleway.ai/v1",
+    "env_var": "SCW_SECRET_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "scx-ai",
+    "name": "SCX.ai",
+    "base_url": "https://api.scx.ai/v1",
+    "env_var": "SCX_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "scx-ai/"
+    ],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "searxng",
+    "name": "SearXNG",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 1,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "serper",
+    "name": "Serper",
+    "base_url": "https://google.serper.dev",
+    "env_var": "SERPER_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 1,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "snowflake",
+    "name": "Snowflake",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "snowflake/",
+      "snowflake/jamba-",
+      "snowflake/llama3-"
+    ],
+    "model_count": 24,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "soniox",
+    "name": "Soniox",
+    "base_url": "https://api.soniox.com",
+    "env_var": "SONIOX_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "soniox/"
+    ],
+    "model_count": 2,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "stability",
+    "name": "Stability AI",
+    "base_url": "https://api.stability.ai/v2beta",
+    "env_var": "STABILITY_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "stability/",
+      "stability/sd3-",
+      "stability/sd3.5-"
+    ],
+    "model_count": 23,
+    "function_calling": false,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "synthetic",
+    "name": "Synthetic",
+    "base_url": "https://api.synthetic.new/openai/v1",
+    "env_var": "SYNTHETIC_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "tavily",
+    "name": "Tavily",
+    "base_url": "https://api.tavily.com/v1",
+    "env_var": "TAVILY_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "tavily/"
+    ],
+    "model_count": 2,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "tencent",
+    "name": "Tencent",
+    "base_url": "https://tokenhub-intl.tencentcloudmaas.com/v1",
+    "env_var": "TENCENT_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "tencent/"
+    ],
+    "model_count": 2,
+    "function_calling": true,
+    "vision": false,
+    "reasoning": true
+  },
+  {
+    "id": "tensormesh",
+    "name": "Tensormesh",
+    "base_url": "https://serverless.tensormesh.ai/v1",
+    "env_var": "TENSORMESH_INFERENCE_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "tensormesh/"
+    ],
+    "model_count": 10,
+    "function_calling": true,
+    "vision": false,
+    "reasoning": true
+  },
+  {
+    "id": "text-completion-codestral",
+    "name": "Text Completion Codestral",
+    "base_url": "https://codestral.mistral.ai/v1",
+    "env_var": "CODESTRAL_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "text-",
+      "text-completion-codestral/"
+    ],
+    "model_count": 2,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "text-completion-openai",
+    "name": "Text Completion OpenAI",
+    "base_url": "https://api.openai.com/v1",
+    "env_var": "OPENAI_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "gpt-"
+    ],
+    "model_count": 6,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "together_ai",
+    "name": "Together AI",
+    "base_url": "https://api.together.xyz/v1",
+    "env_var": "TOGETHER_AI_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "together-",
+      "together_ai/",
+      "together_ai/Qwen/Qwen2.5-"
+    ],
+    "model_count": 43,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "topaz",
+    "name": "Topaz",
+    "base_url": "https://api.topazlabs.com/image/v1",
+    "env_var": "TOPAZ_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "triton",
+    "name": "Triton",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "v0",
+    "name": "V0",
+    "base_url": "https://api.v0.dev/v1",
+    "env_var": "V0_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "v0/",
+      "v0/v0-"
+    ],
+    "model_count": 3,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "venice",
+    "name": "Venice.ai",
+    "base_url": "https://api.venice.ai/api/v1",
+    "env_var": "VENICE_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "vercel_ai_gateway",
+    "name": "Vercel AI Gateway",
+    "base_url": "https://ai-gateway.vercel.sh/v1",
+    "env_var": "VERCEL_AI_GATEWAY_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "vercel_ai_gateway/",
+      "vercel_ai_gateway/alibaba/qwen-",
+      "vercel_ai_gateway/amazon/nova-"
+    ],
+    "model_count": 101,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "vertex_ai",
+    "name": "Google - Vertex AI",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "vertex_ai/",
+      "vertex_ai/gemini-"
+    ],
+    "model_count": 9,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "vertex_ai/agent_engine",
+    "name": "Vertex AI Agent Engine",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "vllm",
+    "name": "VLLM",
+    "base_url": "http://localhost:8000/v1",
+    "env_var": null,
+    "auth_type": "none",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "volcengine",
+    "name": "Volcengine",
+    "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+    "env_var": "VOLCENGINE_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "doubao-",
+      "volcengine/",
+      "volcengine/doubao-"
+    ],
+    "model_count": 12,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "voyage",
+    "name": "Voyage AI",
+    "base_url": "https://api.voyageai.com/v1",
+    "env_var": "VOYAGE_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "voyage/",
+      "voyage/rerank-",
+      "voyage/voyage-"
+    ],
+    "model_count": 19,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "wandb",
+    "name": "WandB Inference",
+    "base_url": "https://api.wandb.ai/proxy/openai/v1",
+    "env_var": "WANDB_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "wandb/",
+      "wandb/Qwen/Qwen3-",
+      "wandb/deepseek-"
+    ],
+    "model_count": 14,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "watsonx",
+    "name": "IBM - Watsonx.ai",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "watsonx/",
+      "watsonx/ibm/granite-",
+      "watsonx/meta-"
+    ],
+    "model_count": 29,
+    "function_calling": true,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "watsonx_text",
+    "name": "Watsonx Text",
+    "base_url": "",
+    "env_var": null,
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "xai",
+    "name": "xAI",
+    "base_url": "https://api.x.ai/v1",
+    "env_var": "XAI_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "xai/",
+      "xai/grok-"
+    ],
+    "model_count": 35,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  },
+  {
+    "id": "xiaomi_mimo",
+    "name": "Xiaomi Mimo",
+    "base_url": "https://api.xiaomimimo.com/v1",
+    "env_var": "XIAOMI_MIMO_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": false,
+    "reasoning": true
+  },
+  {
+    "id": "xinference",
+    "name": "Xinference",
+    "base_url": "http://localhost:9997/v1",
+    "env_var": null,
+    "auth_type": "none",
+    "streaming_format": "sse",
+    "model_prefixes": [],
+    "model_count": 0,
+    "function_calling": false,
+    "vision": false,
+    "reasoning": false
+  },
+  {
+    "id": "zai",
+    "name": "Z.AI",
+    "base_url": "https://api.z.ai/api/paas/v4",
+    "env_var": "ZAI_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "zai/",
+      "zai/glm-"
+    ],
+    "model_count": 11,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": false
+  }
+]

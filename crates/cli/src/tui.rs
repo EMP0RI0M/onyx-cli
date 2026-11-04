@@ -488,6 +488,7 @@ enum Ctl {
     Clear(String),
     Resume(Vec<Message>, String),
     SetModel(String),
+    SetEndpoint { host: String, port: u16, path: String, key: String },
     SetEffort(String),
     SystemAppend(String),
     Audit,
@@ -891,6 +892,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/docstrings", "scan files to generate missing documentation"),
 
     // System Settings & AI Control
+    ("/provider", "[name|key|oauth] configure AI provider (liter-llm)"),
     ("/model", "[name] show or hot-swap AI model"),
     ("/effort", "<low|med|high|max|none> reasoning level"),
     ("/fast", "toggle high-speed execution mode"),
@@ -1324,6 +1326,12 @@ impl<'a> Tui<'a> {
                         hm.model = m;
                         let _ = ut.send(UiOut::ModelName(hm.model.clone()));
                     }
+                    Ctl::SetEndpoint { host, port, path, key } => {
+                        hm.host = host;
+                        hm.port = port;
+                        hm.path = path;
+                        hm.key = key;
+                    }
                     Ctl::SetEffort(eff) => {
                         hm.effort = eff;
                     }
@@ -1679,6 +1687,29 @@ impl<'a> Tui<'a> {
             return (" Conversations (↑/↓ to choose, tab/enter to resume) ".into(), items);
         }
 
+        // Subcommand dropdown for /provider or /providers
+        if input.starts_with("/provider") {
+            let arg = if let Some((_, rest)) = input.split_once(' ') {
+                rest.trim()
+            } else {
+                ""
+            };
+            let storage = agent::provider::load_storage();
+            let catalog = agent::provider::load_catalog();
+            let mut items = Vec::new();
+            for p in catalog {
+                let active = if p.id == storage.active_provider { " [active]" } else { "" };
+                let desc = format!("{}{active}", p.auth_type);
+                if arg.is_empty()
+                    || p.id.to_lowercase().contains(&arg.to_lowercase())
+                    || p.name.to_lowercase().contains(&arg.to_lowercase())
+                {
+                    items.push((p.id.clone(), p.name, desc));
+                }
+            }
+            return (" AI Providers (↑/↓ to choose, tab/enter to select) ".into(), items);
+        }
+
         // Subcommand dropdown for /model or /models
         if input.starts_with("/model") || input.starts_with("/models") {
             let arg = if let Some((_, rest)) = input.split_once(' ') {
@@ -1926,7 +1957,10 @@ impl<'a> Tui<'a> {
         let auto = matches!(*self.gw.mode.lock().unwrap(), ApprovalMode::Auto);
         const THEMES: [&str; 3] = ["onyx-cyan", "amber-term", "emerald"];
         let theme_str = THEMES.get(self.theme_idx).unwrap_or(&"onyx-cyan").to_string();
+        let storage = agent::provider::load_storage();
+        let prov_id = storage.active_provider.clone();
         vec![
+            ("provider", "Active Provider", prov_id, "Connected model provider (Enter to cycle active provider)"),
             ("model", "Model Engine", self.hm.model.clone(), "Active LLM engine (Enter to cycle available models)"),
             ("effort", "Reasoning Effort", self.hm.effort.clone(), "Reasoning depth: none, low, medium, high, max"),
             ("approval", "Approval Mode", if auto { "AUTO (YOLO)".into() } else { "Interactive".into() }, "Security approval policy (cycle with Enter or Shift+Tab)"),
@@ -1946,6 +1980,18 @@ impl<'a> Tui<'a> {
         let idx = self.settings_selected.min(items.len().saturating_sub(1));
         let (key, _, _, _) = items[idx];
         match key {
+            "provider" => {
+                let storage = agent::provider::load_storage();
+                let catalog = agent::provider::load_catalog();
+                let ids: Vec<String> = catalog.iter().map(|p| p.id.clone()).collect();
+                if let Some(pos) = ids.iter().position(|id| id == &storage.active_provider) {
+                    let next_pos = (pos + 1) % ids.len();
+                    let next_id = &ids[next_pos];
+                    self.switch_to_provider(next_id);
+                } else if !ids.is_empty() {
+                    self.switch_to_provider(&ids[0]);
+                }
+            }
             "model" => {
                 let mut models = self.cached_models.clone();
                 if models.is_empty() {
@@ -2011,6 +2057,211 @@ impl<'a> Tui<'a> {
             _ => {}
         }
         self.save_persisted_config();
+    }
+
+    /// Switch live execution to target provider
+    fn switch_to_provider(&mut self, target_id: &str) {
+        let mut storage = agent::provider::load_storage();
+        let spec = match agent::provider::find_spec(target_id) {
+            Some(s) => s,
+            None => {
+                self.items.push(Item::Error(format!("unknown provider `{target_id}`")));
+                return;
+            }
+        };
+
+        storage.active_provider = target_id.to_string();
+        let cfg = storage.providers.entry(target_id.to_string()).or_insert_with(|| {
+            agent::provider::ProviderConfig {
+                provider_id: target_id.to_string(),
+                base_url: spec.base_url.clone(),
+                api_key: None,
+                oauth_token: None,
+                active_model: spec.model_prefixes.first().cloned(),
+                custom_headers: std::collections::HashMap::new(),
+            }
+        });
+
+        let base = agent::provider::resolve_base_url(&spec, Some(cfg));
+        let key = agent::provider::resolve_api_key(&spec, Some(cfg)).unwrap_or_default();
+        let (host, port) = agent::model::omniroute_config().host_port_from(&base);
+        let path = if base.ends_with("/chat/completions") {
+            base.split('/').skip(3).collect::<Vec<&str>>().join("/")
+        } else {
+            let p = base.split("://").nth(1).unwrap_or(&base);
+            let sub = p.find('/').map(|i| &p[i..]).unwrap_or("");
+            format!("{sub}/chat/completions")
+        };
+
+        self.hm.host = host.clone();
+        self.hm.port = port;
+        self.hm.path = path.clone();
+        self.hm.key = key.clone();
+
+        if let Some(ref m) = cfg.active_model {
+            self.hm.model = m.clone();
+            self.opts.model = Some(m.clone());
+        }
+
+        if let Some(tx) = &self.ctl_tx {
+            let _ = tx.send(Ctl::SetEndpoint {
+                host,
+                port,
+                path,
+                key,
+            });
+            let _ = tx.send(Ctl::SetModel(self.hm.model.clone()));
+        }
+
+        let _ = agent::provider::save_storage(&storage);
+        // Refresh cached models
+        self.cached_models = self.hm.list_models().unwrap_or_default();
+        self.items.push(Item::Info(format!(
+            "switched provider to {} ({}) · endpoint {}",
+            spec.name, spec.id, self.hm.host
+        )));
+    }
+
+    /// Handle `/provider` command execution
+    fn handle_provider_cmd(&mut self, line: &str) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        let mut storage = agent::provider::load_storage();
+
+        if parts.len() == 1 {
+            // Display active provider and list connected providers
+            self.items.push(Item::Info(format!("Active Provider: {BOLD}{}{RESET}", storage.active_provider)));
+            self.items.push(Item::Info("Configured Providers:".into()));
+            for (id, cfg) in &storage.providers {
+                let spec = agent::provider::find_spec(id);
+                let name = spec.as_ref().map(|s| s.name.as_str()).unwrap_or(id.as_str());
+                let has_key = cfg.api_key.as_ref().map(|k| !k.is_empty()).unwrap_or(false)
+                    || cfg.oauth_token.as_ref().map(|t| !t.is_empty()).unwrap_or(false);
+                let auth_stat = if has_key { "configured" } else { "needs key/login" };
+                let is_act = if id == &storage.active_provider { " [ACTIVE]" } else { "" };
+                self.items.push(Item::Info(format!("  {:<16} · {:<24} ({auth_stat}){is_act}", id, name)));
+            }
+            self.items.push(Item::Info("Usage: /provider <name> | /provider key <name> <api_key> | /provider login copilot".into()));
+            return;
+        }
+
+        match parts[1] {
+            "list" => {
+                let catalog = agent::provider::load_catalog();
+                self.items.push(Item::Info(format!("liter-llm Provider Catalog ({} providers):", catalog.len())));
+                for p in catalog.iter().take(20) {
+                    self.items.push(Item::Info(format!("  {:<16} · {:<28} (auth: {})", p.id, p.name, p.auth_type)));
+                }
+                self.items.push(Item::Info("... use /provider <name> to activate any of the 174 providers".into()));
+            }
+            "key" | "set-key" => {
+                if parts.len() < 4 {
+                    self.items.push(Item::Info("usage: /provider key <provider_id> <api_key>".into()));
+                    return;
+                }
+                let prov_id = parts[2];
+                let key = parts[3];
+                let entry = storage.providers.entry(prov_id.to_string()).or_insert_with(|| {
+                    agent::provider::ProviderConfig {
+                        provider_id: prov_id.to_string(),
+                        base_url: None,
+                        api_key: None,
+                        oauth_token: None,
+                        active_model: None,
+                        custom_headers: std::collections::HashMap::new(),
+                    }
+                });
+                entry.api_key = Some(key.to_string());
+                if let Err(e) = agent::provider::save_storage(&storage) {
+                    self.items.push(Item::Error(format!("failed to save config: {e}")));
+                } else {
+                    self.items.push(Item::Info(format!("saved API key for `{prov_id}` in ~/.onyx/providers.json")));
+                    if storage.active_provider == prov_id {
+                        self.switch_to_provider(prov_id);
+                    }
+                }
+            }
+            "url" | "set-url" => {
+                if parts.len() < 4 {
+                    self.items.push(Item::Info("usage: /provider url <provider_id> <base_url>".into()));
+                    return;
+                }
+                let prov_id = parts[2];
+                let url = parts[3];
+                let entry = storage.providers.entry(prov_id.to_string()).or_insert_with(|| {
+                    agent::provider::ProviderConfig {
+                        provider_id: prov_id.to_string(),
+                        base_url: None,
+                        api_key: None,
+                        oauth_token: None,
+                        active_model: None,
+                        custom_headers: std::collections::HashMap::new(),
+                    }
+                });
+                entry.base_url = Some(url.to_string());
+                let _ = agent::provider::save_storage(&storage);
+                self.items.push(Item::Info(format!("saved base_url `{url}` for `{prov_id}`")));
+                if storage.active_provider == prov_id {
+                    self.switch_to_provider(prov_id);
+                }
+            }
+            "login" | "oauth" => {
+                let target = parts.get(2).copied().unwrap_or("copilot");
+                if target == "copilot" || target == "github" || target == "github_copilot" {
+                    self.items.push(Item::Info("Starting GitHub Copilot OAuth Device Flow...".into()));
+                    match agent::provider::start_copilot_device_flow() {
+                        Ok(resp) => {
+                            self.items.push(Item::Info(format!(
+                                "Please visit: {BOLD}{}{RESET}", resp.verification_uri
+                            )));
+                            self.items.push(Item::Info(format!(
+                                "Enter device code: {BOLD}{CYAN}{}{RESET}", resp.user_code
+                            )));
+                            self.items.push(Item::Info("Waiting for authorization (press Esc to cancel)...".into()));
+                            
+                            // Poll up to 12 attempts
+                            let mut authed = false;
+                            for _ in 0..12 {
+                                std::thread::sleep(std::time::Duration::from_secs(resp.interval.max(5)));
+                                match agent::provider::poll_copilot_device_token(&resp.device_code) {
+                                    Ok(Some(token)) => {
+                                        let entry = storage.providers.entry("github_copilot".to_string()).or_insert_with(|| {
+                                            agent::provider::ProviderConfig {
+                                                provider_id: "github_copilot".to_string(),
+                                                base_url: Some("https://api.github.com/copilot_internal/v2/token".to_string()),
+                                                api_key: None,
+                                                oauth_token: None,
+                                                active_model: Some("gpt-4o".to_string()),
+                                                custom_headers: std::collections::HashMap::new(),
+                                            }
+                                        });
+                                        entry.oauth_token = Some(token);
+                                        let _ = agent::provider::save_storage(&storage);
+                                        self.items.push(Item::Info("GitHub Copilot OAuth authentication successful!".into()));
+                                        self.switch_to_provider("github_copilot");
+                                        authed = true;
+                                        break;
+                                    }
+                                    Ok(None) => continue,
+                                    Err(e) => {
+                                        self.items.push(Item::Error(format!("OAuth polling error: {e}")));
+                                        break;
+                                    }
+                                }
+                            }
+                            if !authed {
+                                self.items.push(Item::Info("Authorization timed out or still pending. Run `/provider login copilot` again when ready.".into()));
+                            }
+                        }
+                        Err(e) => self.items.push(Item::Error(format!("failed to start device flow: {e}"))),
+                    }
+                } else {
+                    self.items.push(Item::Info(format!("OAuth provider `{target}` not supported yet (supported: copilot)")));
+                }
+            }
+            target_id => {
+                self.switch_to_provider(target_id);
+            }
+        }
     }
 
     fn settings_lines_v(&self) -> Vec<String> {
@@ -2580,6 +2831,9 @@ impl<'a> Tui<'a> {
                 self.history_bytes = 0;
                 self.ctx_history.clear();
                 self.items.push(Item::Info("conversation cleared".into()));
+            }
+            "/provider" | "/providers" => {
+                self.handle_provider_cmd(line);
             }
             "/model" | "/models" => {
                 if let Some(m) = arg {
@@ -3744,6 +3998,8 @@ impl<'a> Tui<'a> {
                             let target = &matches[idx].0;
                             if title.contains("Conversations") || title.contains("Resume") {
                                 self.input = format!("/resume {target}");
+                            } else if title.contains("Providers") {
+                                self.input = format!("/provider {target}");
                             } else if title.contains("Model") {
                                 self.input = format!("/model {target}");
                             } else if title.contains("Effort") {
@@ -3772,6 +4028,12 @@ impl<'a> Tui<'a> {
                             if title.contains("Conversations") || title.contains("Resume") {
                                 // Resume immediately!
                                 self.input = format!("/resume {target}");
+                                self.cursor = self.input.len();
+                                self.slash_selected = 0;
+                                self.submit();
+                            } else if title.contains("Providers") {
+                                // Switch provider immediately!
+                                self.input = format!("/provider {target}");
                                 self.cursor = self.input.len();
                                 self.slash_selected = 0;
                                 self.submit();

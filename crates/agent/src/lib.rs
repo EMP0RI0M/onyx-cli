@@ -9,6 +9,7 @@
 pub mod context;
 pub mod core_bridge;
 pub mod model;
+pub mod provider;
 pub mod session;
 
 use serde_json::Value;

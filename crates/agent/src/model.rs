@@ -151,25 +151,58 @@ fn strip_prefix_bytes<'a>(hay: &'a [u8], pre: &[u8]) -> Option<&'a [u8]> {
     }
 }
 
-/// Discover the model gateway coordinates from ONYX_* env (OmniRoute defaults).
-/// `ONYX_BASE_URL` (default `http://127.0.0.1:20128/v1`), `ONYX_API_KEY`
-/// (optional; a loopback OmniRoute may accept none), `ONYX_MODEL` (default
-/// `"auto"` — OmniRoute's quota-aware fallback channel, passed verbatim).
+/// Discover the model gateway coordinates from ONYX_* env or active Provider in ~/.onyx/providers.json.
 pub fn omniroute_config() -> GatewayCfg {
-    let base = std::env::var("ONYX_BASE_URL")
-        .or_else(|_| std::env::var("TEK_BASE_URL"))
-        .unwrap_or_else(|_| "http://127.0.0.1:20128/v1".to_string());
-    let key = std::env::var("ONYX_API_KEY")
-        .or_else(|_| std::env::var("TEK_API_KEY"))
-        .unwrap_or_default();
-    let model = std::env::var("ONYX_MODEL")
-        .or_else(|_| std::env::var("TEK_MODEL"))
-        .unwrap_or_else(|_| "auto".to_string());
+    // 1. If explicit environment variables are set, prioritize them
+    if let Ok(base) = std::env::var("ONYX_BASE_URL").or_else(|_| std::env::var("TEK_BASE_URL")) {
+        let key = std::env::var("ONYX_API_KEY")
+            .or_else(|_| std::env::var("TEK_API_KEY"))
+            .unwrap_or_default();
+        let model = std::env::var("ONYX_MODEL")
+            .or_else(|_| std::env::var("TEK_MODEL"))
+            .unwrap_or_else(|_| "auto".to_string());
+        let (host, port) = parse_host_port(&base);
+        return GatewayCfg { host, port, base, key, model };
+    }
+
+    // 2. Read from active provider in ~/.onyx/providers.json
+    let storage = crate::provider::load_storage();
+    let active_id = &storage.active_provider;
+    let cfg = storage.providers.get(active_id);
+    let spec = crate::provider::find_spec(active_id).unwrap_or_else(|| {
+        crate::provider::ProviderSpec {
+            id: active_id.clone(),
+            name: active_id.clone(),
+            base_url: Some("http://127.0.0.1:8317/v1".to_string()),
+            env_var: Some("OPENAI_API_KEY".to_string()),
+            auth_type: "bearer".to_string(),
+            streaming_format: "sse".to_string(),
+            model_prefixes: vec![],
+            model_count: 0,
+            function_calling: true,
+            vision: true,
+            reasoning: true,
+        }
+    });
+
+    let base = crate::provider::resolve_base_url(&spec, cfg);
+    let key = crate::provider::resolve_api_key(&spec, cfg).unwrap_or_default();
+    let model = cfg
+        .and_then(|c| c.active_model.clone())
+        .or_else(|| std::env::var("ONYX_MODEL").ok())
+        .unwrap_or_else(|| "gpt-oss-120b-medium".to_string());
+
     let (host, port) = parse_host_port(&base);
     GatewayCfg { host, port, base, key, model }
 }
 
-fn parse_host_port(base: &str) -> (String, u16) {
+impl GatewayCfg {
+    pub fn host_port_from(&self, base: &str) -> (String, u16) {
+        parse_host_port(base)
+    }
+}
+
+pub fn parse_host_port(base: &str) -> (String, u16) {
     let after = base.split("://").nth(1).unwrap_or(base);
     let authority = after.split('/').next().unwrap_or(after);
     let mut parts = authority.rsplitn(2, ':');
