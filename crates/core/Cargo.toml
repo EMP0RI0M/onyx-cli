@@ -10,3 +10,6 @@ path = "src/lib.rs"
 
 [dependencies]
 serde_json = { workspace = true }
+aes-gcm = { workspace = true }
+ring = { workspace = true }
+subtle = { workspace = true }

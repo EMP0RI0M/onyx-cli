@@ -34,6 +34,9 @@ pub fn http_request(
     auth: Option<&str>,
     body: Option<&str>,
 ) -> Result<String, String> {
+    if port == 443 {
+        return http_request_tls(method, host, port, path, auth, body);
+    }
     let addr = (host, port)
         .to_socket_addrs()
         .map_err(|e| format!("resolve {host}:{port}: {e}"))?
@@ -45,7 +48,7 @@ pub fn http_request(
     sock.set_read_timeout(Some(Duration::from_secs(120))).ok();
 
     let mut req = String::new();
-    req.push_str(&format!("{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nAccept: application/json\r\n"));
+    req.push_str(&format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nAccept: application/json\r\n"));
     if let Some(a) = auth {
         req.push_str(&format!("Authorization: Bearer {a}\r\n"));
     }
@@ -77,6 +80,38 @@ pub fn http_request(
         }
     }
     parse_response(&raw)
+}
+
+/// Fallback / TLS request runner via curl
+pub fn http_request_tls(
+    method: &str,
+    host: &str,
+    port: u16,
+    path: &str,
+    auth: Option<&str>,
+    body: Option<&str>,
+) -> Result<String, String> {
+    let scheme = if port == 443 { "https" } else { "http" };
+    let url = if (port == 443 && scheme == "https") || (port == 80 && scheme == "http") {
+        format!("{scheme}://{host}{path}")
+    } else {
+        format!("{scheme}://{host}:{port}{path}")
+    };
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args(["-s", "-S", "-X", method, &url]);
+    cmd.args(["-H", "accept: application/json"]);
+    cmd.args(["-H", "content-type: application/json"]);
+    if let Some(a) = auth {
+        cmd.args(["-H", &format!("authorization: Bearer {a}")]);
+    }
+    if let Some(b) = body {
+        cmd.args(["-d", b]);
+    }
+    let output = cmd.output().map_err(|e| format!("curl execution failed: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("curl error: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 fn parse_response(raw: &[u8]) -> Result<String, String> {
@@ -203,12 +238,14 @@ impl GatewayCfg {
 }
 
 pub fn parse_host_port(base: &str) -> (String, u16) {
+    let is_https = base.starts_with("https://");
+    let default_port = if is_https { 443 } else if base.starts_with("http://") { 80 } else { 20128 };
     let after = base.split("://").nth(1).unwrap_or(base);
     let authority = after.split('/').next().unwrap_or(after);
     let mut parts = authority.rsplitn(2, ':');
     match (parts.next(), parts.next()) {
-        (Some(p), Some(h)) if !p.is_empty() => (h.to_string(), p.parse().unwrap_or(20128)),
-        _ => (authority.to_string(), 20128),
+        (Some(p), Some(h)) if !p.is_empty() => (h.to_string(), p.parse().unwrap_or(default_port)),
+        _ => (authority.to_string(), default_port),
     }
 }
 
@@ -653,6 +690,9 @@ pub fn http_sse(
     body: Option<&str>,
     on_data: &mut dyn FnMut(&str) -> bool,
 ) -> Result<(), String> {
+    if port == 443 {
+        return http_sse_curl(method, host, port, path, auth, body, on_data);
+    }
     let addr = (host, port)
         .to_socket_addrs()
         .map_err(|e| format!("resolve {host}:{port}: {e}"))?
@@ -708,6 +748,61 @@ pub fn http_sse(
         }
         buf.extend_from_slice(&tmp[..n]);
     }
+}
+
+/// Fallback / TLS SSE stream reader via curl -N
+pub fn http_sse_curl(
+    method: &str,
+    host: &str,
+    port: u16,
+    path: &str,
+    auth: Option<&str>,
+    body: Option<&str>,
+    on_data: &mut dyn FnMut(&str) -> bool,
+) -> Result<(), String> {
+    let scheme = if port == 443 { "https" } else { "http" };
+    let url = if (port == 443 && scheme == "https") || (port == 80 && scheme == "http") {
+        format!("{scheme}://{host}{path}")
+    } else {
+        format!("{scheme}://{host}:{port}{path}")
+    };
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args(["-N", "-s", "-S", "-X", method, &url]);
+    cmd.args(["-H", "accept: text/event-stream"]);
+    cmd.args(["-H", "content-type: application/json"]);
+    if let Some(a) = auth {
+        cmd.args(["-H", &format!("authorization: Bearer {a}")]);
+    }
+    if let Some(b) = body {
+        cmd.args(["-d", b]);
+    }
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|e| format!("spawn curl SSE: {e}"))?;
+    let stdout = child.stdout.take().ok_or_else(|| "no stdout".to_string())?;
+    use std::io::BufRead;
+    let reader = std::io::BufReader::new(stdout);
+    for line in reader.lines() {
+        match line {
+            Ok(l) => {
+                let trimmed = l.trim();
+                if let Some(data) = sse_data(trimmed) {
+                    if data == "[DONE]" {
+                        let _ = child.kill();
+                        return Ok(());
+                    }
+                    if !on_data(&data) {
+                        let _ = child.kill();
+                        return Ok(());
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let _ = child.wait();
+    Ok(())
 }
 
 fn sse_pump(

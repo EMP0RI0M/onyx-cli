@@ -17,9 +17,11 @@
 
 pub mod jsonrpc;
 pub mod protocol;
+pub mod secrets;
 pub mod session;
 
 pub use protocol::{
     ApprovalOutcome, CoreEvent, ItemKind, ItemStatus, TurnId, UsageFigures, EVENT_SCHEMA_VERSION,
 };
+pub use secrets::{Tier, Vault};
 pub use session::{SessionMeta, ThreadStore};

@@ -2077,6 +2077,8 @@ impl<'a> Tui<'a> {
                 base_url: spec.base_url.clone(),
                 api_key: None,
                 oauth_token: None,
+                oauth_refresh_token: None,
+                oauth_expires_at: None,
                 active_model: spec.model_prefixes.first().cloned(),
                 custom_headers: std::collections::HashMap::new(),
             }
@@ -2166,6 +2168,8 @@ impl<'a> Tui<'a> {
                         base_url: None,
                         api_key: None,
                         oauth_token: None,
+                        oauth_refresh_token: None,
+                        oauth_expires_at: None,
                         active_model: None,
                         custom_headers: std::collections::HashMap::new(),
                     }
@@ -2193,6 +2197,8 @@ impl<'a> Tui<'a> {
                         base_url: None,
                         api_key: None,
                         oauth_token: None,
+                        oauth_refresh_token: None,
+                        oauth_expires_at: None,
                         active_model: None,
                         custom_headers: std::collections::HashMap::new(),
                     }
@@ -2224,17 +2230,32 @@ impl<'a> Tui<'a> {
                                 std::thread::sleep(std::time::Duration::from_secs(resp.interval.max(5)));
                                 match agent::provider::poll_copilot_device_token(&resp.device_code) {
                                     Ok(Some(token)) => {
+                                        // Attempt to exchange GitHub token for Copilot session token
+                                        let (session_tok, base_url) = match agent::provider::exchange_copilot_session_token(&token) {
+                                            Ok(sess) => {
+                                                let api_url = sess.endpoints.as_ref()
+                                                    .and_then(|e| e.get("api").cloned())
+                                                    .unwrap_or_else(|| "https://api.githubcopilot.com".to_string());
+                                                (sess.token, api_url)
+                                            }
+                                            Err(_) => (token.clone(), "https://api.githubcopilot.com".to_string()),
+                                        };
+
                                         let entry = storage.providers.entry("github_copilot".to_string()).or_insert_with(|| {
                                             agent::provider::ProviderConfig {
                                                 provider_id: "github_copilot".to_string(),
-                                                base_url: Some("https://api.github.com/copilot_internal/v2/token".to_string()),
+                                                base_url: Some(base_url.clone()),
                                                 api_key: None,
                                                 oauth_token: None,
+                                                oauth_refresh_token: None,
+                                                oauth_expires_at: None,
                                                 active_model: Some("gpt-4o".to_string()),
                                                 custom_headers: std::collections::HashMap::new(),
                                             }
                                         });
-                                        entry.oauth_token = Some(token);
+                                        entry.oauth_token = Some(session_tok);
+                                        entry.oauth_refresh_token = Some(token);
+                                        entry.base_url = Some(base_url);
                                         let _ = agent::provider::save_storage(&storage);
                                         self.items.push(Item::Info("GitHub Copilot OAuth authentication successful!".into()));
                                         self.switch_to_provider("github_copilot");
@@ -2254,8 +2275,34 @@ impl<'a> Tui<'a> {
                         }
                         Err(e) => self.items.push(Item::Error(format!("failed to start device flow: {e}"))),
                     }
+                } else if target == "google" || target == "vertex" || target == "gemini" {
+                    self.items.push(Item::Info("Resolving Google Cloud / Vertex Application Default Credentials...".into()));
+                    match agent::provider::exchange_google_service_account_token("") {
+                        Ok(token) => {
+                            let entry = storage.providers.entry(target.to_string()).or_insert_with(|| {
+                                agent::provider::ProviderConfig {
+                                    provider_id: target.to_string(),
+                                    base_url: None,
+                                    api_key: None,
+                                    oauth_token: None,
+                                    oauth_refresh_token: None,
+                                    oauth_expires_at: None,
+                                    active_model: Some("gemini-2.5-flash".to_string()),
+                                    custom_headers: std::collections::HashMap::new(),
+                                }
+                            });
+                            entry.oauth_token = Some(token);
+                            let _ = agent::provider::save_storage(&storage);
+                            self.items.push(Item::Info(format!("Google ADC credentials acquired for `{target}`!")));
+                            self.switch_to_provider(target);
+                        }
+                        Err(e) => {
+                            self.items.push(Item::Error(format!("{e}")));
+                            self.items.push(Item::Info(format!("Tip: You can also set API key directly: `/provider key {target} <key>`")));
+                        }
+                    }
                 } else {
-                    self.items.push(Item::Info(format!("OAuth provider `{target}` not supported yet (supported: copilot)")));
+                    self.items.push(Item::Info(format!("OAuth provider `{target}` not supported yet (supported: copilot, google)")));
                 }
             }
             target_id => {
