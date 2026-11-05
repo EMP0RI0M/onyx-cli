@@ -16,6 +16,7 @@ sandbox = { path = "../sandbox" }
 subagent = { path = "../subagent" }
 mcp = { path = "../mcp" }
 skills = { path = "../skills" }
+skillopt = { workspace = true }
 tools = { workspace = true }
 serde_json = { workspace = true }
 libc = { workspace = true }

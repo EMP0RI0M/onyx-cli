@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/kernel", "crates/tools", "crates/terminal", "crates/agent", "crates/guardian", "crates/sandbox", "crates/subagent", "crates/mcp", "crates/skills", "crates/core", "crates/cli"]
+members = ["crates/kernel", "crates/tools", "crates/terminal", "crates/agent", "crates/guardian", "crates/sandbox", "crates/subagent", "crates/mcp", "crates/skills", "crates/skillopt", "crates/core", "crates/cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,6 +10,8 @@ license = "MIT"
 [workspace.dependencies]
 kernel = { path = "crates/kernel" }
 tools = { path = "crates/tools" }
+skills = { path = "crates/skills" }
+skillopt = { path = "crates/skillopt" }
 onyx-core = { path = "crates/core" }
 libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }

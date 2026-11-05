@@ -1,0 +1,20 @@
+[package]
+name = "skillopt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "skillopt"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+anyhow = "1.0"
+tracing = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+sha2 = "0.10"
+hex = "0.4"

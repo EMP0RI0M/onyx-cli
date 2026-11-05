@@ -42,6 +42,7 @@ use crate::markdown::render_markdown;
 use crate::theme;
 use ratatui::crossterm::cursor::{Hide, Show};
 use ratatui::crossterm::execute;
+use ratatui::crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use ratatui::crossterm::terminal::{
     disable_raw_mode as ct_disable_raw, enable_raw_mode as ct_enable_raw, EnterAlternateScreen,
     LeaveAlternateScreen,
@@ -65,6 +66,7 @@ use ratatui::Terminal;
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
+const ITALIC: &str = "\x1b[3m";
 
 // Premium Dark Workstation Colors (#00E5FF, #F1F5F9, #89939F, #252B35, #20D99A, #FF647C, #FFCA68)
 const CYAN: &str = "\x1b[38;2;0;229;255m";       // Primary cyan #00E5FF
@@ -297,11 +299,26 @@ fn title_case_model(m: &str) -> String {
 }
 
 /// Decode one stdin event into (chars, code). Escape sequences map to codes
-/// ≥1000 (arrows, page keys) or 10 (shift+tab). Unrecognized → ('?', 0).
-/// A merged run of printable bytes (pasted text / fast typing) yields every
+/// ≥1000 (arrows, page keys, paste) or 10 (shift+tab). Unrecognized → ('?', 0).
+/// Code 2000 indicates bracketed paste payload.
+/// A merged run of printable bytes (fast typing) yields every
 /// char at once; control bytes are always single events.
 fn decode_key(buf: &[u8]) -> (Vec<char>, u32) {
     let one = |c: char| vec![c];
+    // Check bracketed paste: \x1b[200~ ... \x1b[201~
+    if buf.starts_with(b"\x1b[200~") {
+        let content_start = 6;
+        let content_end = if buf.ends_with(b"\x1b[201~") {
+            buf.len() - 6
+        } else {
+            buf.len()
+        };
+        if content_end >= content_start {
+            let s = String::from_utf8_lossy(&buf[content_start..content_end]);
+            return (s.chars().collect(), 2000);
+        }
+        return (Vec::new(), 2000);
+    }
     match buf {
         [] => (one('\0'), 0),
         [0x1b] => (one('\x1b'), 0),
@@ -373,7 +390,9 @@ impl InputPump {
         let stop = Arc::new(Mutex::new(false));
         let stop2 = stop.clone();
         let handle = thread::spawn(move || {
-            let mut tmp = [0u8; 64];
+            let mut tmp = [0u8; 512];
+            let mut in_paste = false;
+            let mut paste_buf = Vec::new();
             loop {
                 if *stop2.lock().unwrap() {
                     break;
@@ -386,38 +405,90 @@ impl InputPump {
                     break;
                 }
                 let got = &tmp[..n as usize];
-                let mut i = 0usize;
-                while i < got.len() {
-                    let b = got[i];
-                    let end = if b == 0x1b {
-                        // consume CSI: ESC [ params… final-byte, ESC O x, or ESC char
-                        let mut j = i + 1;
-                        if j < got.len() && (got[j] == b'[' || got[j] == b'O') {
-                            j += 1;
-                            while j < got.len() && !(0x40..=0x7e).contains(&got[j]) {
-                                j += 1;
-                            }
-                            j = (j + 1).min(got.len());
-                        } else {
-                            j = (j + 1).min(got.len());
+
+                // If currently inside bracketed paste mode, keep accumulating until \x1b[201~
+                if in_paste {
+                    paste_buf.extend_from_slice(got);
+                    if let Some(pos) = paste_buf.windows(6).position(|w| w == b"\x1b[201~") {
+                        let end_pos = pos + 6;
+                        let full_paste = paste_buf[..end_pos].to_vec();
+                        let remainder = paste_buf[end_pos..].to_vec();
+                        in_paste = false;
+                        paste_buf.clear();
+                        if tx.send(full_paste).is_err() {
+                            return;
                         }
-                        j
-                    } else {
-                        // UTF-8 continuation bytes belong to this one key event
-                        let mut j = i + 1;
-                        while j < got.len() && got[j] & 0xc0 == 0x80 {
-                            j += 1;
+                        if !remainder.is_empty() {
+                            // Process remainder below
+                            Self::process_input_chunk(&remainder, &mut in_paste, &mut paste_buf, &tx);
                         }
-                        j
-                    };
-                    if tx.send(got[i..end].to_vec()).is_err() {
-                        return; // receiver gone: exit the pump
                     }
-                    i = end;
+                    continue;
                 }
+
+                // Normal parsing or entering paste mode
+                Self::process_input_chunk(got, &mut in_paste, &mut paste_buf, &tx);
             }
         });
         Self { rx, stop, handle: Some(handle) }
+    }
+
+    fn process_input_chunk(
+        got: &[u8],
+        in_paste: &mut bool,
+        paste_buf: &mut Vec<u8>,
+        tx: &Sender<Vec<u8>>,
+    ) {
+        let mut i = 0usize;
+        while i < got.len() {
+            // Check for start of bracketed paste: \x1b[200~
+            if got[i..].starts_with(b"\x1b[200~") {
+                *in_paste = true;
+                paste_buf.clear();
+                paste_buf.extend_from_slice(&got[i..]);
+                if let Some(pos) = paste_buf.windows(6).position(|w| w == b"\x1b[201~") {
+                    let end_pos = pos + 6;
+                    let full_paste = paste_buf[..end_pos].to_vec();
+                    let remainder = paste_buf[end_pos..].to_vec();
+                    *in_paste = false;
+                    paste_buf.clear();
+                    if tx.send(full_paste).is_err() {
+                        return;
+                    }
+                    if !remainder.is_empty() {
+                        Self::process_input_chunk(&remainder, in_paste, paste_buf, tx);
+                    }
+                }
+                return;
+            }
+
+            let b = got[i];
+            let end = if b == 0x1b {
+                // consume CSI: ESC [ params… final-byte, ESC O x, or ESC char
+                let mut j = i + 1;
+                if j < got.len() && (got[j] == b'[' || got[j] == b'O') {
+                    j += 1;
+                    while j < got.len() && !(0x40..=0x7e).contains(&got[j]) {
+                        j += 1;
+                    }
+                    j = (j + 1).min(got.len());
+                } else {
+                    j = (j + 1).min(got.len());
+                }
+                j
+            } else {
+                // UTF-8 continuation bytes belong to this one key event
+                let mut j = i + 1;
+                while j < got.len() && got[j] & 0xc0 == 0x80 {
+                    j += 1;
+                }
+                j
+            };
+            if tx.send(got[i..end].to_vec()).is_err() {
+                return;
+            }
+            i = end;
+        }
     }
 
     /// Next key event, or None after `poll` of quiet. Queued escape sequences
@@ -476,6 +547,9 @@ enum Item {
         output: String,
     },
     Answer(String),
+    /// Collapsed reasoning trace from one step. Body is hidden until ctrl+o
+    /// expands it (gated on `expanded`, same as tool output).
+    Thinking(String),
     Info(String),
     Error(String),
 }
@@ -488,7 +562,7 @@ enum Ctl {
     Clear(String),
     Resume(Vec<Message>, String),
     SetModel(String),
-    SetEndpoint { host: String, port: u16, path: String, key: String },
+    SetEndpoint { host: String, port: u16, path: String, key: String, base_url: String },
     SetEffort(String),
     SystemAppend(String),
     Audit,
@@ -893,6 +967,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
 
     // System Settings & AI Control
     ("/provider", "[name|key|oauth] configure AI provider (liter-llm)"),
+    ("/connect", "searchable picker to connect a provider and store its key"),
     ("/model", "[name] show or hot-swap AI model"),
     ("/effort", "<low|med|high|max|none> reasoning level"),
     ("/fast", "toggle high-speed execution mode"),
@@ -907,7 +982,9 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/settings", "view system configurations & active modes"),
     ("/mode", "cycle approval mode (Normal, Edits, YOLO)"),
     ("/steps", "N set max agent steps"),
-    ("/skill", "<name> load a skill from ~/.onyx/skills"),
+    ("/skill", "<name> load a skill into active prompt"),
+    ("/skills", "list all discovered skills across installed packs"),
+    ("/skillopt", "[<name>] run the SkillOpt offline cycle and gate skill edits"),
 
     // Token Analytics & Health Diagnostics
     ("/cost", "insight into tokens used and estimated costs"),
@@ -963,6 +1040,7 @@ pub struct Tui<'a> {
     tick: usize,
     thinking: bool,
     tail: String,          // streamed text of the current step
+    reasoning: String,     // streamed reasoning/thinking of the current step
     tail_scrolled: usize,  // chars dropped from the front when tail overflows
     running: bool,
     cancel: Arc<Mutex<bool>>,
@@ -980,9 +1058,14 @@ pub struct Tui<'a> {
     workspace_dir: String,
     slash_selected: usize,
     question_selected: usize,
+    question_input: String,
+    question_cursor: usize,
     cached_models: Vec<String>,
     mcp_count: usize,
     skill_count: usize,
+    /// SkillOpt candidates accepted by the validation gate, awaiting
+    /// `/skillopt apply`. Never written to disk without that confirmation.
+    pending_skill_updates: std::collections::HashMap<String, String>,
     real_prompt_tokens: usize,
     real_completion_tokens: usize,
     real_total_tokens: usize,
@@ -999,6 +1082,506 @@ pub struct Tui<'a> {
     emacs_keys: bool,
     settings_active: bool,
     settings_selected: usize,
+    connect: Option<ConnectWizard>,
+    resume_browser: Option<ResumeBrowser>,
+    last_browser_height: usize,
+}
+
+/// Full-screen "Chat Sessions" picker opened by bare `/resume`. Complements —
+/// not replaces — the inline dropdown that appears while typing a partial
+/// `/resume …`; both share `resume_fork` to replay a transcript. All state is
+/// UI-thread only; nothing here touches the running agent loop until Enter.
+struct ResumeBrowser {
+    /// Every loaded session, in the order returned by the store.
+    all: Vec<agent::session::SessionInfo>,
+    /// Indices into `all` after scope filter + query filter + date-desc sort.
+    rows: Vec<usize>,
+    /// Cursor within `rows`.
+    sel: usize,
+    /// First visible row in the scroll window.
+    top: usize,
+    /// Live `/` search text.
+    query: String,
+    /// Space-toggle: preview the selected session's first prompts inline.
+    expanded: bool,
+    /// Scope toggle: false = current worktree only, true = all projects.
+    show_all: bool,
+    mode: BrowserMode,
+    /// `?` toggles the extended shortcut line.
+    help: bool,
+}
+
+enum BrowserMode {
+    List,
+    Search,
+}
+
+impl ResumeBrowser {
+    fn new(all: Vec<agent::session::SessionInfo>, show_all: bool) -> Self {
+        let mut b = Self {
+            all,
+            rows: Vec::new(),
+            sel: 0,
+            top: 0,
+            query: String::new(),
+            expanded: false,
+            show_all,
+            mode: BrowserMode::List,
+            help: false,
+        };
+        b.rebuild_rows();
+        b
+    }
+
+    /// Re-derive `rows` from scope + query, sorted newest-first. Keeps the
+    /// cursor clamped in range so repeated filtering never strands it.
+    fn rebuild_rows(&mut self) {
+        let q = self.query.to_lowercase();
+        let mut idx: Vec<usize> = (0..self.all.len())
+            .filter(|&i| {
+                let s = &self.all[i];
+                if q.is_empty() {
+                    true
+                } else {
+                    let title = s.title.as_deref().unwrap_or("");
+                    let project = s.project.as_str();
+                    let branch = s.branch.as_deref().unwrap_or("");
+                    let preview = s.preview.as_str();
+                    title.to_lowercase().contains(&q)
+                        || project.to_lowercase().contains(&q)
+                        || branch.to_lowercase().contains(&q)
+                        || preview.to_lowercase().contains(&q)
+                        || s.id.to_lowercase().contains(&q)
+                }
+            })
+            .collect();
+        idx.sort_by(|&a, &b| self.all[b].modified.cmp(&self.all[a].modified));
+        self.rows = idx;
+        if self.sel >= self.rows.len() {
+            self.sel = self.rows.len().saturating_sub(1);
+        }
+        self.clamp_scroll();
+    }
+
+    fn clamp_scroll(&mut self) {
+        // Window height is unknown here; callers pass it via ensure_visible.
+        if self.top > self.sel {
+            self.top = self.sel;
+        }
+    }
+
+    fn selected_session(&self) -> Option<&agent::session::SessionInfo> {
+        self.rows.get(self.sel).map(|&i| &self.all[i])
+    }
+}
+
+/// Provider rows kept visible in the connect picker before windowing.
+const CONNECT_VISIBLE_ROWS: usize = 9;
+
+/// A row in the connect picker: either a non-selectable section header or a
+/// provider entry from the catalog.
+enum ConnectRow {
+    Header(&'static str),
+    Provider(usize),
+}
+
+/// Inline "Connect a provider" flow, modelled on opencode's setup wizard:
+/// searchable Popular-then-alphabetical provider list → masked API-key entry →
+/// vault write → activate. Lives entirely on the UI thread; no worker channel
+/// is involved because nothing here touches the running agent loop.
+struct ConnectWizard {
+    step: ConnectStep,
+    query: String,
+    selected: usize,
+    /// Catalog index chosen at the list step, consumed by the key step.
+    provider: usize,
+    key_input: String,
+    key_cursor: usize,
+}
+
+enum ConnectStep {
+    Pick,
+    Key,
+}
+
+impl Tui<'_> {
+    /// Curated providers shown under "Popular", mirroring what people actually
+    /// wire up first: hosted flagships, subscriptions, and local engines.
+    const POPULAR_PROVIDERS: [&'static str; 10] = [
+        "anthropic",
+        "openai",
+        "openrouter",
+        "github_copilot",
+        "gemini",
+        "groq",
+        "ollama",
+        "llamacpp",
+        "custom_openai",
+        "deepseek",
+    ];
+
+    fn open_connect_wizard(&mut self) {
+        self.connect = Some(ConnectWizard {
+            step: ConnectStep::Pick,
+            query: String::new(),
+            selected: 0,
+            provider: 0,
+            key_input: String::new(),
+            key_cursor: 0,
+        });
+    }
+
+    /// Catalog indices matching the wizard's query, popular ones first and
+    /// grouped so the list reads "Popular" then alphabetical — the grouping IS
+    /// the sort order.
+    fn connect_rows(catalog: &[agent::provider::ProviderSpec], query: &str) -> Vec<ConnectRow> {
+        let q = query.to_lowercase();
+        let matches = |idx: usize| -> bool {
+            if q.is_empty() {
+                return true;
+            }
+            let p = &catalog[idx];
+            p.id.to_lowercase().contains(&q) || p.name.to_lowercase().contains(&q)
+        };
+
+        // Catalog order is alphabetical, so walking it preserves that for free.
+        let mut popular = Vec::new();
+        for pid in Self::POPULAR_PROVIDERS {
+            if let Some(idx) = catalog.iter().position(|p| p.id == pid) {
+                if matches(idx) && !popular.contains(&idx) {
+                    popular.push(idx);
+                }
+            }
+        }
+        let rest: Vec<usize> = (0..catalog.len())
+            .filter(|idx| !popular.contains(idx) && matches(*idx))
+            .collect();
+
+        let mut rows = Vec::new();
+        if !popular.is_empty() {
+            rows.push(ConnectRow::Header("Popular"));
+            rows.extend(popular.into_iter().map(ConnectRow::Provider));
+        }
+        if !rest.is_empty() {
+            rows.push(ConnectRow::Header("Providers"));
+            rows.extend(rest.into_iter().map(ConnectRow::Provider));
+        }
+        rows
+    }
+
+    /// One-line status used as the description column in the picker.
+    fn connect_status(configured: bool, active: bool) -> String {
+        let base = if configured { "configured" } else { "not connected" };
+        if active {
+            format!("{base} · active")
+        } else {
+            base.to_string()
+        }
+    }
+
+    fn connect_lines_v(&self) -> Vec<String> {
+        let w = self.width.max(40);
+        let Some(wiz) = self.connect.as_ref() else {
+            return Vec::new();
+        };
+        let inner = w.saturating_sub(4);
+        let mut out = Vec::new();
+        match wiz.step {
+            ConnectStep::Pick => {
+                let search = if wiz.query.is_empty() {
+                    format!("{DIM}type to filter{RESET}")
+                } else {
+                    format!("{BOLD}{FG_MAIN}{}{RESET}", wiz.query)
+                };
+                out.push(format!("  {BOLD}{CYAN}Connect a provider{RESET}   {search}"));
+                let catalog = agent::provider::load_catalog();
+                let rows = Self::connect_rows(&catalog, &wiz.query);
+                let storage = agent::provider::load_storage();
+                let sel = wiz.selected.min(rows.len().saturating_sub(1));
+
+                // Window around the selection so long lists stay bounded.
+                let prov_rows: Vec<usize> = (0..rows.len())
+                    .filter(|ri| matches!(rows[*ri], ConnectRow::Provider(_)))
+                    .collect();
+                let start = if prov_rows.len() <= CONNECT_VISIBLE_ROWS {
+                    0
+                } else {
+                    let pos = prov_rows.iter().position(|r| *r >= sel).unwrap_or(0);
+                    let lead = pos.saturating_sub(CONNECT_VISIBLE_ROWS / 2);
+                    prov_rows[lead.min(prov_rows.len().saturating_sub(CONNECT_VISIBLE_ROWS))]
+                };
+
+                let mut emitted = 0usize;
+                for ri in start..rows.len() {
+                    if emitted >= CONNECT_VISIBLE_ROWS {
+                        break;
+                    }
+                    match &rows[ri] {
+                        ConnectRow::Header(title) => {
+                            let rule = inner
+                                .saturating_sub(title.chars().count() + 7)
+                                .max(0);
+                            out.push(format!(
+                                "  {DIM}{BOLD}── {title} {}{RESET}",
+                                "─".repeat(rule)
+                            ));
+                            emitted += 1;
+                        }
+                        ConnectRow::Provider(ci) => {
+                            let p = &catalog[*ci];
+                            let cfg = storage.providers.get(&p.id);
+                            let has_key = cfg
+                                .and_then(|c| c.api_key.as_ref().map(|k| !k.is_empty()))
+                                .unwrap_or(false)
+                                || cfg
+                                    .and_then(|c| c.oauth_token.as_ref().map(|t| !t.is_empty()))
+                                    .unwrap_or(false)
+                                || p.auth_type == "none";
+                            let active = p.id == storage.active_provider;
+                            let is_sel = ri == sel;
+                            let mark = if is_sel {
+                                format!("{CYAN}❯{RESET}")
+                            } else {
+                                " ".to_string()
+                            };
+                            let name_txt = if is_sel {
+                                format!("{BOLD}{FG_MAIN}{}{RESET}", p.name)
+                            } else {
+                                format!("{FG_MAIN}{}{RESET}", p.name)
+                            };
+                            let desc = Self::connect_status(has_key, active);
+                            let plain_len = p.name.chars().count() + 3 + desc.chars().count();
+                            if plain_len <= inner {
+                                let pad = inner - p.name.chars().count() - desc.chars().count() - 3;
+                                out.push(format!(
+                                    "{mark} {name_txt}{}{DIM}{desc}{RESET}",
+                                    " ".repeat(pad + 1)
+                                ));
+                            } else {
+                                out.push(format!("{mark} {name_txt}"));
+                                out.push(format!("   {DIM}{desc}{RESET}"));
+                            }
+                            emitted += 1;
+                        }
+                    }
+                }
+                if rows.is_empty() {
+                    out.push(format!("  {DIM}no provider matches ─ esc to close{RESET}"));
+                }
+                out.push(format!("{BORDER}  {}{RESET}", "─".repeat(inner)));
+                out.push(format!(
+                    "  {DIM}↑↓ navigate · enter select · esc close{RESET}"
+                ));
+            }
+            ConnectStep::Key => {
+                let p = &agent::provider::load_catalog()[wiz.provider];
+                out.push(format!("  {BOLD}{CYAN}API key · {}{RESET}", p.name));
+                out.push(format!(
+                    "  {DIM}stored in the credential vault, never in plaintext config{RESET}"
+                ));
+                out.push(String::new());
+                let shown: String = std::iter::repeat('•')
+                    .take(wiz.key_input.chars().count())
+                    .collect();
+                let body = if shown.is_empty() {
+                    format!("{DIM}(paste or type the key){RESET}")
+                } else {
+                    format!("{BOLD}{FG_MAIN}{shown}{RESET}")
+                };
+                out.push(format!("  {DIM}key:{RESET} {body}"));
+                out.push(String::new());
+                out.push(format!("{BORDER}  {}{RESET}", "─".repeat(inner)));
+                out.push(format!(
+                    "  {DIM}enter submit · esc back to the list{RESET}"
+                ));
+            }
+        }
+        out
+    }
+
+    /// Commit the typed key: vault write, activate the provider, report where
+    /// the secret actually landed.
+    fn connect_finish(&mut self) {
+        let Some(wiz) = self.connect.take() else {
+            return;
+        };
+        let catalog = agent::provider::load_catalog();
+        let Some(p) = catalog.get(wiz.provider) else {
+            return;
+        };
+        let id = p.id.clone();
+        let name = p.name.clone();
+        let key = wiz.key_input.trim().to_string();
+        if key.is_empty() {
+            self.items
+                .push(Item::Info(format!("cancelled — `{id}` not connected")));
+            return;
+        }
+        let stored = agent::provider::put_secret(&format!("{id}/api_key"), &key);
+        let via_vault = stored.starts_with("vault:");
+        {
+            let mut storage = agent::provider::load_storage();
+            let entry = storage.providers.entry(id.clone()).or_insert_with(|| {
+                agent::provider::ProviderConfig {
+                    provider_id: id.clone(),
+                    base_url: None,
+                    api_key: None,
+                    oauth_token: None,
+                    oauth_refresh_token: None,
+                    oauth_expires_at: None,
+                    active_model: None,
+                    custom_headers: std::collections::HashMap::new(),
+                }
+            });
+            entry.api_key = Some(stored);
+            if let Err(e) = agent::provider::save_storage(&storage) {
+                self.items.push(Item::Error(format!("failed to save config: {e}")));
+                return;
+            }
+        }
+        let where_ = if via_vault {
+            "credential vault"
+        } else {
+            "providers.json (vault unavailable — stored inline)"
+        };
+        self.items
+            .push(Item::Info(format!("saved API key for `{name}` in {where_}")));
+        self.switch_to_provider(&id);
+    }
+
+    /// Keys for the connect wizard, handled ahead of the composer so typing
+    /// filters the list instead of landing in the input. Returns true when the
+    /// keystroke was consumed.
+    fn connect_key(&mut self, chars: &[char], code: u32) -> bool {
+        let step = match &self.connect {
+            Some(w) => match w.step {
+                ConnectStep::Pick => 0,
+                ConnectStep::Key => 1,
+            },
+            None => return false,
+        };
+        if step == 0 {
+            self.connect_pick_key(chars, code)
+        } else {
+            self.connect_key_entry_key(chars, code)
+        }
+    }
+
+    fn connect_pick_key(&mut self, chars: &[char], code: u32) -> bool {
+        let (query, selected) = {
+            let wiz = self.connect.as_ref().unwrap();
+            (wiz.query.clone(), wiz.selected)
+        };
+        let catalog = agent::provider::load_catalog();
+        let rows = Self::connect_rows(&catalog, &query);
+        let selectable: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| matches!(r, ConnectRow::Provider(_)))
+            .map(|(i, _)| i)
+            .collect();
+        let ch = chars.first().copied().unwrap_or('\0');
+        match (ch, code) {
+            ('\x1b', _) | ('\x03', _) => {
+                self.connect = None;
+            }
+            ('\0', 1000) => {
+                if let Some(pos) = selectable.iter().position(|r| *r >= selected) {
+                    self.connect.as_mut().unwrap().selected = selectable[pos.saturating_sub(1)];
+                }
+            }
+            ('\0', 1001) => {
+                if let Some(pos) = selectable.iter().rposition(|r| *r <= selected) {
+                    if pos + 1 < selectable.len() {
+                        self.connect.as_mut().unwrap().selected = selectable[pos + 1];
+                    }
+                }
+            }
+            ('\r', _) | ('\n', _) => {
+                if let Some(ConnectRow::Provider(ci)) = rows.get(selected) {
+                    let ci = *ci;
+                    let spec = catalog[ci].clone();
+                    let storage = agent::provider::load_storage();
+                    let configured = storage
+                        .providers
+                        .get(&spec.id)
+                        .and_then(|c| c.api_key.as_ref().map(|k| !k.is_empty()))
+                        .unwrap_or(false)
+                        || spec.auth_type == "none";
+                    if configured {
+                        // Already wired (or needs no key): just switch.
+                        self.connect = None;
+                        self.switch_to_provider(&spec.id);
+                    } else {
+                        let wiz = self.connect.as_mut().unwrap();
+                        wiz.provider = ci;
+                        wiz.step = ConnectStep::Key;
+                        wiz.key_input.clear();
+                        wiz.key_cursor = 0;
+                    }
+                }
+            }
+            ('\u{7f}', _) => {
+                // Backspace edits the search; esc is the only thing that closes
+                // the picker. Popping the last char of an empty query is a no-op,
+                // so the user cannot accidentally destroy the wizard here.
+                let wiz = self.connect.as_mut().unwrap();
+                if wiz.query.pop().is_some() {
+                    wiz.selected = 0;
+                }
+            }
+            (c, 0) if !c.is_control() => {
+                let wiz = self.connect.as_mut().unwrap();
+                wiz.query.extend(chars.iter().copied());
+                wiz.selected = 0;
+                // Keep the selection on a row that still exists after refiltering.
+                let rows = Self::connect_rows(&catalog, &wiz.query);
+                if !matches!(rows.get(wiz.selected), Some(ConnectRow::Provider(_))) {
+                    wiz.selected = rows
+                        .iter()
+                        .position(|r| matches!(r, ConnectRow::Provider(_)))
+                        .unwrap_or(0);
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
+    fn connect_key_entry_key(&mut self, chars: &[char], code: u32) -> bool {
+        let ch = chars.first().copied().unwrap_or('\0');
+        match (ch, code) {
+            ('\x1b', _) => {
+                self.connect.as_mut().unwrap().step = ConnectStep::Pick;
+            }
+            ('\x03', _) => {
+                self.connect = None;
+            }
+            ('\r', _) | ('\n', _) => {
+                self.connect_finish();
+            }
+            ('\u{7f}', _) => {
+                let wiz = self.connect.as_mut().unwrap();
+                if wiz.key_cursor > 0 {
+                    let prev = wiz.key_input[..wiz.key_cursor]
+                        .chars()
+                        .next_back()
+                        .map(|c| c.len_utf8())
+                        .unwrap_or(0);
+                    wiz.key_cursor -= prev;
+                    wiz.key_input.remove(wiz.key_cursor);
+                }
+            }
+            (c, 0) if !c.is_control() => {
+                let wiz = self.connect.as_mut().unwrap();
+                let run: String = chars.iter().collect();
+                wiz.key_input.replace_range(wiz.key_cursor..wiz.key_cursor, &run);
+                wiz.key_cursor += run.len();
+            }
+            _ => {}
+        }
+        true
+    }
 }
 
 
@@ -1018,11 +1601,11 @@ impl<'a> Tui<'a> {
             } else { 0 }
         } else { 0 };
 
-        let skill_count = if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        let skill_count = {
             let mut cat = skills::SkillCatalog::new();
-            cat.scan_dir(&home.join(".onyx/skills"));
+            cat.scan_all_default();
             cat.skills.len()
-        } else { 0 };
+        };
 
         // Restore the persisted /theme choice (ONYX_THEME env wins).
         let theme_idx = ["onyx-cyan", "amber-term", "emerald"]
@@ -1073,6 +1656,7 @@ impl<'a> Tui<'a> {
             tick: 0,
             thinking: false,
             tail: String::new(),
+            reasoning: String::new(),
             tail_scrolled: 0,
             running: false,
             cancel: Arc::new(Mutex::new(false)),
@@ -1089,9 +1673,12 @@ impl<'a> Tui<'a> {
             active_tool_start: None,
             slash_selected: 0,
             question_selected: 0,
+            question_input: String::new(),
+            question_cursor: 0,
             cached_models,
             mcp_count,
             skill_count,
+            pending_skill_updates: Default::default(),
             real_prompt_tokens: 0,
             real_completion_tokens: 0,
             real_total_tokens: 0,
@@ -1108,6 +1695,9 @@ impl<'a> Tui<'a> {
             emacs_keys,
             settings_active: false,
             settings_selected: 0,
+            connect: None,
+            resume_browser: None,
+            last_browser_height: 10,
             workspace_dir: std::env::current_dir()
                 .map(|p| {
                     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
@@ -1326,11 +1916,12 @@ impl<'a> Tui<'a> {
                         hm.model = m;
                         let _ = ut.send(UiOut::ModelName(hm.model.clone()));
                     }
-                    Ctl::SetEndpoint { host, port, path, key } => {
+                    Ctl::SetEndpoint { host, port, path, key, base_url } => {
                         hm.host = host;
                         hm.port = port;
                         hm.path = path;
-                        hm.key = key;
+                        hm.key = key.clone();
+                        hm.set_endpoint_for(&base_url, &key);
                     }
                     Ctl::SetEffort(eff) => {
                         hm.effort = eff;
@@ -1388,6 +1979,8 @@ impl<'a> Tui<'a> {
         }
         if self.tail_visible() {
             content.extend(self.tail_lines());
+        } else if self.running && !self.reasoning.is_empty() {
+            content.extend(self.reasoning_tail_lines());
         } else if self.thinking {
             content.push(self.thinking_line());
         }
@@ -1420,6 +2013,22 @@ impl<'a> Tui<'a> {
                     "  ".to_string()
                 };
                 out.push(format!("{FG_250}{mark}{t}{RESET}", t = w));
+            }
+        }
+        out
+    }
+
+    /// Live reasoning, rendered dim + italic under a "Thinking" cue so it reads
+    /// as the model's scratchpad rather than the answer.
+    fn reasoning_tail_lines(&self) -> Vec<String> {
+        let frame = SPINNER[self.tick % SPINNER.len()];
+        let mut out = vec![format!("{CYAN}{frame}{RESET} {DIM}Thinking…{RESET}")];
+        let vis: String = self.reasoning.chars().skip(self.tail_scrolled).collect();
+        let clean = clean_model_text(&vis);
+        let wrap_w = self.width.saturating_sub(6).max(20);
+        for para in clean.split('\n') {
+            for w in wrap(para, wrap_w) {
+                out.push(format!("  {DIM}{w}{RESET}"));
             }
         }
         out
@@ -1511,6 +2120,24 @@ impl<'a> Tui<'a> {
                     out.push(format!("  {dot} {BOLD}{FG_MAIN}{desc}{RESET} {DIM}(ctrl+o to expand){RESET}"));
                 } else {
                     out.push(format!("  {dot} {BOLD}{FG_MAIN}{desc}{RESET}"));
+                }
+                out
+            }
+            Item::Thinking(t) => {
+                let clean = clean_model_text(t);
+                let lines: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
+                let n = lines.len();
+                let mut out = Vec::new();
+                if self.expanded {
+                    out.push(format!("  {DIM}◌ Thought for {n} line(s) · ctrl+o to collapse{RESET}"));
+                    let wrap_w = w.saturating_sub(6).max(20);
+                    for l in &lines {
+                        for wl in wrap(l, wrap_w) {
+                            out.push(format!("    {DIM}{ITALIC}{wl}{RESET}"));
+                        }
+                    }
+                } else {
+                    out.push(format!("  {DIM}◌ Thought for {n} line(s) · ctrl+o to expand{RESET}"));
                 }
                 out
             }
@@ -1619,18 +2246,32 @@ impl<'a> Tui<'a> {
                 }
             }
 
-            // Divider & footer actions
+            // Interactive answer / typing prompt line
             out.push(String::new());
+            let input_slice = if self.question_input.is_empty() {
+                format!("{DIM}Type an answer or select an option above…{RESET}")
+            } else {
+                format!("{BOLD}{FG_MAIN}{}{RESET}", self.question_input)
+            };
+            out.push(format!(" {CYAN}❯{RESET} {input_slice}"));
+
+            // Divider & footer actions
             out.push(format!("{BORDER} {}{RESET}", "─".repeat(w.saturating_sub(4))));
-            out.push(format!(" {DIM}↑↓ navigate · Enter select · 1..9 jump · Esc cancel{RESET}"));
+            out.push(format!(" {DIM}↑↓ choose · Tab fill · Type custom answer · Enter submit · Esc cancel{RESET}"));
         }
         out
     }
 
     /// A width-fitting slice of `input` centred on the caret, with the caret
-    /// landing at column `cursor_chars()` within the slice. Newlines (only
-    /// reachable via alt+enter) render as '⏎' so the row stays one line.
+    /// landing at column `cursor_chars()` within the slice. Newlines
+    /// render as '⏎' so the row stays one line.
     fn input_window(&self) -> String {
+        // If pasted multi-line text is long, show compact representation with pasted badge
+        let line_count = self.input.lines().count();
+        if line_count > 3 {
+            let first_snippet: String = self.input.lines().next().unwrap_or("").chars().take(40).collect();
+            return format!("[Pasted Text: {line_count} lines] {first_snippet}…");
+        }
         let cc = self.cursor_chars();
         // Reserve: "❯ " prefix, ≥1 cell right of the caret, ellipsis margins.
         let avail = self.width.saturating_sub(6).max(8);
@@ -1658,8 +2299,11 @@ impl<'a> Tui<'a> {
             return (String::new(), Vec::new());
         }
 
-        // Subcommand dropdown for /resume or /res
-        if input.starts_with("/resume") || input.starts_with("/res ") {
+        // Subcommand dropdown for /resume or /res — but ONLY while refining.
+        // Bare "/resume" (no trailing space, no query) is reserved for the
+        // full-screen browser, so the dropdown must not fire there or its Enter
+        // handler would rewrite the command into "/resume <id>" and steal it.
+        if input.starts_with("/res ") || input.starts_with("/resume ") {
             let arg = if let Some((_, rest)) = input.split_once(' ') {
                 rest.trim()
             } else {
@@ -1771,15 +2415,14 @@ impl<'a> Tui<'a> {
                 ""
             };
             let mut items = Vec::new();
-            if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-                let mut cat = skills::SkillCatalog::new();
-                cat.scan_dir(&home.join(".onyx/skills"));
-                for (_, sk) in &cat.skills {
-                    if arg.is_empty() || sk.name.to_lowercase().contains(&arg.to_lowercase()) {
-                        items.push((sk.name.clone(), sk.name.clone(), sk.description.clone()));
-                    }
+            let mut cat = skills::SkillCatalog::new();
+            cat.scan_all_default();
+            for (_, sk) in &cat.skills {
+                if arg.is_empty() || sk.name.to_lowercase().contains(&arg.to_lowercase()) {
+                    items.push((sk.name.clone(), sk.name.clone(), sk.description.clone()));
                 }
             }
+            items.sort_by(|a, b| a.0.cmp(&b.0));
             return (" Load Skill (↑/↓ to choose, tab/enter to select) ".into(), items);
         }
 
@@ -1858,6 +2501,7 @@ impl<'a> Tui<'a> {
         // worker owns the handle.
         self.write_checkpoint();
         self.tail.clear();
+        self.reasoning.clear();
         self.tail_scrolled = 0;
         self.thinking = true;
         self.running = true;
@@ -2079,7 +2723,7 @@ impl<'a> Tui<'a> {
                 oauth_token: None,
                 oauth_refresh_token: None,
                 oauth_expires_at: None,
-                active_model: spec.model_prefixes.first().cloned(),
+                active_model: None,
                 custom_headers: std::collections::HashMap::new(),
             }
         });
@@ -2099,6 +2743,9 @@ impl<'a> Tui<'a> {
         self.hm.port = port;
         self.hm.path = path.clone();
         self.hm.key = key.clone();
+        // Re-resolve the wire protocol for this provider (OpenAI-compat vs
+        // Anthropic Messages vs native Gemini) so non-OpenAI endpoints work.
+        self.hm.set_endpoint_for(&base, &key);
 
         if let Some(ref m) = cfg.active_model {
             self.hm.model = m.clone();
@@ -2110,7 +2757,8 @@ impl<'a> Tui<'a> {
                 host,
                 port,
                 path,
-                key,
+                key: key.clone(),
+                base_url: base.clone(),
             });
             let _ = tx.send(Ctl::SetModel(self.hm.model.clone()));
         }
@@ -2174,11 +2822,22 @@ impl<'a> Tui<'a> {
                         custom_headers: std::collections::HashMap::new(),
                     }
                 });
-                entry.api_key = Some(key.to_string());
+                // Store the secret in the credential vault and persist only a
+                // `vault:<slot>` reference in providers.json, so the literal key
+                // never sits in the plaintext config file. put_secret falls back to
+                // the raw value if the vault can't be written.
+                let stored = agent::provider::put_secret(&format!("{prov_id}/api_key"), key);
+                let via_vault = stored.starts_with("vault:");
+                entry.api_key = Some(stored);
                 if let Err(e) = agent::provider::save_storage(&storage) {
                     self.items.push(Item::Error(format!("failed to save config: {e}")));
                 } else {
-                    self.items.push(Item::Info(format!("saved API key for `{prov_id}` in ~/.onyx/providers.json")));
+                    let where_ = if via_vault {
+                        "credential vault (~/.onyx/credentials.json)"
+                    } else {
+                        "~/.onyx/providers.json (vault unavailable — stored inline)"
+                    };
+                    self.items.push(Item::Info(format!("saved API key for `{prov_id}` in {where_}")));
                     if storage.active_provider == prov_id {
                         self.switch_to_provider(prov_id);
                     }
@@ -2854,6 +3513,248 @@ impl<'a> Tui<'a> {
         true
     }
 
+    /// Open the full-screen session browser, scoped to the current worktree by
+    /// default. Falls back to all projects when the workspace has no sessions.
+    fn open_resume_browser(&mut self) {
+        let scoped = agent::session::list_sessions_scoped(usize::MAX, Some(&self.workspace_dir));
+        let (all, show_all) = if scoped.is_empty() {
+            (agent::session::list_sessions_scoped(usize::MAX, None), true)
+        } else {
+            (scoped, false)
+        };
+        if all.is_empty() {
+            self.items.push(Item::Info("no saved sessions yet".into()));
+            return;
+        }
+        self.resume_browser = Some(ResumeBrowser::new(all, show_all));
+    }
+
+    /// Seal the current transcript and replay `msgs` into a fresh session id.
+    /// Shared by `/resume <query>` and Enter in the browser so both paths fork
+    /// identically. Returns the new session id for the caller's status line.
+    fn resume_fork(&mut self, msgs: &[Message]) -> String {
+        if let Some(tx) = &self.ctl_tx {
+            let _ = tx.send(Ctl::DropTranscript);
+        }
+        self.session = None;
+        let new_sid = agent::session::new_session_id();
+        let transcript = agent::session::Transcript::open(&new_sid, &self.hm.model);
+        if let Some(t) = &transcript {
+            for m in msgs {
+                t.push(m);
+            }
+        }
+        self.session = transcript;
+        if let Some(tx) = &self.ctl_tx {
+            let _ = tx.send(Ctl::Resume(msgs.to_vec(), new_sid.clone()));
+        }
+        self.items.retain(|it| matches!(it, Item::Banner));
+        for m in msgs {
+            match m.role.as_str() {
+                "user" => self.items.push(Item::User(m.content.clone())),
+                "assistant" => {
+                    if let Some(tc) = &m.tool_call {
+                        if tc.name != "terminate" && tc.name != "ask_human" {
+                            self.items.push(Item::Tool {
+                                name: tc.name.clone(),
+                                args: tc.args.to_string(),
+                                ok: true,
+                                denied: false,
+                                duration: None,
+                                output: String::new(),
+                            });
+                        }
+                    } else if !m.content.is_empty() {
+                        let clean = clean_model_text(&m.content);
+                        if !clean.trim().is_empty() {
+                            self.items.push(Item::Answer(clean));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        new_sid
+    }
+
+    /// Scroll so the cursor stays inside a window of `height` visible rows.
+    fn browser_ensure_visible(&mut self, height: usize) {
+        let height = height.max(1);
+        let (sel, top, len) = {
+            let b = self.resume_browser.as_ref().unwrap();
+            (b.sel, b.top, b.rows.len())
+        };
+        if len == 0 {
+            if let Some(b) = self.resume_browser.as_mut() {
+                b.top = 0;
+            }
+            return;
+        }
+        let mut top = top;
+        if sel < top {
+            top = sel;
+        } else if sel >= top + height {
+            top = sel + 1 - height;
+        }
+        let top = top.min(len.saturating_sub(1));
+        if let Some(b) = self.resume_browser.as_mut() {
+            b.top = top;
+        }
+    }
+
+    /// Re-scope the row set: current worktree vs all projects, preserving the
+    /// live query. Reloads from the store so newly-written sessions appear.
+    fn browser_rescope(&mut self) {
+        let show_all = self.resume_browser.as_ref().map(|b| b.show_all).unwrap_or(true);
+        let all = if show_all {
+            agent::session::list_sessions_scoped(usize::MAX, None)
+        } else {
+            let scoped =
+                agent::session::list_sessions_scoped(usize::MAX, Some(&self.workspace_dir));
+            if scoped.is_empty() {
+                agent::session::list_sessions_scoped(usize::MAX, None)
+            } else {
+                scoped
+            }
+        };
+        if let Some(b) = self.resume_browser.as_mut() {
+            b.all = all;
+            b.show_all = show_all;
+            b.rebuild_rows();
+        }
+    }
+
+    fn browser_key(&mut self, chars: &[char], code: u32) {
+        let ch = chars.first().copied().unwrap_or('\0');
+        // Search mode captures printable edits; List mode dispatches actions.
+        let in_search = matches!(
+            self.resume_browser.as_ref().map(|b| &b.mode),
+            Some(BrowserMode::Search)
+        );
+        if in_search {
+            match (ch, code) {
+                ('\x1b', _) => {
+                    // Esc: clear query and drop back to list navigation.
+                    if let Some(b) = self.resume_browser.as_mut() {
+                        b.query.clear();
+                        b.mode = BrowserMode::List;
+                        b.rebuild_rows();
+                    }
+                }
+                ('\r', _) | ('\n', _) => {
+                    // Enter commits the search, returns to list nav.
+                    if let Some(b) = self.resume_browser.as_mut() {
+                        b.mode = BrowserMode::List;
+                    }
+                }
+                ('\x7f', _) | ('\x08', _) => {
+                    if let Some(b) = self.resume_browser.as_mut() {
+                        b.query.pop();
+                        b.rebuild_rows();
+                    }
+                }
+                ('\0', 1000) => self.browser_move(-1),
+                ('\0', 1001) => self.browser_move(1),
+                _ => {
+                    for &c in chars {
+                        if !c.is_control() {
+                            if let Some(b) = self.resume_browser.as_mut() {
+                                b.query.push(c);
+                            }
+                        }
+                    }
+                    if let Some(b) = self.resume_browser.as_mut() {
+                        b.rebuild_rows();
+                    }
+                }
+            }
+            return;
+        }
+
+        match (ch, code) {
+            ('\x1b', _) | ('\x03', _) => self.resume_browser = None,
+            ('\0', 1000) => self.browser_move(-1),
+            ('\0', 1001) => self.browser_move(1),
+            ('\0', 1008) => self.browser_move(-8), // PgUp
+            ('\0', 1009) => self.browser_move(8),  // PgDn
+            (' ', _) => {
+                if let Some(b) = self.resume_browser.as_mut() {
+                    b.expanded = !b.expanded;
+                }
+            }
+            ('/' , _) => {
+                if let Some(b) = self.resume_browser.as_mut() {
+                    b.mode = BrowserMode::Search;
+                }
+            }
+            ('?' , _) => {
+                if let Some(b) = self.resume_browser.as_mut() {
+                    b.help = !b.help;
+                }
+            }
+            ('\x02', _) => {
+                // Ctrl+B: toggle to current-branch/worktree scope only.
+                if let Some(b) = self.resume_browser.as_mut() {
+                    b.show_all = false;
+                }
+                self.browser_rescope();
+            }
+            ('\x01', _) => {
+                // Ctrl+A: force all projects.
+                if let Some(b) = self.resume_browser.as_mut() {
+                    b.show_all = true;
+                }
+                self.browser_rescope();
+            }
+            ('b', _) => {
+                if let Some(b) = self.resume_browser.as_mut() {
+                    b.show_all = !b.show_all;
+                }
+                self.browser_rescope();
+            }
+            ('\r', _) | ('\n', _) => self.browser_select_resume(),
+            _ => {}
+        }
+    }
+
+    fn browser_move(&mut self, delta: isize) {
+        if let Some(b) = self.resume_browser.as_mut() {
+            if b.rows.is_empty() {
+                return;
+            }
+            let n = b.rows.len() as isize;
+            let mut s = b.sel as isize + delta;
+            if s < 0 {
+                s = 0;
+            }
+            if s >= n {
+                s = n - 1;
+            }
+            b.sel = s as usize;
+        }
+        self.browser_ensure_visible(self.last_browser_height);
+    }
+
+    fn browser_select_resume(&mut self) {
+        let Some(s) = self.resume_browser.as_ref().and_then(|b| b.selected_session()).cloned()
+        else {
+            return;
+        };
+        let Some((_path, msgs)) = agent::session::resolve_session(&s.id) else {
+            if let Some(b) = self.resume_browser.as_mut() {
+                b.expanded = false;
+            }
+            self.items.push(Item::Error(format!("could not load session {}", s.id)));
+            return;
+        };
+        self.resume_browser = None;
+        let sid = self.resume_fork(&msgs);
+        self.items.push(Item::Info(format!(
+            "resumed {} message(s) · new session {sid}",
+            msgs.len()
+        )));
+    }
+
     fn slash(&mut self, line: &str) {
         let mut it = line.split_whitespace();
         let cmd = it.next().unwrap_or("");
@@ -2869,6 +3770,7 @@ impl<'a> Tui<'a> {
                 self.items.retain(|it| matches!(it, Item::Banner));
                 self.scroll_offset = 0;
                 self.tail.clear();
+                self.reasoning.clear();
                 self.tail_scrolled = 0;
                 self.session_title = None;
                 self.real_total_tokens = 0;
@@ -2880,8 +3782,15 @@ impl<'a> Tui<'a> {
                 self.items.push(Item::Info("conversation cleared".into()));
             }
             "/provider" | "/providers" => {
-                self.handle_provider_cmd(line);
+                if arg.is_none() {
+                    // Bare `/provider` opens the picker; every subcommand form
+                    // (list/key/url/login/<id>) keeps its text behaviour.
+                    self.open_connect_wizard();
+                } else {
+                    self.handle_provider_cmd(line);
+                }
             }
+            "/connect" => self.open_connect_wizard(),
             "/model" | "/models" => {
                 if let Some(m) = arg {
                     if let Some(tx) = &self.ctl_tx {
@@ -2952,9 +3861,38 @@ impl<'a> Tui<'a> {
                 if let Some(name) = arg {
                     self.load_skill(name);
                 } else {
-                    self.items.push(Item::Info("usage: /skill <name>".into()));
+                    self.items.push(Item::Info("usage: /skill <name> (or /skills to list all)".into()));
                 }
             }
+            "/skills" => {
+                let mut cat = skills::SkillCatalog::new();
+                cat.scan_all_default();
+                self.items.push(Item::Info(format!("Available skills ({} total):", cat.count())));
+                let mut sorted: Vec<_> = cat.skills.values().collect();
+                sorted.sort_by(|a, b| a.name.cmp(&b.name));
+                for sk in sorted {
+                    let desc = if sk.description.is_empty() {
+                        "".to_string()
+                    } else {
+                        format!(" — {}", sk.description)
+                    };
+                    self.items.push(Item::Info(format!("  • /skill {}{}", sk.name, desc)));
+                }
+            }
+            "/skillopt" => match arg {
+                None => self.run_skillopt(None),
+                Some("apply") => self.apply_skillopt(),
+                Some("discard") => {
+                    let n = self.pending_skill_updates.len();
+                    self.pending_skill_updates.clear();
+                    self.items.push(Item::Info(if n == 0 {
+                        "nothing staged".into()
+                    } else {
+                        format!("dropped {n} staged skill update(s)")
+                    }));
+                }
+                Some(name) => self.run_skillopt(Some(name)),
+            },
             "/sessions" => {
                 let list = agent::session::list_sessions(12);
                 if list.is_empty() {
@@ -2973,63 +3911,14 @@ impl<'a> Tui<'a> {
             }
             "/res" | "/resume" => {
                 match arg {
-                    None => self.items.push(Item::Info("usage: /resume <id|prefix|suffix>  (see /sessions)".into())),
+                    // Bare /resume → full-screen session browser (hybrid: keeps
+                    // the inline dropdown for partial typing and this direct-arg
+                    // path for fast id/prefix resume).
+                    None => self.open_resume_browser(),
                     Some(q) => match agent::session::resolve_session(q) {
                         None => self.items.push(Item::Error(format!("no session matches `{q}` (try /sessions)"))),
                         Some((path, msgs)) => {
-                            // Replay is a fork: the resumed transcript becomes a NEW
-                            // session file so the original stays untouched. Tell the
-                            // worker to drop its handle before installing ours, so it
-                            // can't append to the sealed file after this point.
-                            if let Some(tx) = &self.ctl_tx {
-                                let _ = tx.send(Ctl::DropTranscript);
-                            }
-                            let sid = agent::session::new_session_id();
-                            let transcript = agent::session::Transcript::open(&sid, &self.hm.model);
-                            if let Some(t) = &transcript {
-                                for m in &msgs {
-                                    t.push(m);
-                                }
-                            }
-                            self.session = transcript;
-                            if let Some(tx) = &self.ctl_tx {
-                                let _ = tx.send(Ctl::Resume(msgs.clone(), sid.clone()));
-                            }
-                            // Clear previous local items except banner before replaying resumed session
-                            self.items.retain(|it| matches!(it, Item::Banner));
-                            // Mirror the replayed conversation into the visible scrollback.
-                            for m in &msgs {
-                                match m.role.as_str() {
-                                    "user" => self.items.push(Item::User(m.content.clone())),
-                                    "assistant" => {
-                                        if let Some(tc) = &m.tool_call {
-                                            if tc.name != "terminate" && tc.name != "ask_human" {
-                                                self.items.push(Item::Tool {
-                                                    name: tc.name.clone(),
-                                                    args: tc.args.to_string(),
-                                                    ok: true,
-                                                    denied: false,
-                                                    duration: None,
-                                                    output: String::new(),
-                                                });
-                                            }
-                                        } else if !m.content.is_empty() {
-                                            let clean = clean_model_text(&m.content);
-                                            if !clean.trim().is_empty() {
-                                                self.items.push(Item::Answer(clean));
-                                            }
-                                        }
-                                    }
-                                    "tool" => {
-                                        if let Some(Item::Tool { output, .. }) = self.items.last_mut() {
-                                            if output.is_empty() {
-                                                *output = m.content.clone();
-                                            }
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
+                            let sid = self.resume_fork(&msgs);
                             self.items.push(Item::Info(format!(
                                 "resumed {} message(s) from {} · new session {sid}",
                                 msgs.len(),
@@ -3661,12 +4550,8 @@ impl<'a> Tui<'a> {
     }
 
     fn load_skill(&mut self, name: &str) {
-        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-            self.items.push(Item::Error("no HOME".into()));
-            return;
-        };
         let mut catalog = skills::SkillCatalog::new();
-        catalog.scan_dir(&home.join(".onyx/skills"));
+        catalog.scan_all_default();
         if let Some(sk) = catalog.get(name) {
             let add = format!("\n\n[Active Skill: {}]\n{}\n{}", sk.name, sk.description, sk.instructions);
             if let Some(tx) = &self.ctl_tx {
@@ -3674,10 +4559,143 @@ impl<'a> Tui<'a> {
             }
             self.items.push(Item::Info(format!("loaded skill: {}", sk.name)));
         } else {
-            self.items.push(Item::Error(format!("skill `{name}` not found in ~/.onyx/skills")));
+            self.items.push(Item::Error(format!("skill `{name}` not found in skill directories")));
         }
     }
 
+    /// `$ONYX_HOME/skills`, defaulting to `~/.onyx/skills`.
+    fn skills_root() -> Option<PathBuf> {
+        let base = match std::env::var("ONYX_HOME") {
+            Ok(h) if !h.is_empty() => PathBuf::from(h),
+            _ => std::env::var_os("HOME").map(PathBuf::from).and_then(|h| Some(h.join(".onyx")))?,
+        };
+        Some(base.join("skills"))
+    }
+
+    /// Run the SkillOpt-Sleep offline cycle over saved transcripts and gate the
+    /// resulting edits. Deterministic: no model call is made, so this works even
+    /// when every inference endpoint is unreachable. Accepted candidates are held
+    /// for confirmation rather than written straight to disk.
+    fn run_skillopt(&mut self, target: Option<&str>) {
+        use skillopt::skillopt_sleep::onyx_facade::optimize_skills;
+
+        let mut catalog = skills::SkillCatalog::new();
+        catalog.scan_all_default();
+        if catalog.count() == 0 {
+            self.items.push(Item::Error("no skills found in any configured skill directory".into()));
+            return;
+        }
+
+        let mut skills = std::collections::HashMap::new();
+        match target {
+            None => {
+                for (name, sk) in &catalog.skills {
+                    skills.insert(name.clone(), sk.instructions.clone());
+                }
+            }
+            Some(name) => match catalog.get(name) {
+                Some(sk) => {
+                    skills.insert(sk.name.clone(), sk.instructions.clone());
+                }
+                None => {
+                    self.items.push(Item::Error(format!("skill `{name}` not found")));
+                    return;
+                }
+            },
+        }
+
+        let sessions = agent::session::sessions_dir();
+        let n_sessions = std::fs::read_dir(&sessions)
+            .map(|d| {
+                d.flatten()
+                    .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
+                    .count()
+            })
+            .unwrap_or(0);
+        self.items.push(Item::Info(format!(
+            "⟳ skillopt: harvesting {n_sessions} transcript(s), optimizing {} skill(s)",
+            skills.len()
+        )));
+
+        // Deterministic path: no model client is constructed, so this completes
+        // even with every inference endpoint down.
+        let outcome = match optimize_skills(sessions, skills) {
+            Ok(o) => o,
+            Err(e) => {
+                self.items.push(Item::Error(format!("skillopt failed: {e}")));
+                return;
+            }
+        };
+
+        for note in &outcome.notes {
+            self.items.push(Item::Info(format!("   {note}")));
+        }
+        if outcome.tasks.is_empty() {
+            self.items.push(Item::Info(
+                "nothing to learn: no mined tasks with a substantive prompt".into(),
+            ));
+            return;
+        }
+
+        for r in &outcome.reports {
+            let mark = if r.accepted { "✓" } else { "✗" };
+            self.items.push(Item::Info(format!(
+                "   {mark} {:<22} {:<15} {:>6.3} → {:>6.3}  {} task(s) {} edit(s)  {}",
+                r.skill_name,
+                r.gate_action,
+                r.baseline_score,
+                r.candidate_score,
+                r.n_tasks,
+                if r.accepted { r.n_applied_edits } else { r.n_rejected_edits },
+                r.reason
+            )));
+        }
+
+        if outcome.updated_skills.is_empty() {
+            self.items.push(Item::Info("gate rejected every candidate — no skill changed".into()));
+            return;
+        }
+
+        self.pending_skill_updates = outcome.updated_skills;
+        let names: Vec<&str> = self.pending_skill_updates.keys().map(|s| s.as_str()).collect();
+        self.items.push(Item::Info(format!(
+            "staged {} skill update(s): {}. /skillopt apply writes them, /skillopt discard drops them.",
+            names.len(),
+            names.join(", ")
+        )));
+    }
+
+    /// Write staged SkillOpt candidates back to their SKILL.md files.
+    fn apply_skillopt(&mut self) {
+        if self.pending_skill_updates.is_empty() {
+            self.items.push(Item::Info("nothing staged — run /skillopt first".into()));
+            return;
+        }
+        let mut catalog = skills::SkillCatalog::new();
+        catalog.scan_all_default();
+
+        let updates = std::mem::take(&mut self.pending_skill_updates);
+        for (name, instructions) in updates {
+            let probe = skills::Skill {
+                name: name.clone(),
+                description: String::new(),
+                tools_allowed: Vec::new(),
+                model_hint: None,
+                instructions: instructions.clone(),
+            };
+            let new_hash = probe.content_hash();
+            match catalog.persist_instructions(&name, &instructions) {
+                Ok(prev) => {
+                    self.items.push(Item::Info(format!("   ✓ wrote {name}: {prev} → {new_hash}")))
+                }
+                Err(e) => self.items.push(Item::Error(format!("   ✗ {name}: {e}"))),
+            }
+        }
+        // Re-scan so the header count reflects any skill that failed to parse.
+        let mut refreshed = skills::SkillCatalog::new();
+        refreshed.scan_all_default();
+        self.skill_count = refreshed.count();
+    }
     /// Map one protocol event onto the transcript. This is the ONLY place the
     /// UI reacts to engine progress — it never sees AgentEvent directly.
     fn on_core_event(&mut self, ev: onyx_core::CoreEvent) {
@@ -3685,8 +4703,18 @@ impl<'a> Tui<'a> {
         match (ev.status, ev.kind) {
             (ItemStatus::Started, ItemKind::Thinking { .. }) => {
                 self.tail.clear();
+                self.reasoning.clear();
                 self.tail_scrolled = 0;
                 self.thinking = true;
+            }
+            (_, ItemKind::Thinking { delta: Some(d), .. }) => {
+                // Live reasoning text. Kept out of `tail` so it never becomes the answer.
+                self.thinking = true;
+                self.reasoning.push_str(&d);
+                let n = self.reasoning.chars().count();
+                if n > 1400 {
+                    self.tail_scrolled = n - 1200;
+                }
             }
             (_, ItemKind::AgentMessage { delta, final_text }) => {
                 if let Some(d) = delta {
@@ -3768,6 +4796,10 @@ impl<'a> Tui<'a> {
     }
 
     fn finalize_tail(&mut self) {
+        if !self.reasoning.trim().is_empty() {
+            let r = std::mem::take(&mut self.reasoning);
+            self.items.push(Item::Thinking(r));
+        }
         if !self.tail.trim().is_empty() {
             let t = std::mem::take(&mut self.tail);
             let clean = clean_model_text(&t);
@@ -3853,6 +4885,26 @@ impl<'a> Tui<'a> {
                 continue;
             };
 
+            // The connect wizard owns the keyboard outright while open: its
+            // search field and key entry replace the composer, so nothing here
+            // may fall through to normal input handling. One event at a time —
+            // a merged printable run shares a single `code`, so iterating chars
+            // and passing that code would misread arrow keys as text.
+            if self.connect.is_some() {
+                self.connect_key(&chars, code);
+                paint(self);
+                continue;
+            }
+
+            // The resume browser owns the keyboard outright while open, exactly
+            // like the connect wizard: one event at a time so a merged printable
+            // run isn't mistaken for an arrow key.
+            if self.resume_browser.is_some() {
+                self.browser_key(&chars, code);
+                paint(self);
+                continue;
+            }
+
             // Approval card swallows most keys while pending.
             if self.ask.pending().is_some() {
                 for &ch in &chars {
@@ -3873,20 +4925,31 @@ impl<'a> Tui<'a> {
                 let count = options.len();
                 match (first, code) {
                     ('\0', 1000) => {
-                        // Up arrow
+                        // Up arrow: navigate options
                         if count > 0 {
                             self.question_selected = (self.question_selected + count - 1) % count;
                         }
                     }
                     ('\0', 1001) => {
-                        // Down arrow
+                        // Down arrow: navigate options
                         if count > 0 {
                             self.question_selected = (self.question_selected + 1) % count;
                         }
                     }
-                    ('\r', _) | ('\n', _) => {
-                        // Enter select
+                    ('\t', _) => {
+                        // Tab: copy highlighted option text into question_input for editing
                         if !options.is_empty() {
+                            let idx = self.question_selected.min(count - 1);
+                            self.question_input = options[idx].clone();
+                            self.question_cursor = self.question_input.len();
+                        }
+                    }
+                    ('\r', _) | ('\n', _) => {
+                        // Enter: submit typed answer if present, else selected option
+                        let trimmed = self.question_input.trim();
+                        if !trimmed.is_empty() {
+                            self.ask.answer_question(Ok(trimmed.to_string()));
+                        } else if !options.is_empty() {
                             let idx = self.question_selected.min(count - 1);
                             let selected_text = options[idx].clone();
                             self.ask.answer_question(Ok(selected_text));
@@ -3894,21 +4957,95 @@ impl<'a> Tui<'a> {
                             self.ask.answer_question(Ok("confirmed".to_string()));
                         }
                         self.question_selected = 0;
+                        self.question_input.clear();
+                        self.question_cursor = 0;
                     }
                     ('\x1b', _) | ('\x03', _) => {
                         // Escape / Ctrl+C cancels question
                         self.ask.answer_question(Err("User cancelled question".to_string()));
                         self.question_selected = 0;
+                        self.question_input.clear();
+                        self.question_cursor = 0;
                     }
-                    (c, 0) if c >= '1' && c <= '9' => {
+                    ('\u{7f}', _) => {
+                        // Backspace in question_input
+                        if self.question_cursor > 0 {
+                            let prev = self.question_input[..self.question_cursor]
+                                .chars()
+                                .next_back()
+                                .map(|c| c.len_utf8())
+                                .unwrap_or(0);
+                            self.question_cursor -= prev;
+                            self.question_input.remove(self.question_cursor);
+                        }
+                    }
+                    ('\0', 1004) => {
+                        // Delete key
+                        if self.question_cursor < self.question_input.len() {
+                            let next = self.question_input[self.question_cursor..]
+                                .chars()
+                                .next()
+                                .map(|c| c.len_utf8())
+                                .unwrap_or(0);
+                            self.question_input.replace_range(self.question_cursor..self.question_cursor + next, "");
+                        }
+                    }
+                    ('\0', 1002) => {
+                        // Right arrow
+                        if self.question_cursor < self.question_input.len() {
+                            let next = self.question_input[self.question_cursor..]
+                                .chars()
+                                .next()
+                                .map(|c| c.len_utf8())
+                                .unwrap_or(0);
+                            self.question_cursor += next;
+                        }
+                    }
+                    ('\0', 1003) => {
+                        // Left arrow
+                        if self.question_cursor > 0 {
+                            let prev = self.question_input[..self.question_cursor]
+                                .chars()
+                                .next_back()
+                                .map(|c| c.len_utf8())
+                                .unwrap_or(0);
+                            self.question_cursor -= prev;
+                        }
+                    }
+                    ('\0', 1006) => self.question_cursor = 0, // Home
+                    ('\0', 1007) => self.question_cursor = self.question_input.len(), // End
+                    (c, 0) if self.question_input.is_empty() && c >= '1' && c <= '9' => {
+                        // Quick digit jump if input is empty
                         let num = (c as usize) - ('0' as usize);
                         if num <= count {
                             let selected_text = options[num - 1].clone();
                             self.ask.answer_question(Ok(selected_text));
                             self.question_selected = 0;
+                            self.question_input.clear();
+                            self.question_cursor = 0;
                         }
                     }
-                    _ => {}
+                    (_, 2000) => {
+                        // Bracketed paste into question input
+                        for &c in &chars {
+                            if c != '\r' && c != '\n' {
+                                self.question_input.insert(self.question_cursor, c);
+                                self.question_cursor += c.len_utf8();
+                            } else {
+                                self.question_input.insert(self.question_cursor, ' ');
+                                self.question_cursor += 1;
+                            }
+                        }
+                    }
+                    _ => {
+                        // Regular printable typing into question_input
+                        for &c in &chars {
+                            if !c.is_control() {
+                                self.question_input.insert(self.question_cursor, c);
+                                self.question_cursor += c.len_utf8();
+                            }
+                        }
+                    }
                 }
                 paint(self);
                 continue;
@@ -4212,6 +5349,10 @@ impl<'a> Tui<'a> {
                     (c, 0) if !c.is_control() => {
                         insert_run(self, std::slice::from_ref(&c));
                     }
+                    (_, 2000) => {
+                        // Bracketed paste event into composer
+                        insert_run(self, &chars);
+                    }
                     _ => {}
                 }
             } else {
@@ -4360,6 +5501,13 @@ impl<'a> Tui<'a> {
         f.buffer_mut().set_style(area, theme::base());
         let w = area.width.max(20) as usize;
 
+        // Full-screen resume browser: owns the entire viewport while open, so
+        // nothing below renders. Mirrors how the connect wizard is gated.
+        if self.resume_browser.is_some() {
+            self.render_resume_browser(f, area);
+            return;
+        }
+
         // ── header (centered block-glyph ONYX banner + tagline) ──
         let account = std::env::var("ONYX_ACCOUNT").unwrap_or_else(|_| "local".to_string());
         let wide_header = w >= 40 && area.height >= 12;
@@ -4457,9 +5605,21 @@ impl<'a> Tui<'a> {
             Vec::new()
         };
 
+        // ── connect-provider wizard (modal while open) ──
+        let connect_lines: Vec<RuLine> = self
+            .connect_lines_v()
+            .into_iter()
+            .flat_map(|l| fit_lines(&l, w))
+            .map(|l| Self::ansi_to_line(&l))
+            .collect();
+        let connect_active = !connect_lines.is_empty();
+
         // ── slash dropdown (only when typing "/…") ──
         let (dd_title, dd_matches) = self.matching_dropdown_items();
-        let dropdown_active = !dd_matches.is_empty();
+        // Gate on the wizard being open, not on how many lines it happened to
+        // render: an empty-result panel is still one line tall, and the slash
+        // dropdown must never steal keystrokes from a wizard the user is in.
+        let dropdown_active = !dd_matches.is_empty() && self.connect.is_none();
         let dropdown_height = if dropdown_active {
             (dd_matches.len().min(6) + 2) as u16
         } else {
@@ -4473,6 +5633,7 @@ impl<'a> Tui<'a> {
         let settings_h = settings_lines.len() as u16;
         let approval_h = approval_lines.len() as u16;
         let question_h = question_lines.len() as u16;
+        let connect_h = connect_lines.len() as u16;
 
         let mut constraints = vec![
             Constraint::Length(header_h),
@@ -4487,6 +5648,9 @@ impl<'a> Tui<'a> {
         }
         if question_active {
             constraints.push(Constraint::Length(question_h));
+        }
+        if connect_active {
+            constraints.push(Constraint::Length(connect_h));
         }
         if dropdown_active {
             constraints.push(Constraint::Length(dropdown_height));
@@ -4520,6 +5684,13 @@ impl<'a> Tui<'a> {
             let q = chunks[ci];
             ci += 1;
             q
+        } else {
+            Rect::ZERO
+        };
+        let connect_area = if connect_active {
+            let c = chunks[ci];
+            ci += 1;
+            c
         } else {
             Rect::ZERO
         };
@@ -4602,6 +5773,11 @@ impl<'a> Tui<'a> {
         if question_active {
             let qp = RuParagraph::new(question_lines);
             f.render_widget(qp, question_area);
+        }
+
+        // ── connect-provider wizard ──
+        if connect_active {
+            f.render_widget(RuParagraph::new(connect_lines), connect_area);
         }
 
         // ── slash dropdown ──
@@ -4701,6 +5877,236 @@ impl<'a> Tui<'a> {
         let _ = max_visible;
         StatefulWidget::render(list, area, f.buffer_mut(), &mut state);
     }
+
+    /// Full-screen "Chat Sessions" browser: header line with count + scope, a
+    /// scrollable list of sessions (title on line 1, age · branch · size on line 2), an inline
+    /// preview when Space-expanded, and a bottom key-hint strip.
+    fn render_resume_browser(&self, f: &mut Frame, area: Rect) {
+        let Some(b) = self.resume_browser.as_ref() else {
+            return;
+        };
+        let w = area.width.max(20) as usize;
+
+        // ── top banner rule ──
+        // " Chat"
+        // "─────────────────────────────────────────────────────────────────────────"
+        let top_title = RuLine::from(vec![
+            RuSpan::styled(" Chat", theme::strong()),
+        ]);
+        let divider_line = RuLine::from(vec![
+            RuSpan::styled("─".repeat(w), theme::border()),
+        ]);
+
+        // ── section header line ──
+        // " Chat Sessions (69, current worktree)                                      sorted by date desc"
+        let scope = if b.show_all {
+            "all projects".to_string()
+        } else {
+            "current worktree".to_string()
+        };
+        let left_hdr = format!(" Chat Sessions ({}, {})", b.rows.len(), scope);
+        let right_hdr = "sorted by date desc";
+        let spaces = w.saturating_sub(left_hdr.chars().count() + right_hdr.chars().count() + 1);
+        let section_hdr = RuLine::from(vec![
+            RuSpan::styled(left_hdr, theme::strong()),
+            RuSpan::styled(" ".repeat(spaces.max(2)), theme::dim()),
+            RuSpan::styled(right_hdr, theme::dim()),
+        ]);
+
+        // ── search bar (visible only while searching) ──
+        let search_line = if matches!(b.mode, BrowserMode::Search) || !b.query.is_empty() {
+            Some(RuLine::from(vec![
+                RuSpan::styled(" / ", theme::accent_bold()),
+                RuSpan::styled(b.query.clone(), theme::strong()),
+                RuSpan::styled(if matches!(b.mode, BrowserMode::Search) { "▏" } else { "" }.to_string(), theme::dim()),
+            ]))
+        } else {
+            None
+        };
+
+        // ── items ──
+        // Exactly matches the user's reference mockup:
+        //  ❯ Complete Tektilr Core
+        //    55s · onyx-experiment · 27.7 MB
+        //
+        //    clean n the cache
+        //    19h · onyx-experiment · 89.7 KB
+        let mut items: Vec<RuListItem> = Vec::new();
+        for (row_i, &idx) in b.rows.iter().enumerate() {
+            let s = &b.all[idx];
+            let is_sel = row_i == b.sel;
+            let arrow = if is_sel { " ❯ " } else { "   " };
+            let title_raw = s
+                .title
+                .clone()
+                .unwrap_or_else(|| {
+                    if !s.preview.is_empty() {
+                        agent::session::derive_title(&s.preview)
+                    } else {
+                        "Untitled Session".to_string()
+                    }
+                });
+            let dur = fmt_duration(s.duration_secs);
+            let branch = s.branch.clone().unwrap_or_else(|| "-".into());
+            let size = fmt_bytes(s.bytes);
+            let meta_line = format!("   {dur} · {branch} · {size}");
+
+            let title_style = if is_sel {
+                theme::accent_bold()
+            } else {
+                theme::strong()
+            };
+
+            let mut lines = vec![
+                RuLine::from(vec![
+                    RuSpan::styled(arrow.to_string(), if is_sel { theme::accent_bold() } else { theme::dim() }),
+                    RuSpan::styled(title_raw, title_style),
+                ]),
+                RuLine::from(vec![
+                    RuSpan::styled(meta_line, theme::dim()),
+                ]),
+            ];
+
+            // Inline preview under the selected expanded row when space toggled
+            if is_sel && b.expanded {
+                if let Some((_p, msgs)) = agent::session::resolve_session(&s.id) {
+                    let users: Vec<&Message> = msgs.iter().filter(|m| m.role == "user").take(3).collect();
+                    for m in users {
+                        let one = m.content.lines().next().unwrap_or("").chars().take(w.saturating_sub(8)).collect::<String>();
+                        lines.push(RuLine::from(vec![
+                            RuSpan::styled("   › ".to_string(), theme::dim()),
+                            RuSpan::styled(one, theme::dim()),
+                        ]));
+                    }
+                }
+            }
+
+            // Trailing empty space line between cards
+            lines.push(RuLine::from(vec![RuSpan::raw("")]));
+            items.push(RuListItem::new(lines));
+        }
+
+        if items.is_empty() {
+            items.push(RuListItem::new(vec![
+                RuLine::from(vec![RuSpan::styled("   no matching sessions", theme::dim())]),
+            ]));
+        }
+
+        // ── key hint footer strip ──
+        // "Ctrl+A show all projects · Ctrl+B only show current branch · Space preview · ↑↓ navigate ·"
+        // "Enter select · / search · ? for shortcuts · Esc close"
+        let hint_lines = vec![
+            RuLine::from(vec![
+                RuSpan::styled(
+                    "Ctrl+A show all projects · Ctrl+B only show current branch · Space preview · ↑↓ navigate ·",
+                    theme::dim(),
+                ),
+            ]),
+            RuLine::from(vec![
+                RuSpan::styled(
+                    "Enter select · / search · ? for shortcuts · Esc close",
+                    theme::dim(),
+                ),
+            ]),
+        ];
+
+        // ── layout: top_title, divider, section_hdr, [search], list, footer ──
+        let mut constraints = vec![
+            Constraint::Length(1), // Chat
+            Constraint::Length(1), // ───
+            Constraint::Length(1), // Chat Sessions header
+        ];
+        if search_line.is_some() {
+            constraints.push(Constraint::Length(1));
+        }
+        constraints.push(Constraint::Min(4));  // list
+        constraints.push(Constraint::Length(2)); // 2-line footer
+
+        let chunks = RuLayout::vertical(constraints).split(area);
+        let mut ci = 0usize;
+        f.render_widget(RuParagraph::new(vec![top_title]), chunks[ci]);
+        ci += 1;
+        f.render_widget(RuParagraph::new(vec![divider_line]), chunks[ci]);
+        ci += 1;
+        f.render_widget(RuParagraph::new(vec![section_hdr]), chunks[ci]);
+        ci += 1;
+        if let Some(sl) = &search_line {
+            f.render_widget(RuParagraph::new(vec![sl.clone()]), chunks[ci]);
+            ci += 1;
+        }
+        let list_area = chunks[ci];
+        ci += 1;
+        let hints_area = chunks[ci];
+
+        let list = RuList::new(items)
+            .highlight_symbol("")
+            .block(RuBlock::new().borders(RuBorders::NONE));
+
+        let mut state = RuListState::default()
+            .with_offset(b.top)
+            .with_selected(Some(b.sel.min(b.rows.len().saturating_sub(1))));
+        StatefulWidget::render(list, list_area, f.buffer_mut(), &mut state);
+
+        // Scrollbar on the right edge of the list area
+        let total_rows = b.rows.len();
+        let visible_rows = (list_area.height as usize) / 3;
+        if total_rows > visible_rows.max(1) {
+            let mut sb_state = RuScrollbarState::new(total_rows).position(b.top);
+            RuScrollbar::new(RuScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_style(theme::border())
+                .thumb_style(theme::accent_bold())
+                .render(list_area, f.buffer_mut(), &mut sb_state);
+        }
+
+        f.render_widget(RuParagraph::new(hint_lines), hints_area);
+    }
+}
+
+/// Compact human-readable duration: 55s, 19h, 4d, 3mo.
+fn fmt_duration(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else if secs < 2_592_000 {
+        format!("{}d", secs / 86_400)
+    } else {
+        format!("{}mo", secs / 2_592_000)
+    }
+}
+
+/// Compact byte count: 27.7 MB, 512 KB, 928 B.
+fn fmt_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    if bytes < KB {
+        format!("{bytes} B")
+    } else if bytes < MB {
+        let k = bytes as f64 / KB as f64;
+        format!("{:.0} KB", k)
+    } else if bytes < GB {
+        let m = bytes as f64 / MB as f64;
+        format!("{:.1} MB", m)
+    } else {
+        let g = bytes as f64 / GB as f64;
+        format!("{:.1} GB", g)
+    }
+}
+
+/// Last path component of a filesystem-ish string.
+#[allow(dead_code)]
+fn basename(p: &str) -> String {
+    p.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(p)
+        .to_string()
 }
 
 fn wrap(text: &str, width: usize) -> Vec<String> {
@@ -4729,6 +6135,7 @@ impl AltScreenGuard {
     /// Best-effort: undo everything `tui_session` turns on, in reverse order.
     fn restore() {
         let mut out = io::stdout();
+        execute!(out, DisableBracketedPaste).ok();
         execute!(out, Show).ok();
         execute!(out, LeaveAlternateScreen).ok();
         ct_disable_raw().ok();
@@ -4772,6 +6179,7 @@ pub fn tui_session(
             return;
         }
         execute!(out, Hide).ok();
+        execute!(out, EnableBracketedPaste).ok();
         out.flush().ok();
     }
     let _guard = AltScreenGuard;
@@ -4797,8 +6205,75 @@ pub fn tui_session(
 
 #[cfg(test)]
 mod tests {
-    use super::Tui;
+    use super::{decode_key, ConnectRow, Tui};
     use ratatui::style::Color;
+
+    #[test]
+    fn connect_picker_puts_popular_first_then_alphabetical() {
+        let catalog = agent::provider::load_catalog();
+        let rows = Tui::connect_rows(&catalog, "");
+        let headers: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                ConnectRow::Header(t) => Some(*t),
+                ConnectRow::Provider(_) => None,
+            })
+            .collect();
+        assert_eq!(headers, vec!["Popular", "Providers"]);
+
+        // Popular block holds only curated ids, in the curated order.
+        let popular: Vec<usize> = rows
+            .iter()
+            .take_while(|r| !matches!(r, ConnectRow::Header("Providers")))
+            .filter_map(|r| match r {
+                ConnectRow::Provider(i) => Some(*i),
+                _ => None,
+            })
+            .collect();
+        assert!(!popular.is_empty());
+        for (k, i) in popular.iter().enumerate() {
+            assert_eq!(catalog[*i].id, Tui::POPULAR_PROVIDERS[k]);
+        }
+
+        // The Providers block is alphabetical because the catalog is.
+        let rest: Vec<usize> = rows
+            .iter()
+            .skip_while(|r| !matches!(r, ConnectRow::Header("Providers")))
+            .filter_map(|r| match r {
+                ConnectRow::Provider(i) => Some(*i),
+                _ => None,
+            })
+            .collect();
+        let mut sorted = rest.clone();
+        sorted.sort_unstable();
+        assert_eq!(rest, sorted);
+        assert_eq!(rest.len() + popular.len(), catalog.len());
+    }
+
+    #[test]
+    fn connect_search_filters_both_sections_and_drops_empty_ones() {
+        let catalog = agent::provider::load_catalog();
+        let rows = Tui::connect_rows(&catalog, "open");
+        let hits: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                ConnectRow::Provider(i) => Some(catalog[*i].id.as_str()),
+                ConnectRow::Header(_) => None,
+            })
+            .collect();
+        // Name matches count too, so check against both fields.
+        for id in &hits {
+            let p = catalog.iter().find(|c| &c.id == id).unwrap();
+            assert!(
+                p.id.contains("open") || p.name.to_lowercase().contains("open"),
+                "{id} should not match"
+            );
+        }
+        assert!(hits.contains(&"openrouter"));
+        // No curated provider matches "zzz", so its section header disappears.
+        let rows = Tui::connect_rows(&catalog, "zzzznotaprovider");
+        assert!(rows.is_empty());
+    }
 
     #[test]
     fn ansi_to_line_plain_text_is_one_span() {
@@ -4839,5 +6314,14 @@ mod tests {
         // A CSI that is not SGR (e.g. cursor row set) must not leak into text.
         let line = Tui::ansi_to_line("\x1b[3;7Hready");
         assert_eq!(line.spans.iter().map(|s| s.content.as_ref()).collect::<String>(), "ready");
+    }
+
+    #[test]
+    fn decode_key_bracketed_paste() {
+        let paste = b"\x1b[200~hello\nworld\x1b[201~";
+        let (chars, code): (Vec<char>, u32) = decode_key(paste);
+        assert_eq!(code, 2000);
+        let s: String = chars.into_iter().collect();
+        assert_eq!(s, "hello\nworld");
     }
 }
