@@ -58,8 +58,10 @@ pub enum ItemKind {
     AgentMessage { delta: Option<String>, final_text: Option<String> },
     /// A tool invocation. `output`/`error` appear only on the terminal edges.
     ToolCall { name: String, args: Value, ok: Option<bool>, output: Option<String> },
-    /// An engine step beginning — drives spinners/activity labels.
-    Thinking { step: usize },
+    /// An engine step beginning — drives spinners/activity labels. `delta`
+    /// carries streamed reasoning text on Updated edges so a client can render
+    /// live thinking without reopening the answer channel.
+    Thinking { step: usize, delta: Option<String> },
     /// Real token usage reported by the model endpoint.
     Usage(UsageFigures),
     /// A notice that is not part of any turn (session path, mode changes).
@@ -137,7 +139,7 @@ impl CoreEvent {
                 "ok": ok,
                 "output": output,
             }),
-            ItemKind::Thinking { step } => json!({ "type": "thinking", "step": step }),
+            ItemKind::Thinking { step, delta } => json!({ "type": "thinking", "step": step, "delta": delta }),
             ItemKind::Usage(u) => json!({
                 "type": "usage",
                 "prompt_tokens": u.prompt_tokens,
@@ -182,7 +184,10 @@ impl CoreEvent {
                 ok: k.get("ok").and_then(Value::as_bool),
                 output: opt_str("output"),
             },
-            "thinking" => ItemKind::Thinking { step: k.get("step")?.as_u64()? as usize },
+            "thinking" => ItemKind::Thinking {
+                step: k.get("step")?.as_u64()? as usize,
+                delta: opt_str("delta"),
+            },
             "usage" => ItemKind::Usage(UsageFigures {
                 prompt_tokens: k.get("prompt_tokens")?.as_u64()?,
                 completion_tokens: k.get("completion_tokens")?.as_u64()?,

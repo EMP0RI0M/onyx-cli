@@ -44,11 +44,47 @@ pub struct Transcript {
     path: PathBuf,
 }
 
+/// The workspace directory recorded for scoping `/resume` to the current
+/// project. Best-effort: `None` when cwd cannot be read.
+fn detect_cwd() -> Option<String> {
+    std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Best-effort git branch name for `cwd`, via `git rev-parse --abbrev-ref HEAD`.
+/// Returns `None` off a repo / without git; never blocks on a missing binary.
+fn detect_branch(cwd: Option<&str>) -> Option<String> {
+    let mut cmd = std::process::Command::new("git");
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    let out = cmd
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() || s == "HEAD" {
+        None
+    } else {
+        Some(s)
+    }
+}
+
 impl Transcript {
     /// Create (or reopen) the transcript for `id`, writing a header record the
     /// first time. Returns `None` if the directory could not be created — a
-    /// failure to persist must never abort an interactive session.
+    /// failure to persist must never abort an interactive session. Records the
+    /// current workspace + git branch so `/resume` can scope by project.
     pub fn open(id: &str, model: &str) -> Option<Self> {
+        Self::open_in(id, model, detect_cwd().as_deref())
+    }
+
+    /// Like [`Transcript::open`] but records an explicit `cwd` (and its detected
+    /// branch) instead of probing the process working directory.
+    pub fn open_in(id: &str, model: &str, cwd: Option<&str>) -> Option<Self> {
         let dir = sessions_dir();
         if fs::create_dir_all(&dir).is_err() {
             return None;
@@ -57,7 +93,13 @@ impl Transcript {
         let fresh = !path.exists();
         let mut f = fs::OpenOptions::new().create(true).append(true).open(&path).ok()?;
         if fresh {
-            let rec = json!({ "kind": "meta", "model": model, "ts": now_secs() });
+            let mut rec = json!({ "kind": "meta", "model": model, "ts": now_secs() });
+            if let Some(c) = cwd {
+                rec["cwd"] = json!(c);
+                if let Some(b) = detect_branch(Some(c)) {
+                    rec["branch"] = json!(b);
+                }
+            }
             if let Ok(line) = serde_json::to_string(&rec) {
                 let _ = writeln!(f, "{line}");
             }
@@ -138,6 +180,7 @@ pub fn load_messages(path: &PathBuf) -> Vec<Message> {
 }
 
 /// Summary of one session for `/resume`: id, first user prompt, size, mtime.
+#[derive(Clone, Debug)]
 pub struct SessionInfo {
     pub id: String,
     pub preview: String,
@@ -146,19 +189,170 @@ pub struct SessionInfo {
     pub title: Option<String>,
     #[allow(dead_code)]
     pub modified: u64,
+    /// Workspace directory recorded at creation (meta `cwd`), if known.
+    pub cwd: Option<String>,
+    /// Basename of `cwd` — the project label shown in the browser header.
+    pub project: String,
+    /// Git branch recorded at creation (meta `branch`), if any.
+    pub branch: Option<String>,
+    /// Transcript file size in bytes.
+    pub bytes: u64,
+    /// Earliest message timestamp (0 when none recorded).
+    pub first_ts: u64,
+    /// Latest message timestamp (falls back to `modified`).
+    pub last_ts: u64,
+    /// Wall-clock span of the conversation (last_ts − first_ts, 0 when unknown).
+    pub duration_secs: u64,
 }
 
-/// Read the `title` field from a transcript's meta header, if present.
-pub fn session_title(path: &PathBuf) -> Option<String> {
+/// Collect every per-message `ts` seen while loading, alongside the messages.
+fn load_with_timestamps(path: &PathBuf) -> (Vec<Message>, Vec<u64>) {
+    let mut msgs = Vec::new();
+    let mut stamps = Vec::new();
+    let Ok(file) = fs::File::open(path) else { return (msgs, stamps) };
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else { break };
+        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        if v.get("kind").and_then(Value::as_str) == Some("message") {
+            if let (Some(role), Some(content)) = (
+                v.get("role").and_then(Value::as_str),
+                v.get("content").and_then(Value::as_str),
+            ) {
+                let mut m = Message::text(role, content);
+                if let Some(tc) = v.get("tool_call") {
+                    let name = tc.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                    let args = tc.get("args").cloned().unwrap_or(Value::Null);
+                    m.tool_call = Some(ToolCall { name, args });
+                }
+                msgs.push(m);
+                if let Some(t) = v.get("ts").and_then(Value::as_u64) {
+                    stamps.push(t);
+                }
+            }
+        }
+    }
+    (msgs, stamps)
+}
+
+/// Basename of a path, used as the short project label.
+fn basename(p: &str) -> String {
+    p.trim_end_matches('/').rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or(p).to_string()
+}
+
+/// List stored sessions, most-recently-modified first, capped at `limit`.
+/// Empty sessions (0 messages) are skipped and cleaned up.
+pub fn list_sessions(limit: usize) -> Vec<SessionInfo> {
+    list_sessions_scoped(limit, None)
+}
+
+/// Like [`list_sessions`] but, when `scope_cwd` is `Some`, keeps only sessions
+/// whose recorded workspace matches that directory. Sessions with no recorded
+/// cwd are excluded from a scoped view (they predate project tagging).
+pub fn list_sessions_scoped(limit: usize, scope_cwd: Option<&str>) -> Vec<SessionInfo> {
+    let dir = sessions_dir();
+    let Ok(entries) = fs::read_dir(&dir) else { return Vec::new() };
+    let mut infos: Vec<SessionInfo> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?").to_string();
+        let (msgs, stamps) = load_with_timestamps(&path);
+        // If session has no user messages, remove empty artifact and skip
+        if msgs.is_empty() {
+            let _ = fs::remove_file(&path);
+            continue;
+        }
+        let preview = msgs
+            .iter()
+            .find(|m| m.role == "user")
+            .map(|m| m.content.chars().take(72).collect::<String>())
+            .unwrap_or_default();
+        let modified = path
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|t| t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0))
+            .unwrap_or(0);
+        let bytes = path.metadata().map(|m| m.len()).unwrap_or(0);
+
+        let meta = read_meta(&path);
+        let cwd = meta
+            .as_ref()
+            .and_then(|m| m.get("cwd").and_then(Value::as_str).map(|s| s.to_string()));
+        let branch = meta
+            .as_ref()
+            .and_then(|m| m.get("branch").and_then(Value::as_str).map(|s| s.to_string()));
+        let project = cwd.as_deref().map(basename).unwrap_or_else(|| "unknown".to_string());
+
+        // Scoped view: keep only same-workspace sessions.
+        if let Some(sc) = scope_cwd {
+            match &cwd {
+                Some(c) if c == sc => {}
+                _ => continue,
+            }
+        }
+
+        let first_ts = stamps.iter().min().copied().unwrap_or(0);
+        let last_ts = stamps.iter().max().copied().unwrap_or(modified);
+        // Fold the session-start recorded in the meta header so a single-turn
+        // conversation still reports its true span (the first message can share
+        // the meta's second-granularity timestamp).
+        let meta_ts = meta
+            .as_ref()
+            .and_then(|m| m.get("ts").and_then(Value::as_u64));
+        let first_ts = match meta_ts {
+            Some(t) if first_ts == 0 => t,
+            Some(t) => first_ts.min(t),
+            None => first_ts,
+        };
+        let last_ts = last_ts.max(meta_ts.unwrap_or(0)).max(modified);
+        let duration_secs = last_ts.saturating_sub(first_ts);
+
+        let title = session_title(&path).or_else(|| {
+            if !preview.is_empty() {
+                Some(derive_title(&preview))
+            } else {
+                None
+            }
+        });
+        infos.push(SessionInfo {
+            id,
+            preview,
+            messages: msgs.len(),
+            title,
+            modified,
+            cwd,
+            project,
+            branch,
+            bytes,
+            first_ts,
+            last_ts,
+            duration_secs,
+        });
+    }
+    infos.sort_by(|a, b| b.modified.cmp(&a.modified));
+    infos.truncate(limit);
+    infos
+}
+
+/// Read the first `meta` record of a transcript, if any. Shared by title,
+/// project and branch lookups so the header is parsed once per session.
+pub fn read_meta(path: &PathBuf) -> Option<Value> {
     let file = fs::File::open(path).ok()?;
     for line in BufReader::new(file).lines().take(4) {
         let Ok(line) = line else { break };
         let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
         if v.get("kind").and_then(Value::as_str) == Some("meta") {
-            return v.get("title").and_then(Value::as_str).map(|s| s.to_string());
+            return Some(v);
         }
     }
     None
+}
+
+/// Read the `title` field from a transcript's meta header, if present.
+pub fn session_title(path: &PathBuf) -> Option<String> {
+    read_meta(path)?.get("title").and_then(Value::as_str).map(|s| s.to_string())
 }
 
 /// Update or insert a `title` into a transcript's meta header record.
@@ -218,49 +412,6 @@ pub fn derive_title(text: &str) -> String {
     } else {
         out.join(" ")
     }
-}
-
-/// List stored sessions, most-recently-modified first, capped at `limit`.
-/// Empty sessions (0 messages) are skipped and cleaned up.
-pub fn list_sessions(limit: usize) -> Vec<SessionInfo> {
-    let dir = sessions_dir();
-    let Ok(entries) = fs::read_dir(&dir) else { return Vec::new() };
-    let mut infos: Vec<SessionInfo> = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?").to_string();
-        let msgs = load_messages(&path);
-        // If session has no user messages, remove empty artifact and skip
-        if msgs.is_empty() {
-            let _ = fs::remove_file(&path);
-            continue;
-        }
-        let preview = msgs
-            .iter()
-            .find(|m| m.role == "user")
-            .map(|m| m.content.chars().take(72).collect::<String>())
-            .unwrap_or_default();
-        let modified = path
-            .metadata()
-            .and_then(|m| m.modified())
-            .map(|t| t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0))
-            .unwrap_or(0);
-        
-        let title = session_title(&path).or_else(|| {
-            if !preview.is_empty() {
-                Some(derive_title(&preview))
-            } else {
-                None
-            }
-        });
-        infos.push(SessionInfo { id, preview, messages: msgs.len(), title, modified });
-    }
-    infos.sort_by(|a, b| b.modified.cmp(&a.modified));
-    infos.truncate(limit);
-    infos
 }
 
 /// Resolve a resume target by exact id, prefix, suffix, title, or query; returns the message list.
@@ -362,6 +513,51 @@ mod tests {
         let tc = restored[0].tool_call.as_ref().expect("tool call restored");
         assert_eq!(tc.name, "bash");
         assert_eq!(tc.args["cmd"], "ls");
+
+        let _ = fs::remove_dir_all(&dir);
+        std::env::remove_var("ONYX_HOME");
+    }
+
+    #[test]
+    fn scoped_listing_and_metadata_roundtrip() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("onyx-sess-scope-{}", new_session_id()));
+        std::env::set_var("ONYX_HOME", &dir);
+
+        // Two sessions in project A, one in project B.
+        let a1 = new_session_id();
+        {
+            let t = Transcript::open_in(&a1, "m", Some("/work/projA")).expect("open");
+            t.push(&Message::text("user", "first prompt"));
+            t.push(&Message::text("assistant", "reply"));
+        }
+        let a2 = new_session_id();
+        {
+            let t = Transcript::open_in(&a2, "m", Some("/work/projA")).expect("open");
+            t.push(&Message::text("user", "another"));
+        }
+        let b1 = new_session_id();
+        {
+            let t = Transcript::open_in(&b1, "m", Some("/work/projB")).expect("open");
+            t.push(&Message::text("user", "elsewhere"));
+        }
+
+        let all = list_sessions(usize::MAX);
+        assert_eq!(all.len(), 3, "unscoped sees every session");
+        for s in &all {
+            assert!(!s.project.is_empty());
+            assert!(s.bytes > 0, "size recorded");
+        }
+
+        let scoped = list_sessions_scoped(usize::MAX, Some("/work/projA"));
+        assert_eq!(scoped.len(), 2, "scoped to projA keeps only its two");
+        assert!(scoped.iter().all(|s| s.project == "projA"));
+        assert!(scoped.iter().any(|s| s.id == a1 && s.messages == 2));
+
+        // Duration is derivable and non-negative; first_ts recorded from message ts.
+        let s1 = scoped.iter().find(|s| s.id == a1).unwrap();
+        assert!(s1.first_ts > 0);
+        assert!(s1.duration_secs < 60, "same-second span stays tiny");
 
         let _ = fs::remove_dir_all(&dir);
         std::env::remove_var("ONYX_HOME");

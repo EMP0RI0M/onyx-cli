@@ -1,0 +1,48 @@
+[package]
+name = "onyx-retrieval"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+description = "In-process tool/skill/fact retrieval for the Onyx core — BM25, dense, or hybrid ranking with usage-adaptive reordering. No vector database."
+keywords = ["ai-agents", "tool-calling", "embeddings", "retrieval", "bm25"]
+categories = ["text-processing", "algorithms"]
+
+[dependencies]
+bm25 = "2.3"
+# The BM25 tokenizer's own normalization and word splitting, reused so
+# `engine_query` hands the engine words at exactly its granularity.
+deunicode = "1.6"
+unicode-segmentation = "1.13"
+# Id-keyed, insertion-ordered corpus storage: `register` replaces in place so a
+# re-registered id never duplicates.
+indexmap = { version = "2", features = ["serde"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Cross-language catalog-definition telemetry hashes.
+serde_json_canonicalizer = "0.3"
+ulid = "1"
+
+# Dense (semantic) retrieval — pure-Rust Candle inference, no C++/ONNX native
+# dep, so the build stays clean cross-platform. `hf-hub` fetches the model on
+# first use into the shared HuggingFace cache (sync `ureq` backend, rustls —
+# no OpenSSL/native-tls).
+candle-core = "0.9"
+candle-nn = "0.9"
+candle-transformers = "0.9"
+# `fancy-regex` is the pure-Rust regex backend; `onig` pulls oniguruma (C) via
+# onig_sys, which breaks cross-compilation to aarch64-linux. BERT WordPiece
+# tokenization is unaffected by the backend.
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
+
+# Sync HTTP client for OpenAI-compatible embedding endpoints (OpenAI, Ollama,
+# TEI, vLLM…). Already in-tree via hf-hub's `ureq` feature; rustls with the
+# `ring` backend to match this workspace (aws-lc-rs needs cmake).
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
+rustls = { workspace = true }
+
+# Content digests for Local embedding fingerprints (path is not identity).
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"

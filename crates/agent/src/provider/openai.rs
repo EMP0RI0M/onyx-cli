@@ -92,7 +92,12 @@ impl ProviderProtocol for OpenAiCompat {
         Ok(ParsedReply { content, thinking, tool_calls, usage: usage_from(&v) })
     }
 
-    fn parse_stream_event(&self, data: &str, acc: &mut StreamAcc) -> bool {
+    fn parse_stream_event(
+        &self,
+        data: &str,
+        acc: &mut StreamAcc,
+        on_reasoning: &mut dyn FnMut(&str),
+    ) -> bool {
         if data == "[DONE]" {
             acc.done = true;
             return false;
@@ -108,7 +113,10 @@ impl ProviderProtocol for OpenAiCompat {
             acc.content.push_str(txt);
         }
         if let Some(r) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
-            acc.thinking.push_str(r);
+            if !r.is_empty() {
+                acc.thinking.push_str(r);
+                on_reasoning(r);
+            }
         }
         if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
             for tc in tcs {
@@ -196,16 +204,19 @@ mod tests {
         OpenAiCompat.parse_stream_event(
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"vec"}}]}}]}"#,
             &mut acc,
+            &mut |_| {},
         );
         OpenAiCompat.parse_stream_event(
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"math","arguments":"{\"op\":"}}]}}]}"#,
             &mut acc,
+            &mut |_| {},
         );
         OpenAiCompat.parse_stream_event(
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"dot\"}"}}]}}]}"#,
             &mut acc,
+            &mut |_| {},
         );
-        let done = !OpenAiCompat.parse_stream_event("[DONE]", &mut acc);
+        let done = !OpenAiCompat.parse_stream_event("[DONE]", &mut acc, &mut |_| {});
         assert!(done);
         let p = acc.into_parsed();
         assert_eq!(p.tool_calls[0].name, "vecmath");

@@ -27,6 +27,7 @@ pub enum AuthScheme {
 }
 
 /// A resolved, ready-to-call endpoint: protocol + absolute path + auth plan.
+#[derive(Clone)]
 pub struct Resolved {
     pub protocol: Arc<dyn ProviderProtocol>,
     pub host: String,

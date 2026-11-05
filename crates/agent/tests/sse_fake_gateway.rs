@@ -130,7 +130,7 @@ fn streaming_sse_stitches_tool_calls_across_splits() {
     let history = vec![Message::text("user", "go")];
 
     let mut seen = String::new();
-    let step = hm.next_step_streaming(&history, &[], &mut |d| seen.push_str(d));
+    let step = hm.next_step_streaming(&history, &[], &mut |d| seen.push_str(d), &mut |_| {});
 
     match step {
         Step::Calls(calls) => {

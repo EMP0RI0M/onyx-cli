@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/kernel", "crates/tools", "crates/terminal", "crates/agent", "crates/guardian", "crates/sandbox", "crates/subagent", "crates/mcp", "crates/skills", "crates/skillopt", "crates/core", "crates/cli"]
+members = ["crates/kernel", "crates/tools", "crates/terminal", "crates/agent", "crates/guardian", "crates/sandbox", "crates/subagent", "crates/mcp", "crates/skills", "crates/skillopt", "crates/core", "crates/retrieval", "crates/cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,9 +13,15 @@ tools = { path = "crates/tools" }
 skills = { path = "crates/skills" }
 skillopt = { path = "crates/skillopt" }
 onyx-core = { path = "crates/core" }
+onyx-retrieval = { path = "crates/retrieval" }
 libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1"
+# `preserve_order` makes JSON objects insertion-ordered. The retrieval engine's
+# searchable-text projection walks a tool's `properties` in schema-defined
+# order, and its embedding/artifact digests are built from that text — without
+# this feature the same catalog produces a different projection per load and
+# every cached vector is invalidated.
+serde_json = { version = "1", features = ["preserve_order"] }
 tungstenite = "0.24"
 ratatui = "0.30"
 crossterm = "0.29"
@@ -34,3 +40,16 @@ subtle = "2"
 opt-level = 3
 lto = true
 codegen-units = 1
+
+# gemm-common 0.19 declares its AArch64 FP16 SIMD wrappers (vmulq_f16,
+# vaddq_f16, vfmaq_f16, vfmaq_laneq_f16) as plain `pub unsafe fn`, while every
+# other intrinsic in that module carries #[target_feature(enable = ...)]. rustc
+# then emits FMUL/FADD/FMLA .8h at the baseline ARMv8 target and the integrated
+# assembler rejects it ("instruction requires: fullfp16") — a hard compile error
+# on CPUs with FP16 arithmetic only (this host: asimdfhm, no SVE/fullfp16), even
+# though no f16 microkernel is ever dispatched. The vendored copy adds the
+# missing gate to the wrappers and to NeonFp16's vectorize trampoline.
+# candle-core pulls gemm with default features, so feature unification makes
+# disabling `f16` from our side impossible; patching the crate is the only fix.
+[patch.crates-io]
+gemm-common = { path = "/root/gemm-common-vendor" }

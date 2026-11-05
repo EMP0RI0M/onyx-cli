@@ -10,6 +10,7 @@ pub mod context;
 pub mod core_bridge;
 pub mod model;
 pub mod provider;
+pub mod retrieval;
 pub mod session;
 
 use serde_json::Value;
@@ -105,6 +106,9 @@ pub struct TokenUsage {
 pub enum AgentEvent {
     /// A model step is starting (spinner + activity label).
     Thinking { step: usize },
+    /// Streamed reasoning/thinking text delta, kept separate from the answer so a
+    /// UI can render it as collapsible "thinking" rather than the final message.
+    ReasoningDelta(String),
     /// Streamed assistant/reasoning text delta.
     TextDelta(String),
     /// The model requested this tool call.
@@ -113,6 +117,9 @@ pub enum AgentEvent {
     ToolDone { name: String, ok: bool, output: String },
     /// Real token usage reported from the model endpoint.
     Usage(TokenUsage),
+    /// Retrieval narrowed this turn's tool surface; a one-line status the UI can
+    /// show so the operator sees *why* only some tools were offered.
+    CapabilitySelection(String),
 }
 
 /// Result of a full run: the final answer and the total steps taken.
@@ -136,6 +143,11 @@ pub struct ToolCallAgent<'a, P: Policy + ?Sized> {
     /// retry forever against an unchanging policy. 0 disables detection.
     pub denial_limit: usize,
     pub system: String,
+    /// Retrieval-backed capability selection. When set, each turn projects the
+    /// tool surface down to what the user's intent matches before the model sees
+    /// it (see [`crate::retrieval`]). `None` keeps the full catalog on every step —
+    /// the default, and what small catalogs and non-`HttpModel` callers want.
+    pub selector: Option<&'a crate::retrieval::CapabilitySelector>,
 }
 
 impl<'a, P: Policy + ?Sized> ToolCallAgent<'a, P> {
@@ -145,10 +157,17 @@ impl<'a, P: Policy + ?Sized> ToolCallAgent<'a, P> {
             max_steps: 8,
             doom_limit: 3,
             denial_limit: 4,
+            selector: None,
             system: "You are tektile-core, a precise agent. Use tools to act; when done, \
                      call terminate with the final answer."
                 .into(),
         }
+    }
+
+    /// Run the loop with retrieval-driven per-turn tool selection.
+    pub fn with_selector(mut self, selector: &'a crate::retrieval::CapabilitySelector) -> Self {
+        self.selector = Some(selector);
+        self
     }
 
     /// Drive the loop for one user turn. Every tool call is policy-checked and
@@ -177,7 +196,7 @@ impl<'a, P: Policy + ?Sized> ToolCallAgent<'a, P> {
         model: &mut dyn Model,
         user: &str,
         history: &mut Vec<Message>,
-        on_event: &mut dyn FnMut(AgentEvent),
+        mut on_event: &mut dyn FnMut(AgentEvent),
     ) -> Result<RunReport, AgentError> {
         let stream = model
             .as_any_mut()
@@ -188,7 +207,27 @@ impl<'a, P: Policy + ?Sized> ToolCallAgent<'a, P> {
         if history.last().map_or(true, |m| m.role != "user" || m.content != user) {
             history.push(Message::text("user", user));
         }
-        let tool_names = self.gateway.tools.names();
+
+        // Retrieval: project this turn's tool surface down to what the intent
+        // matches. Only meaningful for an HttpModel (the only thing that renders a
+        // catalog); scripted/test models keep the full gateway inventory below.
+        // apply_turn writes hm.turn_tools; we read the offered names back out so the
+        // loop's own tool list agrees with exactly what the model was shown.
+        let mut offered_override: Option<Vec<String>> = None;
+        if let Some(sel) = self.selector {
+            if let Some(hm) = model.as_any_mut().downcast_mut::<crate::model::HttpModel>() {
+                sel.apply_turn(hm, user, history);
+                if let Some(t) = &hm.turn_tools {
+                    on_event(AgentEvent::CapabilitySelection(t.summary()));
+                    offered_override = Some(t.offered_names());
+                }
+            }
+        }
+
+        let tool_names: Vec<String> = match &offered_override {
+            Some(names) => names.clone(),
+            None => self.gateway.tools.names(),
+        };
         let tools: Vec<&str> = tool_names.iter().map(|s| s.as_str()).collect();
 
         // Doom-loop guard: if the model emits the exact same batch of tool calls
@@ -203,12 +242,15 @@ impl<'a, P: Policy + ?Sized> ToolCallAgent<'a, P> {
         for step in 0..self.max_steps {
             on_event(AgentEvent::Thinking { step });
             let action = if stream {
-                let mut sink = |d: &str| on_event(AgentEvent::TextDelta(d.to_string()));
                 let hm = model
                     .as_any_mut()
                     .downcast_mut::<crate::model::HttpModel>()
                     .unwrap();
-                let res = hm.next_step_streaming(history, &tools, &mut sink);
+                let on_ev = std::cell::RefCell::new(&mut on_event);
+                let mut sink = |d: &str| (on_ev.borrow_mut())(AgentEvent::TextDelta(d.to_string()));
+                let mut reasoning_sink =
+                    |r: &str| (on_ev.borrow_mut())(AgentEvent::ReasoningDelta(r.to_string()));
+                let res = hm.next_step_streaming(history, &tools, &mut sink, &mut reasoning_sink);
                 if let Some(u) = &hm.last_usage {
                     on_event(AgentEvent::Usage(u.clone()));
                 }
@@ -254,6 +296,16 @@ impl<'a, P: Policy + ?Sized> ToolCallAgent<'a, P> {
                             tool_call: Some(call.clone()),
                         });
                         let outcome = self.gateway.call(&call.name, &call.args);
+                        // Feed real usage to the retrieval learner so adaptive
+                        // ranking credits the search that offered this tool. No-op
+                        // when the usage arm is off or no selector is attached.
+                        if let Some(sel) = self.selector {
+                            let (ok, err) = match &outcome {
+                                Ok(out) => (!out.is_error, String::new()),
+                                Err(e) => (false, e.to_string()),
+                            };
+                            sel.record_invoke(&call.name, &call.args, ok, 0, &err);
+                        }
                         match &outcome {
                             Ok(out) => on_event(AgentEvent::ToolDone {
                                 name: call.name.clone(),

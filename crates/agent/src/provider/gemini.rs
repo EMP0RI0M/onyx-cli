@@ -101,13 +101,21 @@ impl ProviderProtocol for Gemini {
         Ok(parse_candidate(&v))
     }
 
-    fn parse_stream_event(&self, data: &str, acc: &mut StreamAcc) -> bool {
+    fn parse_stream_event(
+        &self,
+        data: &str,
+        acc: &mut StreamAcc,
+        on_reasoning: &mut dyn FnMut(&str),
+    ) -> bool {
         // Each SSE data payload is one generateContent-shaped object.
         let Ok(v) = serde_json::from_str::<Value>(data) else { return true };
         let p = parse_candidate(&v);
         acc.content.push_str(&p.content);
         if let Some(t) = p.thinking {
-            acc.thinking.push_str(&t);
+            if !t.is_empty() {
+                acc.thinking.push_str(&t);
+                on_reasoning(&t);
+            }
         }
         acc.block_tools.extend(p.tool_calls);
         if p.usage.is_some() {
@@ -119,7 +127,7 @@ impl ProviderProtocol for Gemini {
 
 fn parse_candidate(v: &Value) -> ParsedReply {
     let mut content = String::new();
-    let thinking = String::new();
+    let mut thinking = String::new();
     let mut tool_calls = Vec::new();
     if let Some(cand) = v.get("candidates").and_then(|c| c.get(0)) {
         if let Some(parts) = cand.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
@@ -131,8 +139,13 @@ fn parse_candidate(v: &Value) -> ParsedReply {
                         tool_calls.push(ToolCall { name, args });
                     }
                 } else if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
-                    // Thoughts vs answer: Gemini tags reasoning parts sometimes.
-                    content.push_str(t);
+                    // Gemini marks reasoning parts with `thought: true`; everything
+                    // else is the answer. Unmarked parts stay content (safe default).
+                    if part.get("thought").and_then(|b| b.as_bool()).unwrap_or(false) {
+                        thinking.push_str(t);
+                    } else {
+                        content.push_str(t);
+                    }
                 }
             }
         }

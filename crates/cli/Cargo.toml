@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 agent = { path = "../agent" }
 onyx-core = { path = "../core" }
+onyx-retrieval = { workspace = true }
 guardian = { path = "../guardian" }
 sandbox = { path = "../sandbox" }
 subagent = { path = "../subagent" }

@@ -248,6 +248,13 @@ impl SkillCatalog {
         self.skills.get(name)
     }
 
+    /// Every loaded skill, in insertion order. Used by retrieval to index the whole
+    /// catalog (name + description + instructions) so a terse intent prompt can
+    /// match a skill the operator never named explicitly.
+    pub fn all(&self) -> Vec<&Skill> {
+        self.skills.values().collect()
+    }
+
     pub fn count(&self) -> usize {
         self.skills.len()
     }

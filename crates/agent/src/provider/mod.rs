@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
-pub use registry::{protocol_for, Resolved};
+pub use registry::{protocol_for, resolve, Resolved};
 pub use types::{Header, ParsedReply, ProviderProtocol, RequestCtx, StreamAcc, Usage};
 
 /// Static embedded providers catalog from liter-llm.
@@ -126,14 +126,14 @@ pub fn load_storage() -> ProvidersStorage {
         active_provider: "custom_openai".to_string(),
         providers: HashMap::new(),
     };
-    // Pre-populate custom_openai pointing to the default loopback proxy. No key is
-    // baked in: a loopback CLIProxyAPI accepts none, and any real secret comes from
-    // the credential vault or an env var at resolve time (see `resolve_api_key`).
+    // Pre-populate custom_openai pointing to the default loopback router (OmniRoute).
+    // No key is baked in: a loopback router accepts none, and any real secret comes
+    // from the credential vault or an env var at resolve time (see `resolve_api_key`).
     storage.providers.insert(
         "custom_openai".to_string(),
         ProviderConfig {
             provider_id: "custom_openai".to_string(),
-            base_url: Some("http://127.0.0.1:8317/v1".to_string()),
+            base_url: Some("http://127.0.0.1:20128/v1".to_string()),
             api_key: None,
             oauth_token: None,
             oauth_refresh_token: None,
@@ -267,7 +267,7 @@ pub fn resolve_base_url(spec: &ProviderSpec, config: Option<&ProviderConfig>) ->
             return u.trim().trim_end_matches('/').to_string();
         }
     }
-    "http://127.0.0.1:8317/v1".to_string()
+    "http://127.0.0.1:20128/v1".to_string()
 }
 
 /// Structure for GitHub Copilot Device Flow response

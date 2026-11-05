@@ -1024,6 +1024,7 @@ struct Job {
     hm: *mut HttpModel,
     history: Box<Vec<Message>>,
     opts: *const Opts,
+    sel: *const agent::retrieval::CapabilitySelector,
 }
 unsafe impl Send for Job {}
 
@@ -1031,6 +1032,7 @@ pub struct Tui<'a> {
     gw: &'a mut Gateway<dyn tools::policy::Policy>,
     hm: &'a mut HttpModel,
     opts: &'a mut Opts,
+    sel: Option<&'a agent::retrieval::CapabilitySelector>,
     history_len: usize,
     history_bytes: usize,
     items: Vec<Item>,
@@ -1590,6 +1592,7 @@ impl<'a> Tui<'a> {
         gw: &'a mut Gateway<dyn tools::policy::Policy>,
         hm: &'a mut HttpModel,
         opts: &'a mut Opts,
+        sel: Option<&'a agent::retrieval::CapabilitySelector>,
     ) -> Self {
         let cached_models = hm.list_models().unwrap_or_default();
         let mcp_count = if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
@@ -1647,6 +1650,7 @@ impl<'a> Tui<'a> {
             gw,
             hm,
             opts,
+            sel,
             history_len: 0,
             history_bytes: 0,
             items: vec![Item::Banner],
@@ -1763,6 +1767,7 @@ impl<'a> Tui<'a> {
             hm: self.hm as *mut HttpModel,
             history: Box::new(Vec::new()),
             opts: self.opts as *const Opts,
+            sel: self.sel.map(|s| s as *const agent::retrieval::CapabilitySelector).unwrap_or(std::ptr::null()),
         });
 
         let worker = thread::spawn(move || {
@@ -1774,6 +1779,8 @@ impl<'a> Tui<'a> {
             let hm: &mut HttpModel = unsafe { &mut *job.hm };
             let mut history: Vec<Message> = *job.history;
             let _opts: &Opts = unsafe { &*job.opts };
+            let sel: Option<&agent::retrieval::CapabilitySelector> =
+                if job.sel.is_null() { None } else { Some(unsafe { &*job.sel }) };
             let mut transcript = transcript;
 
             // Approver runs ON the worker thread (it blocks on AskCtl). It may
@@ -1815,6 +1822,9 @@ impl<'a> Tui<'a> {
                         // carries the user+assistant+tool messages even when the
                         // live history is later truncated (cancel) or errored.
                         let mut agent = ToolCallAgent::new(gw);
+                        if let Some(sel) = sel {
+                            agent = agent.with_selector(sel);
+                        }
                         agent.max_steps = max_steps;
                         let mut sink = |ev: AgentEvent| {
                             let core = match &ev {
@@ -2408,12 +2418,8 @@ impl<'a> Tui<'a> {
         }
 
         // Subcommand dropdown for /skill
-        if input.starts_with("/skill") {
-            let arg = if let Some((_, rest)) = input.split_once(' ') {
-                rest.trim()
-            } else {
-                ""
-            };
+        if input.starts_with("/skill ") {
+            let arg = input["/skill ".len()..].trim();
             let mut items = Vec::new();
             let mut cat = skills::SkillCatalog::new();
             cat.scan_all_default();
@@ -3849,6 +3855,17 @@ impl<'a> Tui<'a> {
                 self.items.push(Item::Info("audit requested (see transcript below)".into()));
             }
             "/tools" => {
+                if let Some(sel) = self.sel {
+                    self.items.push(Item::Info(format!(
+                        "retrieval ON · {} tools, {} skills · engine: {} · adaptive: {}",
+                        sel.tool_count(),
+                        sel.skill_count(),
+                        if sel.embeddings_ready() { "hybrid" } else { "bm25" },
+                        sel.adaptive_status()
+                    )));
+                } else {
+                    self.items.push(Item::Info("retrieval OFF (set ONYX_RETRIEVAL=1 to enable per-turn capability selection)".into()));
+                }
                 for n in self.gw.tools.names() {
                     let cap = tools::taxonomy::capability_of(&n).label();
                     self.items.push(Item::Info(format!("  • {n}  {DIM}[{cap}]{RESET}")));
@@ -4790,6 +4807,12 @@ impl<'a> Tui<'a> {
             (_, ItemKind::UserMessage { .. }) => {
                 // Already echoed by the UI thread on submit; replays render it
                 // directly. Nothing to do here.
+            }
+            (_, ItemKind::Info { text }) => {
+                // Per-turn retrieval status ("offered N of M tools via bm25").
+                if !text.trim().is_empty() {
+                    self.items.push(Item::Info(text));
+                }
             }
             _ => {}
         }
@@ -6153,6 +6176,7 @@ pub fn tui_session(
     gw: &mut Gateway<dyn tools::policy::Policy>,
     hm: &mut HttpModel,
     opts: &mut Opts,
+    sel: Option<&agent::retrieval::CapabilitySelector>,
 ) {
     // termios raw-mode guard drives the byte-level InputPump (VMIN=1 blocking
     // read with ISIG/ECHO off). Kept alongside crossterm's raw mode so key
@@ -6192,7 +6216,7 @@ pub fn tui_session(
         .ok();
 
     {
-        let mut tui = Tui::new(gw, hm, opts);
+        let mut tui = Tui::new(gw, hm, opts, sel);
         tui.start_worker();
         tui.run_ratatui(&pump, &mut terminal);
         tui.finish();

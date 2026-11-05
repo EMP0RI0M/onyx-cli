@@ -82,7 +82,15 @@ pub trait ProviderProtocol: Send + Sync {
 
     /// Parse one SSE `data:` payload incrementally, accumulating into `acc`.
     /// Returns false when the stream signals completion (e.g. `[DONE]`).
-    fn parse_stream_event(&self, data: &str, acc: &mut StreamAcc) -> bool;
+    /// Reasoning/thinking deltas are forwarded to `on_reasoning` as they arrive
+    /// so a UI can show them live; adapters that don't separate reasoning simply
+    /// ignore it.
+    fn parse_stream_event(
+        &self,
+        data: &str,
+        acc: &mut StreamAcc,
+        on_reasoning: &mut dyn FnMut(&str),
+    ) -> bool;
 
     /// True if this protocol uses SSE framing for streaming responses.
     fn streams_via_sse(&self) -> bool {

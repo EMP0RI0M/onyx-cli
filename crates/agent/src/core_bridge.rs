@@ -12,9 +12,14 @@ impl AgentEvent {
     /// stream belongs to); this function only maps kind + status.
     pub fn to_core(&self, thread_id: &str, turn_id: u64, item_id: u64) -> CoreEvent {
         let (status, kind) = match self {
-            AgentEvent::Thinking { step } => {
-                (ItemStatus::Started, ItemKind::Thinking { step: *step })
-            }
+            AgentEvent::Thinking { step } => (
+                ItemStatus::Started,
+                ItemKind::Thinking { step: *step, delta: None },
+            ),
+            AgentEvent::ReasoningDelta(text) => (
+                ItemStatus::Updated,
+                ItemKind::Thinking { step: 0, delta: Some(text.clone()) },
+            ),
             AgentEvent::TextDelta(text) => (
                 ItemStatus::Updated,
                 ItemKind::AgentMessage { delta: Some(text.clone()), final_text: None },
@@ -45,6 +50,10 @@ impl AgentEvent {
                     total_tokens: u.total_tokens as u64,
                     cached_prompt_tokens: Some(u.cached_prompt_tokens as u64),
                 }),
+            ),
+            AgentEvent::CapabilitySelection(text) => (
+                ItemStatus::Completed,
+                ItemKind::Info { text: text.clone() },
             ),
         };
         CoreEvent::new(thread_id, turn_id, item_id, status, kind)
@@ -80,6 +89,7 @@ mod tests {
     fn every_agent_event_variant_projects() {
         let cases = vec![
             AgentEvent::Thinking { step: 2 },
+            AgentEvent::ReasoningDelta("hmm".into()),
             AgentEvent::TextDelta("partial".into()),
             AgentEvent::ToolStart { name: "bash".into(), args: json!({"command": "ls"}) },
             AgentEvent::ToolDone { name: "bash".into(), ok: false, output: "denied".into() },
@@ -105,6 +115,19 @@ mod tests {
         let ev = AgentEvent::ToolDone { name: "x".into(), ok: false, output: "no".into() };
         let core = ev.to_core("t", 0, 0);
         assert_eq!(core.status, ItemStatus::Failed);
+    }
+
+    #[test]
+    fn reasoning_delta_projects_as_updated_thinking_not_answer() {
+        let core = AgentEvent::ReasoningDelta("let me think".into()).to_core("t", 1, 4);
+        assert_eq!(core.status, ItemStatus::Updated);
+        // Must be a Thinking item carrying the delta, NOT an AgentMessage.
+        match &core.kind {
+            ItemKind::Thinking { delta: Some(d), .. } => assert_eq!(d, "let me think"),
+            other => panic!("expected Thinking with delta, got {other:?}"),
+        }
+        let back = CoreEvent::from_json(&core.to_json()).expect("wire roundtrip");
+        assert_eq!(back.kind, core.kind);
     }
 
     #[test]

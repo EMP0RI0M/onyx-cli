@@ -208,7 +208,7 @@ pub fn omniroute_config() -> GatewayCfg {
         crate::provider::ProviderSpec {
             id: active_id.clone(),
             name: active_id.clone(),
-            base_url: Some("http://127.0.0.1:8317/v1".to_string()),
+            base_url: Some("http://127.0.0.1:20128/v1".to_string()),
             env_var: Some("OPENAI_API_KEY".to_string()),
             auth_type: "bearer".to_string(),
             streaming_format: "sse".to_string(),
@@ -260,6 +260,43 @@ pub fn default_context_budget() -> usize {
         .unwrap_or(12_000)
 }
 
+/// The tool surface for one turn, projected from the full catalog by retrieval.
+/// Both fields describe the same set: `catalog` is what the model reads, `defs` is
+/// what it may call, and a mismatch means a tool the model was told about but
+/// cannot invoke (or vice versa).
+#[derive(Clone, Debug)]
+pub struct TurnTools {
+    /// `  - name: description\n` lines for the retrieved subset.
+    pub catalog: String,
+    /// OpenAI-shaped definitions for exactly the tools in `catalog`.
+    pub defs: Vec<Value>,
+    /// Retrieved skill bodies to append after the tool catalog — instructions, so
+    /// they belong with the system prompt rather than as a synthetic user message.
+    pub skills: String,
+}
+
+impl TurnTools {
+    /// The names of exactly the tools this turn offers, in ranked order. The agent
+    /// loop uses this so its own tool list agrees with what the model was shown.
+    pub fn offered_names(&self) -> Vec<String> {
+        self.defs
+            .iter()
+            .filter_map(|d| d["function"]["name"].as_str().map(|s| s.to_string()))
+            .collect()
+    }
+
+    /// One-line summary for the TUI status row: how many offered, and any skills
+    /// unfolded into the prompt.
+    pub fn summary(&self) -> String {
+        let n = self.defs.len();
+        if self.skills.trim().is_empty() {
+            format!("retrieval: offering {n} tools")
+        } else {
+            format!("retrieval: offering {n} tools + skill instructions")
+        }
+    }
+}
+
 /// The live model. Constructed with the gateway coordinates + a rendered tool
 /// catalog (name: description lines) used to teach the model what it may call.
 #[derive(Clone)]
@@ -281,6 +318,17 @@ pub struct HttpModel {
     pub effort: String,
     /// Last reported token usage from the server
     pub last_usage: Option<crate::TokenUsage>,
+    /// Per-turn tool projection (see crate::retrieval). When set, this turn's
+    /// system prompt and `tools` array come from here instead of from `catalog` /
+    /// `tool_defs`, which stay the full session catalog. Keeping the two separate is
+    /// what lets retrieval shrink one turn without permanently narrowing the
+    /// session — the next turn can retrieve a different subset, and `/tools` can
+    /// still report what the whole catalog holds.
+    pub turn_tools: Option<TurnTools>,
+    /// Resolved provider endpoint (protocol + auth plan). When present, requests
+    /// route through the provider's own wire protocol instead of the hardcoded
+    /// OpenAI-compat path. `None` keeps the legacy OpenAI behavior intact.
+    pub endpoint: Option<crate::provider::Resolved>,
 }
 
 impl HttpModel {
@@ -297,8 +345,34 @@ impl HttpModel {
             catalog,
             context_budget: default_context_budget(),
             tool_defs: Vec::new(),
+            turn_tools: None,
             effort: "medium".to_string(),
             last_usage: None,
+            endpoint: None,
+        }
+    }
+
+    /// Resolve the active provider's wire protocol for a base URL + key. Falls
+    /// back to `None` (legacy OpenAI-compat) if the spec can't be determined, so
+    /// a bad catalog entry never blocks sending a request.
+    fn resolve_endpoint(base_url: &str, key: &str) -> Option<crate::provider::Resolved> {
+        let active_id = crate::provider::load_storage().active_provider;
+        let spec = crate::provider::find_spec(&active_id)?;
+        crate::provider::resolve(&spec, base_url, key).ok()
+    }
+
+    /// Re-resolve the wire protocol after the host/key changed (e.g. `/provider`
+    /// switch or hot-swap). Keeps `host`/`port` in sync with the resolved endpoint
+    /// so TLS routing (`use_tls`) matches where requests actually go. A failed
+    /// resolution clears the endpoint, falling back to legacy OpenAI-compat.
+    pub fn set_endpoint_for(&mut self, base_url: &str, key: &str) {
+        match Self::resolve_endpoint(base_url, key) {
+            Some(ep) => {
+                self.host = ep.host.clone();
+                self.port = ep.port;
+                self.endpoint = Some(ep);
+            }
+            None => self.endpoint = None,
         }
     }
 
@@ -307,6 +381,7 @@ impl HttpModel {
         let after = cfg.base.split("://").nth(1).unwrap_or(&cfg.base);
         let path_part = after.splitn(2, '/').nth(1).unwrap_or("v1");
         let path = format!("/{}/chat/completions", path_part.trim_end_matches('/'));
+        let endpoint = Self::resolve_endpoint(&cfg.base, &cfg.key);
         Self {
             host: cfg.host.clone(),
             port: cfg.port,
@@ -318,8 +393,10 @@ impl HttpModel {
             catalog,
             context_budget: default_context_budget(),
             tool_defs,
+            turn_tools: None,
             effort: "medium".to_string(),
             last_usage: None,
+            endpoint,
         }
     }
 
@@ -360,6 +437,29 @@ impl HttpModel {
         Ok(ids)
     }
 
+    /// The tool-calling instructions, chosen by whether this turn offers function
+    /// definitions at all. With none, the model has to emit the JSON object form and
+    /// needs the terminate contract spelled out; with definitions, function calling is
+    /// primary and the JSON form is only a fallback.
+    fn protocol_for(has_tools: bool) -> &'static str {
+        if has_tools {
+            "\n\nCall tools via function calling. Batch independent calls in one turn when possible. When finished, call `terminate` with status and the final answer. If a backend ignores function calling, fall back to the JSON object form {\"tool\":\"<name>\",\"args\":{...}}."
+        } else {
+            "\n\nTo call a tool, reply with ONLY a JSON object, no prose:\n  {\"tool\":\"<name>\",\"args\":{...}}\nUse args exactly as the tool needs. When you are finished, call the terminate tool:\n  {\"tool\":\"terminate\",\"args\":{\"status\":\"success\",\"content\":\"<final answer for the user>\"}}\nDo not invent tools. Do not emit more than one JSON object per turn.\nIf the request needs SEVERAL tools, call them one per turn and keep going until you have run EVERY tool the request asks for and gathered each result. Do NOT call terminate until all requested tool work is done; the terminate content must report every result."
+        }
+    }
+
+    /// The effective (catalog, defs) pair for the request about to be built: the
+    /// retrieval projection when one is set for this turn, otherwise the full session
+    /// catalog. One accessor so `build_messages`, `rendered_system` and the body
+    /// builders can never disagree about which tools the model was offered.
+    fn active_tools(&self) -> (&str, &[Value]) {
+        match &self.turn_tools {
+            Some(t) => (t.catalog.as_str(), t.defs.as_slice()),
+            None => (self.catalog.as_str(), self.tool_defs.as_slice()),
+        }
+    }
+
     fn build_messages(&self, history: &[Message]) -> Vec<Value> {
         // Compact the history first when it's estimated to exceed our budget;
         // compaction is a no-op (returns None) for normal conversations.
@@ -372,13 +472,13 @@ impl HttpModel {
             Some(c) => c.as_slice(),
             None => history,
         };
-        let protocol = if self.tool_defs.is_empty() {
-            "\n\nTo call a tool, reply with ONLY a JSON object, no prose:\n  {\"tool\":\"<name>\",\"args\":{...}}\nUse args exactly as the tool needs. When you are finished, call the terminate tool:\n  {\"tool\":\"terminate\",\"args\":{\"status\":\"success\",\"content\":\"<final answer for the user>\"}}\nDo not invent tools. Do not emit more than one JSON object per turn.\nIf the request needs SEVERAL tools, call them one per turn and keep going until you have run EVERY tool the request asks for and gathered each result. Do NOT call terminate until all requested tool work is done; the terminate content must report every result."
-                .to_string()
-        } else {
-            "\n\nCall tools via function calling. Batch independent calls in one turn when possible. When finished, call `terminate` with status and the final answer. If a backend ignores function calling, fall back to the JSON object form {\"tool\":\"<name>\",\"args\":{...}}.".to_string()
-        };
-        let sys = format!("{base}\n\nAvailable tools:\n{catalog}{protocol}", base = self.system, catalog = self.catalog);
+        let (catalog, defs) = self.active_tools();
+        let protocol = Self::protocol_for(!defs.is_empty());
+        let sys = format!(
+            "{base}\n\nAvailable tools:\n{catalog}{protocol}{skills}",
+            base = self.system,
+            skills = self.turn_tools.as_ref().map(|t| t.skills.as_str()).unwrap_or("")
+        );
         let mut msgs = vec![json!({ "role": "system", "content": sys })];
         for m in history {
             match m.role.as_str() {
@@ -393,6 +493,148 @@ impl HttpModel {
             }
         }
         msgs
+    }
+
+    /// The system prompt with the tool catalog + protocol guidance appended. The
+    /// adapters take this verbatim (OpenAI as a `system` message, Anthropic as the
+    /// top-level `system`, Gemini as `systemInstruction`).
+    fn rendered_system(&self) -> String {
+        let (catalog, defs) = self.active_tools();
+        format!(
+            "{base}\n\nAvailable tools:\n{catalog}{protocol}{skills}",
+            base = self.system,
+            protocol = Self::protocol_for(!defs.is_empty()),
+            skills = self.turn_tools.as_ref().map(|t| t.skills.as_str()).unwrap_or("")
+        )
+    }
+
+    fn max_tokens_cfg() -> u32 {
+        std::env::var("ONYX_MAX_TOKENS")
+            .or_else(|_| std::env::var("TEK_MAX_TOKENS"))
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4096)
+    }
+
+    /// Build the request context the resolved adapter needs for one call.
+    fn make_ctx<'a>(&'a self, stream: bool) -> crate::provider::RequestCtx<'a> {
+        crate::provider::RequestCtx {
+            model: &self.model,
+            key: &self.key,
+            temperature: self.temperature,
+            max_tokens: Self::max_tokens_cfg(),
+            effort: &self.effort,
+            stream,
+            tools: self.active_tools().1,
+            system: "", // filled below via owned string
+        }
+    }
+
+    /// Record usage reported by an adapter into `last_usage`.
+    fn apply_usage(&mut self, u: Option<crate::provider::Usage>) {
+        if let Some(u) = u {
+            self.last_usage = Some(crate::TokenUsage {
+                prompt_tokens: u.prompt_tokens,
+                completion_tokens: u.completion_tokens,
+                total_tokens: u.total_tokens,
+                cached_prompt_tokens: u.cached_prompt_tokens,
+            });
+        }
+    }
+
+    /// Turn a parsed reply (from either protocol path) into a Step.
+    fn step_from_parsed(&mut self, p: crate::provider::ParsedReply) -> Step {
+        self.apply_usage(p.usage);
+        if p.tool_calls.is_empty() && p.content.trim().is_empty() {
+            return Step::Final("[model returned empty content]".to_string());
+        }
+        self.to_step(&p.content, p.tool_calls)
+    }
+
+    /// Non-streaming call routed through the resolved provider protocol.
+    fn next_step_protocol(&mut self, history: &[Message]) -> Step {
+        let ep = match &self.endpoint {
+            Some(ep) => ep,
+            None => return Step::Final("[no endpoint]".to_string()),
+        };
+        let sys = self.rendered_system();
+        let mut ctx = self.make_ctx(false);
+        ctx.system = &sys;
+        let body = ep.protocol.build_body(&ctx, history);
+        let body_str = body.to_string();
+        let (bearer, hdrs) = ep.headers_for(&ctx);
+        let extra: Vec<crate::provider::Header> =
+            hdrs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        match crate::provider::transport::request(
+            "POST",
+            &ep.host,
+            ep.port,
+            &ep.path,
+            bearer.as_deref(),
+            &extra,
+            Some(&body_str),
+        ) {
+            Ok(raw) => match ep.protocol.parse_reply(&raw) {
+                Ok(p) => self.step_from_parsed(p),
+                Err(e) => Step::Final(format!("[model parse error: {e}]")),
+            },
+            Err(e) => Step::Final(format!("[model http error: {e}]")),
+        }
+    }
+
+    /// Streaming call routed through the resolved provider protocol. Answer-text
+    /// deltas go to `on_delta`; reasoning/thinking deltas go to `on_reasoning` as
+    /// they arrive, so a UI can show them live instead of dumping them at the end.
+    /// Tool calls + usage are stitched by the adapter's `parse_stream_event`.
+    fn next_step_streaming_protocol(
+        &mut self,
+        history: &[Message],
+        on_delta: &mut dyn FnMut(&str),
+        on_reasoning: &mut dyn FnMut(&str),
+    ) -> Step {
+        let ep = match &self.endpoint {
+            Some(ep) => ep,
+            None => return Step::Final("[no endpoint]".to_string()),
+        };
+        if !ep.protocol.streams_via_sse() {
+            // Protocol without SSE framing (e.g. ndjson local): fall back to one
+            // complete body and emit its content as a single delta.
+            let step = self.next_step_protocol(history);
+            if let Step::Final(text) = &step {
+                on_delta(text);
+            }
+            return step;
+        }
+        let sys = self.rendered_system();
+        let mut ctx = self.make_ctx(true);
+        ctx.system = &sys;
+        let body = ep.protocol.build_body(&ctx, history);
+        let body_str = body.to_string();
+        let (bearer, hdrs) = ep.headers_for(&ctx);
+        let extra: Vec<crate::provider::Header> =
+            hdrs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+        let mut acc = crate::provider::StreamAcc::default();
+        let proto = ep.protocol.clone();
+        let result = crate::provider::transport::sse(
+            "POST",
+            &ep.host,
+            ep.port,
+            &ep.path,
+            bearer.as_deref(),
+            &extra,
+            Some(&body_str),
+            "text/event-stream",
+            &mut |data| proto.parse_stream_event(data, &mut acc, on_reasoning),
+        );
+        if let Err(e) = result {
+            return Step::Final(format!("[model stream error: {e}]"));
+        }
+        let parsed = acc.into_parsed();
+        // Reasoning already streamed live via on_reasoning; do NOT re-emit it into
+        // the answer tail. Only the visible answer text goes to on_delta.
+        on_delta(&parsed.content);
+        self.step_from_parsed(parsed)
     }
 
     // Pull the FIRST well-formed JSON object out of a possibly chatty or
@@ -529,7 +771,11 @@ impl HttpModel {
 
 impl crate::Model for HttpModel {
     fn next_step(&mut self, history: &[Message], _tools: &[&str]) -> Step {
+        if self.endpoint.is_some() {
+            return self.next_step_protocol(history);
+        }
         let msgs = self.build_messages(history);
+        let defs = self.active_tools().1;
         // Thinking models spend most of the budget on reasoning_content and, left
         // uncapped, can return an empty `content`, which ends the tool loop before
         // any tool runs. Give every step room for reasoning + a tool call.
@@ -545,8 +791,8 @@ impl crate::Model for HttpModel {
             "max_tokens": max_tokens,
             "stream": false,
         });
-        if !self.tool_defs.is_empty() {
-            body["tools"] = json!(self.tool_defs);
+        if !defs.is_empty() {
+            body["tools"] = json!(defs);
             body["tool_choice"] = json!("auto");
         }
         let body_str = body.to_string();
@@ -572,8 +818,13 @@ impl HttpModel {
         history: &[Message],
         _tools: &[&str],
         on_delta: &mut dyn FnMut(&str),
+        on_reasoning: &mut dyn FnMut(&str),
     ) -> Step {
+        if self.endpoint.is_some() {
+            return self.next_step_streaming_protocol(history, on_delta, on_reasoning);
+        }
         let msgs = self.build_messages(history);
+        let defs = self.active_tools().1.to_vec();
         let max_tokens: u32 = std::env::var("ONYX_MAX_TOKENS")
             .or_else(|_| std::env::var("TEK_MAX_TOKENS"))
             .ok()
@@ -590,8 +841,8 @@ impl HttpModel {
         if !self.effort.is_empty() {
             body["reasoning_effort"] = json!(self.effort);
         }
-        if !self.tool_defs.is_empty() {
-            body["tools"] = json!(self.tool_defs);
+        if !defs.is_empty() {
+            body["tools"] = json!(defs);
             body["tool_choice"] = json!("auto");
         }
         let body_str = body.to_string();
@@ -633,6 +884,11 @@ impl HttpModel {
                 let Some(choice) = v.get("choices").and_then(|c| c.get(0)).map(|c| c.clone())
                 else { return true };
                 let delta = choice.get("delta").cloned().unwrap_or(json!({}));
+                if let Some(r) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
+                    if !r.is_empty() {
+                        on_reasoning(r);
+                    }
+                }
                 if let Some(txt) = delta.get("content").and_then(|c| c.as_str()) {
                     if !txt.is_empty() {
                         on_delta(txt);

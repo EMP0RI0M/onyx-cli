@@ -33,6 +33,58 @@ fn catalog_for(gw: &Gateway<dyn Policy>) -> String {
     s
 }
 
+/// Build the per-turn capability retriever from the live gateway + skill catalog,
+/// or `None` when retrieval is disabled. Off unless `ONYX_RETRIEVAL` is set to a
+/// non-empty value, so onyx's default behavior (ship the whole catalog every step)
+/// is unchanged until an operator opts in. `ONYX_USAGE_RANKING=1` additionally
+/// wires the adaptive usage arm.
+fn build_selector(gw: &Gateway<dyn Policy>) -> Option<agent::retrieval::CapabilitySelector> {
+    let enabled = env::var("ONYX_RETRIEVAL").map(|v| !v.is_empty()).unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+    let tool_corpus: Vec<onyx_retrieval::Tool> = gw
+        .tools
+        .names()
+        .iter()
+        .filter_map(|name| gw.tools.get(name))
+        .map(|t| onyx_retrieval::Tool {
+            id: t.name().to_string(),
+            name: t.name().to_string(),
+            description: t.description().to_string(),
+            experimental_searchable_description: None,
+            input_schema: t.schema(),
+            output_schema: serde_json::json!({}),
+        })
+        .collect();
+
+    let mut catalog = skills::SkillCatalog::new();
+    catalog.scan_all_default();
+    let skill_corpus: Vec<onyx_retrieval::Skill> = catalog
+        .all()
+        .into_iter()
+        .map(|sk| onyx_retrieval::Skill {
+            id: sk.name.clone(),
+            name: sk.name.clone(),
+            description: sk.description.clone(),
+            experimental_searchable_description: None,
+            tags: vec![],
+            tools: sk.tools_allowed.clone(),
+            metadata: Default::default(),
+            body: sk.instructions.clone(),
+        })
+        .collect();
+
+    let usage = env::var("ONYX_USAGE_RANKING").map(|v| v == "1" || v == "true").unwrap_or(false);
+    let mut sel = agent::retrieval::CapabilitySelector::new()
+        .with_tools(tool_corpus)
+        .with_skills(skill_corpus);
+    if usage {
+        sel.enable_usage_ranking();
+    }
+    Some(sel)
+}
+
 struct Opts {
     model: Option<String>,
     max_steps: usize,
@@ -116,8 +168,12 @@ fn do_turn<P: Policy + ?Sized>(
     history: &mut Vec<Message>,
     prompt: &str,
     opts: &Opts,
+    sel: Option<&agent::retrieval::CapabilitySelector>,
 ) {
     let mut agent = ToolCallAgent::new(gw);
+    if let Some(sel) = sel {
+        agent = agent.with_selector(sel);
+    }
     agent.max_steps = opts.max_steps;
     match agent.run_turn(hm, prompt, history) {
         Ok(rep) => {
@@ -171,18 +227,31 @@ fn slash_command(line: &str, hm: &mut HttpModel, opts: &mut Opts, history: &mut 
         }
         "/skill" => {
             if let Some(name) = it.next() {
-                if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
-                    let mut catalog = skills::SkillCatalog::new();
-                    catalog.scan_dir(&home.join(".onyx/skills"));
-                    if let Some(sk) = catalog.get(name) {
-                        hm.system = sk.augment_system_prompt(&hm.system);
-                        println!("loaded skill: {}", sk.name);
-                    } else {
-                        println!("skill `{name}` not found in ~/.onyx/skills");
-                    }
+                let mut catalog = skills::SkillCatalog::new();
+                catalog.scan_all_default();
+                if let Some(sk) = catalog.get(name) {
+                    hm.system = sk.augment_system_prompt(&hm.system);
+                    println!("loaded skill: {}", sk.name);
+                } else {
+                    println!("skill `{name}` not found in any skill directory (try /skills)");
                 }
             } else {
-                println!("usage: /skill <name>");
+                println!("usage: /skill <name> (or /skills to list all)");
+            }
+        }
+        "/skills" => {
+            let mut catalog = skills::SkillCatalog::new();
+            catalog.scan_all_default();
+            println!("Available skills ({} total):", catalog.count());
+            let mut sorted: Vec<_> = catalog.skills.values().collect();
+            sorted.sort_by(|a, b| a.name.cmp(&b.name));
+            for sk in sorted {
+                let desc = if sk.description.is_empty() {
+                    "".to_string()
+                } else {
+                    format!(" — {}", sk.description)
+                };
+                println!("  • /skill {}{}", sk.name, desc);
             }
         }
         "/sessions" => {
@@ -220,7 +289,7 @@ fn slash_command(line: &str, hm: &mut HttpModel, opts: &mut Opts, history: &mut 
 }
 
 /// Read stdin as a session: every non-empty line is a turn; slash commands are local.
-fn repl<P: Policy + ?Sized>(gw: &Gateway<P>, hm: &mut HttpModel, opts: &mut Opts) {
+fn repl<P: Policy + ?Sized>(gw: &Gateway<P>, hm: &mut HttpModel, opts: &mut Opts, sel: Option<&agent::retrieval::CapabilitySelector>) {
     let mut history: Vec<Message> = Vec::new();
     let stdin = io::stdin();
     loop {
@@ -240,7 +309,7 @@ fn repl<P: Policy + ?Sized>(gw: &Gateway<P>, hm: &mut HttpModel, opts: &mut Opts
             }
             continue;
         }
-        do_turn(gw, hm, &mut history, line, opts);
+        do_turn(gw, hm, &mut history, line, opts, sel);
     }
     println!("\naudit ({} call(s) this session)", gw.audit.snapshot().len());
 }
@@ -254,9 +323,9 @@ fn build_model(cfg: &agent::model::GatewayCfg, opts: &Opts, catalog: String, def
     hm
 }
 
-fn run_once<P: Policy + ?Sized>(gw: &Gateway<P>, hm: &mut HttpModel, opts: &Opts, prompt: &str) {
+fn run_once<P: Policy + ?Sized>(gw: &Gateway<P>, hm: &mut HttpModel, opts: &Opts, prompt: &str, sel: Option<&agent::retrieval::CapabilitySelector>) {
     let mut history = Vec::new();
-    do_turn(gw, hm, &mut history, prompt, opts);
+    do_turn(gw, hm, &mut history, prompt, opts, sel);
     let audit = gw.audit.snapshot();
     println!("\naudit ({} call(s)):", audit.len());
     for a in &audit {
@@ -326,16 +395,14 @@ fn main() {
     // Load active skill if requested via --skill
     let mut skill_instructions: Option<String> = None;
     if let Some(skill_name) = &opts.skill {
-        if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
-            let mut catalog = skills::SkillCatalog::new();
-            catalog.scan_dir(&home.join(".onyx/skills"));
-            if let Some(sk) = catalog.get(skill_name) {
-                sk.apply_to_tools(&mut tool_col);
-                skill_instructions = Some(sk.instructions.clone());
-            } else {
-                eprintln!("onyx: skill `{skill_name}` not found in ~/.onyx/skills");
-                exit(1);
-            }
+        let mut catalog = skills::SkillCatalog::new();
+        catalog.scan_all_default();
+        if let Some(sk) = catalog.get(skill_name) {
+            sk.apply_to_tools(&mut tool_col);
+            skill_instructions = Some(sk.instructions.clone());
+        } else {
+            eprintln!("onyx: skill `{skill_name}` not found in any skill directory");
+            exit(1);
         }
     }
 
@@ -388,9 +455,10 @@ fn main() {
         *gw.mode.lock().unwrap() = tools::audit::ApprovalMode::Auto;
         eprintln!("onyx: --allow-all → AUTO approval mode (every action runs unattended)");
     }
+    let sel = build_selector(&gw);
     match &print {
-        Some(p) => run_once(&gw, &mut hm, &opts, p),
-        None if opts.legacy => repl(&mut gw, &mut hm, &mut opts),
-        None => tui::tui_session(&mut gw, &mut hm, &mut opts),
+        Some(p) => run_once(&gw, &mut hm, &opts, p, sel.as_ref()),
+        None if opts.legacy => repl(&mut gw, &mut hm, &mut opts, sel.as_ref()),
+        None => tui::tui_session(&mut gw, &mut hm, &mut opts, sel.as_ref()),
     }
 }

@@ -11,3 +11,4 @@ path = "src/lib.rs"
 [dependencies]
 tools = { workspace = true }
 serde_json = { workspace = true }
+skillopt = { workspace = true }
