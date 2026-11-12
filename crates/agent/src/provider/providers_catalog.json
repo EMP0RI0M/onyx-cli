@@ -421,6 +421,21 @@
     "reasoning": false
   },
   {
+    "id": "cliproxyapi",
+    "name": "CLIProxyAPI (Rust / Go)",
+    "base_url": "http://127.0.0.1:8317/v1",
+    "env_var": "CLIPROXY_API_KEY",
+    "auth_type": "none",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "*"
+    ],
+    "model_count": 0,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
     "id": "cloudflare",
     "name": "Cloudflare AI Workers",
     "base_url": "",

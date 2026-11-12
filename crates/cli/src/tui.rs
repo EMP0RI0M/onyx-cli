@@ -3210,19 +3210,23 @@ impl<'a> Tui<'a> {
                 }
             }
             target_id => {
-                let spec_opt = agent::provider::find_spec(target_id);
+                let resolved_id = match target_id.to_lowercase().as_str() {
+                    "cliproxy" | "cliproxyapi-rust" | "cliproxy-rust" => "cliproxyapi",
+                    _ => target_id,
+                };
+                let spec_opt = agent::provider::find_spec(resolved_id);
                 let storage = agent::provider::load_storage();
-                let has_key = storage.providers.get(target_id)
+                let has_key = storage.providers.get(resolved_id)
                     .and_then(|c| c.api_key.as_ref().map(|k| !k.is_empty()))
                     .unwrap_or(false);
                 if let Some(spec) = spec_opt {
                     if spec.auth_type != "none" && !has_key {
                         // Needs an API key: open the input popup immediately!
-                        self.open_connect_wizard_for_provider(target_id);
+                        self.open_connect_wizard_for_provider(resolved_id);
                         return;
                     }
                 }
-                self.switch_to_provider(target_id);
+                self.switch_to_provider(resolved_id);
             }
         }
     }
