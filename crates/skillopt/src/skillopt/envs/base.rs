@@ -1,4 +1,3 @@
-use crate::skillopt::datasets::base::DataLoader;
 use crate::skillopt::types::{BatchSpec, Patch, RolloutResult};
 use async_trait::async_trait;
 use std::collections::HashMap;

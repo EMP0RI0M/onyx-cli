@@ -44,7 +44,33 @@ impl Tool for ReadFile {
             ToolError::BadArgs("missing 'path'".into())
         })?;
         let full = self.resolve(path)?;
-        let content = fs::read_to_string(&full).map_err(ToolError::Io)?;
+        let content = match fs::read_to_string(&full) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // If not found, check if common extension variation exists (e.g. .tsx vs .js, .ts vs .js)
+                let p = Path::new(path);
+                let mut alt_suggestion = None;
+                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                    let parent = p.parent().unwrap_or(Path::new(""));
+                    for ext in &["tsx", "ts", "jsx", "js", "json", "rs", "html", "css"] {
+                        let candidate = parent.join(format!("{stem}.{ext}"));
+                        if let Ok(c_full) = self.resolve(&candidate.to_string_lossy()) {
+                            if c_full.exists() {
+                                alt_suggestion = Some(candidate.to_string_lossy().to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+                let hint = if let Some(alt) = alt_suggestion {
+                    format!(" (Did you mean `{alt}`? That file exists.)")
+                } else {
+                    String::new()
+                };
+                return Err(ToolError::Other(format!("File not found: `{path}`.{hint} Check directory contents with `list_dir`.")));
+            }
+            Err(e) => return Err(ToolError::Io(e)),
+        };
         
         let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
         let limit = args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);

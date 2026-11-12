@@ -1,3 +1,6 @@
 /target
 **/*.rs.bk
 *.log
+.onyx/
+benchmark_results/
+conformance/

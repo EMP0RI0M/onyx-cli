@@ -8,6 +8,8 @@
 
 pub mod audit;
 pub mod bash;
+pub mod capability;
+pub mod compress;
 pub mod control;
 pub mod editor;
 pub mod implementations;
@@ -36,14 +38,39 @@ impl<T: Tool + Send + Sync> SharedTool for T {}
 pub struct Output {
     pub content: String,
     pub is_error: bool,
+    /// Original tool output when a deterministic formatter rewrote `content`.
+    /// Consumers can inspect the complete output without forcing a second run.
+    pub raw_content: Option<String>,
+    /// Parsed once by command-output processing and reusable by downstream consumers.
+    pub observation: Option<compress::CommandObservation>,
 }
 
 impl Output {
     pub fn ok(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: false }
+        Self {
+            content: content.into(),
+            is_error: false,
+            raw_content: None,
+            observation: None,
+        }
     }
     pub fn err(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: true }
+        Self {
+            content: content.into(),
+            is_error: true,
+            raw_content: None,
+            observation: None,
+        }
+    }
+
+    pub fn with_observation(
+        mut self,
+        raw_content: impl Into<String>,
+        observation: compress::CommandObservation,
+    ) -> Self {
+        self.raw_content = Some(raw_content.into());
+        self.observation = Some(observation);
+        self
     }
 }
 
@@ -158,6 +185,7 @@ pub fn default_collection(editor_base: std::path::PathBuf) -> ToolCollection {
 
     // Grok-build tools: read_file, list_dir, grep, search_replace, todo, plan mode, web_fetch, update_goal, task_output, kill_task, wait_tasks, ask_user_question, web_search, send_feedback, send_subagent_message, lsp
     c.add(implementations::grok_build::ReadFile::new(editor_base.clone()));
+    c.add(implementations::grok_build::WriteFile::new(editor_base.clone()));
     c.add(implementations::grok_build::ListDir::new(editor_base.clone()));
     c.add(implementations::grok_build::Grep::new(editor_base.clone()));
     c.add(implementations::grok_build::SearchReplace::new(editor_base.clone()));

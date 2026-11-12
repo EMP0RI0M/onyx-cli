@@ -52,7 +52,15 @@ impl Tool for SearchReplace {
         let content = fs::read_to_string(&full).map_err(ToolError::Io)?;
 
         if !content.contains(old_str) {
-            return Err(ToolError::Other(format!("`old_str` not found in `{path}`")));
+            let norm_old = old_str.replace("\r\n", "\n");
+            let norm_content = content.replace("\r\n", "\n");
+            if norm_content.contains(&norm_old) {
+                let occurrences = norm_content.matches(&norm_old).count();
+                let replaced = norm_content.replace(&norm_old, new_str);
+                fs::write(&full, replaced).map_err(ToolError::Io)?;
+                return Ok(Output::ok(format!("successfully replaced {occurrences} occurrence(s) in `{path}` (with newline normalization)")));
+            }
+            return Err(ToolError::Other(format!("`old_str` not found in `{path}`. Inspect the file with `read_file` first.")));
         }
 
         let occurrences = content.matches(old_str).count();

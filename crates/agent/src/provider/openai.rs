@@ -47,6 +47,7 @@ impl ProviderProtocol for OpenAiCompat {
             "temperature": ctx.temperature,
             "max_tokens": ctx.max_tokens,
             "stream": ctx.stream,
+            "include_reasoning": true,
         });
         if ctx.stream {
             body["stream_options"] = json!({ "include_usage": true });
@@ -112,7 +113,11 @@ impl ProviderProtocol for OpenAiCompat {
         if let Some(txt) = delta.get("content").and_then(|c| c.as_str()) {
             acc.content.push_str(txt);
         }
-        if let Some(r) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
+        let r_opt = delta.get("reasoning_content")
+            .or_else(|| delta.get("reasoning"))
+            .or_else(|| delta.get("thought"))
+            .and_then(|c| c.as_str());
+        if let Some(r) = r_opt {
             if !r.is_empty() {
                 acc.thinking.push_str(r);
                 on_reasoning(r);

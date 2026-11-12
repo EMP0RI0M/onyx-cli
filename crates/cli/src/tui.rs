@@ -703,12 +703,15 @@ fn first_line(s: &str) -> &str {
 }
 
 /// Clean up LLM response text that may contain raw JSON fallback tool blocks
-/// (such as {"tool":"terminate","args":{...}} or {"tool":"ask_human","args":{...}} or {"question": "..."}).
-/// If present, extracts the actual message content so raw JSON schema blobs don't leak into the UI.
+/// (such as {"tool":"terminate","args":{...}} or {"tool":"ask_human","args":{...}} or {"question": "..."}),
+/// or embedded `<think>...</think>` tags from reasoning models.
+/// If present, extracts the actual message content so raw reasoning or JSON schema blobs don't leak into the UI.
 fn clean_model_text(text: &str) -> String {
-    let t = text.trim();
+    let (stripped_think, _) = agent::repetition::strip_think_tags(text);
+    let t = stripped_think.trim();
     // Case 1: `→ tool_name({"question":"..."})` or `→ tool_name({...})` from agent loop tool calls
     if let Some(rest) = t.strip_prefix("→ ") {
+        let rest = rest.trim();
         if let Some(open_paren) = rest.find('(') {
             let tool_name = rest[..open_paren].trim();
             if let Some(close_paren) = rest.rfind(')') {
@@ -720,6 +723,21 @@ fn clean_model_text(text: &str) -> String {
                         }
                     }
                     return inside.trim_matches('"').to_string();
+                }
+            }
+        }
+        // Case 1b: Malformed `→ ask_humanquestion":"..."` or `→ ask_human{"question":"..."}`
+        for prefix in ["ask_human", "ask_user_question", "terminate"] {
+            if rest.starts_with(prefix) {
+                let remainder = &rest[prefix.len()..];
+                for key in ["question", "content", "answer"] {
+                    let marker = format!("\"{key}\":\"");
+                    if let Some(idx) = remainder.find(&marker) {
+                        let start = idx + marker.len();
+                        if let Some(end) = remainder[start..].rfind('\"') {
+                            return remainder[start..start + end].to_string();
+                        }
+                    }
                 }
             }
         }
@@ -954,6 +972,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/init", "bootstrap ONYX.md project memory guide"),
     ("/memory", "view or modify project memory & guidelines"),
     ("/plan", "[goal] toggle plan mode for complex tasks"),
+    ("/diff", "[file] inspect git diff with syntax coloring"),
     ("/review", "structural evaluation of git diff & quality"),
     ("/add-dir", "<path> mount supplemental directory"),
     ("/bashes", "view running background tasks or commands"),
@@ -997,6 +1016,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/logs", "print local error traces and session logs"),
     ("/audit", "gateway policy audit logs"),
     ("/tools", "list registered tools and capabilities"),
+    ("/gain", "report output-compression savings (ONYX_COMPACT)"),
     ("/hex", "<text|-d hex|-b bin|-n dec> base converter"),
     ("/sessions", "list saved session transcripts"),
 
@@ -1087,6 +1107,8 @@ pub struct Tui<'a> {
     connect: Option<ConnectWizard>,
     resume_browser: Option<ResumeBrowser>,
     last_browser_height: usize,
+    cached_diff_stat: Option<String>,
+    last_diff_check: Option<std::time::Instant>,
 }
 
 /// Full-screen "Chat Sessions" picker opened by bare `/resume`. Complements —
@@ -1702,6 +1724,8 @@ impl<'a> Tui<'a> {
             connect: None,
             resume_browser: None,
             last_browser_height: 10,
+            cached_diff_stat: None,
+            last_diff_check: None,
             workspace_dir: std::env::current_dir()
                 .map(|p| {
                     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
@@ -1748,13 +1772,62 @@ impl<'a> Tui<'a> {
         self.ui_rx = Some(ur);
         self.ctl_tx = Some(ct);
 
-        // Open a durable transcript for this run so `/resume` can replay it later.
-        // Best-effort: if persistence fails we simply run without it.
-        let sid = agent::session::new_session_id();
-        let transcript = agent::session::Transcript::open(&sid, &self.hm.model);
-        if let Some(t) = &transcript {
-            self.items.push(Item::Info(format!("session {sid} · {}", t.path().display())));
-        }
+        // Open or resume a durable transcript for this run.
+        // Start a fresh, clean session by default. Only resume previous history
+        // if explicitly requested via --resume <id> (or /resume inside the TUI).
+        let resume_target = self.opts.resume.as_deref();
+        let (_sid, transcript, initial_history) = if let Some(target) = resume_target {
+            if let Some((session_path, msgs)) = agent::session::resolve_session(target) {
+                let id = session_path.file_stem().and_then(|s| s.to_str()).unwrap_or(target).to_string();
+                let restored_items = agent::session::load_transcript_items(&session_path);
+                for item in restored_items {
+                    match item {
+                        agent::session::RestoredItem::User(u) => self.items.push(Item::User(u)),
+                        agent::session::RestoredItem::Assistant(a) => {
+                            let clean = clean_model_text(&a);
+                            if !clean.trim().is_empty() {
+                                self.items.push(Item::Answer(clean));
+                            }
+                        }
+                        agent::session::RestoredItem::Tool { name, args, output } => {
+                            if name != "terminate" && name != "ask_human" && name != "ask_user_question" {
+                                let ok = !output.starts_with("ERROR") && !output.starts_with("DENIED");
+                                let denied = output.starts_with("DENIED");
+                                self.items.push(Item::Tool {
+                                    name,
+                                    args,
+                                    ok,
+                                    denied,
+                                    duration: None,
+                                    output,
+                                });
+                            }
+                        }
+                        agent::session::RestoredItem::Thinking(t) => {
+                            if !t.trim().is_empty() {
+                                self.items.push(Item::Thinking(t));
+                            }
+                        }
+                    }
+                }
+                self.items.push(Item::Info(format!("resumed session {} · {} messages", id, msgs.len())));
+                let t = agent::session::Transcript::open(&id, &self.hm.model);
+                (id, t, msgs)
+            } else {
+                let sid = agent::session::new_session_id();
+                let t = agent::session::Transcript::open(&sid, &self.hm.model);
+                self.items.push(Item::Error(format!("could not find session to resume matching `{target}`")));
+                (sid, t, Vec::new())
+            }
+        } else {
+            let sid = agent::session::new_session_id();
+            let t = agent::session::Transcript::open(&sid, &self.hm.model);
+            if let Some(tr) = &t {
+                self.items.push(Item::Info(format!("session {sid} · {}", tr.path().display())));
+            }
+            (sid, t, Vec::new())
+        };
+
         self.session = transcript;
         let transcript = self.session.take(); // move into the worker below
 
@@ -1765,7 +1838,7 @@ impl<'a> Tui<'a> {
         let job = Box::new(Job {
             gw: self.gw as *const Gateway<dyn tools::policy::Policy>,
             hm: self.hm as *mut HttpModel,
-            history: Box::new(Vec::new()),
+            history: Box::new(initial_history),
             opts: self.opts as *const Opts,
             sel: self.sel.map(|s| s as *const agent::retrieval::CapabilitySelector).unwrap_or(std::ptr::null()),
         });
@@ -1805,6 +1878,16 @@ impl<'a> Tui<'a> {
                 .unwrap_or_else(|| "onyx".to_string());
             let mut ids = TurnIds { turn: 0, item: 0, tool_items: std::collections::HashMap::new() };
 
+            let workdir = std::env::var("ONYX_WORKDIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()));
+
+            let assembler = agent::context_assembler::ContextAssembler::new(
+                &workdir,
+                agent::context_assembler::ContextBudgetConfig::default(),
+            );
+            let mut active_checkpoint: Option<Arc<Mutex<agent::autonomous::TaskCheckpoint>>> = None;
+
             while let Ok(msg) = cr.recv() {
                 match msg {
                     Ctl::Prompt(prompt, max_steps) => {
@@ -1821,12 +1904,91 @@ impl<'a> Tui<'a> {
                         // the whole turn from the returned report instead, which
                         // carries the user+assistant+tool messages even when the
                         // live history is later truncated (cancel) or errored.
-                        let mut agent = ToolCallAgent::new(gw);
+                        let mut agent = ToolCallAgent::new(gw)
+                            .with_context_assembler(&assembler);
                         if let Some(sel) = sel {
                             agent = agent.with_selector(sel);
                         }
+
+                        // Autonomous plan & checkpoint integration for engineering tasks
+                        if agent::autonomous::is_engineering_task(&prompt) {
+                            let task_id = format!("task-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0));
+                            let arch = assembler.get_arch_ref();
+                            let engine = agent::autonomous::AutonomousEngine::new(&arch, &workdir);
+                            let plan = engine.plan_task(&task_id, &prompt);
+                            let mut cp = agent::autonomous::TaskCheckpoint::new(&task_id, &prompt, plan);
+                            cp.session_id = Some(thread_id.clone());
+                            let _ = cp.save_atomic(&workdir);
+                            let cp_arc = Arc::new(Mutex::new(cp));
+                            active_checkpoint = Some(Arc::clone(&cp_arc));
+                            agent = agent.with_checkpoint(cp_arc);
+                        } else if let Some(cp_arc) = &active_checkpoint {
+                            agent = agent.with_checkpoint(Arc::clone(cp_arc));
+                        }
+
                         agent.max_steps = max_steps;
+                        let mut current_step = 0usize;
+                        let mut step_reasoning = String::new();
                         let mut sink = |ev: AgentEvent| {
+                            match &ev {
+                                AgentEvent::Thinking { step } => {
+                                    if !step_reasoning.trim().is_empty() {
+                                        if let Some(t) = &transcript {
+                                            t.push_step_thinking(current_step, &step_reasoning);
+                                        }
+                                        step_reasoning.clear();
+                                    }
+                                    current_step = *step;
+                                }
+                                AgentEvent::ReasoningDelta(delta) => {
+                                    step_reasoning.push_str(delta);
+                                }
+                                AgentEvent::ToolStart { name, args } => {
+                                    if !step_reasoning.trim().is_empty() {
+                                        if let Some(t) = &transcript {
+                                            t.push_step_thinking(current_step, &step_reasoning);
+                                        }
+                                        step_reasoning.clear();
+                                    }
+                                    if let Some(t) = &transcript {
+                                        t.push(&Message {
+                                            role: "assistant".into(),
+                                            content: format!("→ {name}({args})"),
+                                            tool_call: Some(agent::ToolCall {
+                                                name: name.clone(),
+                                                args: args.clone(),
+                                            }),
+                                        });
+                                    }
+                                }
+                                AgentEvent::ToolDone { output, .. } => {
+                                    if let Some(t) = &transcript {
+                                        t.push(&Message {
+                                            role: "tool".into(),
+                                            content: output.clone(),
+                                            tool_call: None,
+                                        });
+                                    }
+                                }
+                                AgentEvent::StallDetected { phrase, step } => {
+                                    if let Some(t) = &transcript {
+                                        t.push_event("stall_detected", *step, phrase);
+                                    }
+                                }
+                                AgentEvent::StepCompleted { step, summary } => {
+                                    if !step_reasoning.trim().is_empty() {
+                                        if let Some(t) = &transcript {
+                                            t.push_step_thinking(*step, &step_reasoning);
+                                        }
+                                        step_reasoning.clear();
+                                    }
+                                    if let Some(t) = &transcript {
+                                        t.push_event("step_completed", *step, summary);
+                                    }
+                                }
+                                _ => {}
+                            }
+
                             let core = match &ev {
                                 AgentEvent::ToolStart { name, .. } => {
                                     let id = { ids.item += 1; ids.item };
@@ -1842,20 +2004,27 @@ impl<'a> Tui<'a> {
                             };
                             let _ = ut.send(UiOut::Core(core));
                         };
-                        let res = agent.run_turn_observed(hm, &prompt, &mut history, &mut sink);
+
+                        // Chronological transcript persistence: user prompt is written first
                         if let Some(t) = &transcript {
-                            // Persist exactly the messages this turn added. On cancel
-                            // or error the live history is rolled back below, but the
-                            // report still holds the full turn, so nothing is lost.
-                            let src: &[Message] = match &res {
-                                Ok(rep) => &rep.history[cut..],
-                                Err(_) => &history[cut..],
-                            };
-                            for m in src {
-                                t.push(m);
+                            if !t.last_is_user(&prompt) {
+                                t.push(&Message::text("user", prompt.clone()));
                             }
                         }
-                        if *cancel.lock().unwrap() {
+
+                        let res = agent.run_turn_observed(hm, &prompt, &mut history, &mut sink);
+                        if let Some(t) = &transcript {
+                            // Flush any remaining reasoning from the final step
+                            if !step_reasoning.trim().is_empty() {
+                                t.push_step_thinking(current_step, &step_reasoning);
+                            }
+                            // Persist final assistant response if turn succeeded or failed with answer
+                            if let Ok(rep) = &res {
+                                t.push(&Message::text("assistant", rep.answer.clone()));
+                            }
+                        }
+                        let is_cancelled = *cancel.lock().unwrap();
+                        if is_cancelled {
                             // Drop everything this cancelled turn appended to memory.
                             history.truncate(cut);
                         }
@@ -1863,33 +2032,46 @@ impl<'a> Tui<'a> {
                         // turn-done edge carrying either (answer, steps) or a
                         // fully rendered error sentence (the UI no longer needs
                         // AgentError variants).
-                        let done = match &res {
-                            Ok(rep) => {
-                                let _ = ut.send(UiOut::Core(onyx_core::CoreEvent::new(
-                                    &thread_id, ids.turn, { ids.item += 1; ids.item },
-                                    onyx_core::ItemStatus::Completed,
-                                    onyx_core::ItemKind::AgentMessage {
-                                        delta: None,
-                                        final_text: Some(rep.answer.clone()),
-                                    },
-                                )));
-                                Ok((rep.answer.clone(), rep.steps))
+                        let done = if is_cancelled {
+                            let cancel_msg = "[turn cancelled by user]".to_string();
+                            if let Some(t) = &transcript {
+                                t.push(&Message::text("assistant", cancel_msg.clone()));
                             }
-                            Err(e) => Err(match e {
-                                AgentError::MaxSteps => format!(
-                                    "reached max steps ({max_steps}) without an answer"
-                                ),
-                                AgentError::DoomLoop { tool, repeats, reason } => match reason {
-                                    DoomReason::RepeatedDenials => format!(
-                                        "agent stuck: {repeats} calls in a row were denied by policy. \
-                                         Consider changing the permission mode or adding allow rules."
+                            Err(cancel_msg)
+                        } else {
+                            match &res {
+                                Ok(rep) => {
+                                    let answer_text = if rep.answer.trim().is_empty() {
+                                        "[model returned empty content]".to_string()
+                                    } else {
+                                        rep.answer.clone()
+                                    };
+                                    let _ = ut.send(UiOut::Core(onyx_core::CoreEvent::new(
+                                        &thread_id, ids.turn, { ids.item += 1; ids.item },
+                                        onyx_core::ItemStatus::Completed,
+                                        onyx_core::ItemKind::AgentMessage {
+                                            delta: None,
+                                            final_text: Some(answer_text.clone()),
+                                        },
+                                    )));
+                                    Ok((answer_text, rep.steps))
+                                }
+                                Err(e) => Err(match e {
+                                    AgentError::MaxSteps => format!(
+                                        "reached max steps ({max_steps}) without an answer"
                                     ),
-                                    DoomReason::RepeatedCalls => format!(
-                                        "agent stuck repeating `{tool}` {repeats}× with no progress"
-                                    ),
-                                },
-                                AgentError::Tool(msg) => format!("tool failed at the gateway: {msg}"),
-                            }),
+                                    AgentError::DoomLoop { tool, repeats, reason } => match reason {
+                                        DoomReason::RepeatedDenials => format!(
+                                            "agent stuck: {repeats} calls in a row were denied by policy. \
+                                             Consider changing the permission mode or adding allow rules."
+                                        ),
+                                        DoomReason::RepeatedCalls => format!(
+                                            "agent stuck repeating `{tool}` {repeats}× with no progress"
+                                        ),
+                                    },
+                                    AgentError::Tool(msg) => format!("tool failed at the gateway: {msg}"),
+                                }),
+                            }
                         };
                         let _ = ut.send(UiOut::TurnDone(done));
                     }
@@ -1923,6 +2105,7 @@ impl<'a> Tui<'a> {
                         thread_id = sid;
                         transcript = None; // main thread already opened the replay transcript
                     }                    Ctl::SetModel(m) => {
+                        hm.context_budget = agent::model::context_window_for_model(&m);
                         hm.model = m;
                         let _ = ut.send(UiOut::ModelName(hm.model.clone()));
                     }
@@ -2118,16 +2301,24 @@ impl<'a> Tui<'a> {
 
                 let desc = pretty_action(name, args);
                 if self.expanded && !output.is_empty() {
+                    let total_lines = output.lines().count();
+                    let shown_lines = total_lines.min(15);
+                    let hidden_lines = total_lines.saturating_sub(shown_lines);
+                    let orig_bytes = output.len();
+
                     out.push(format!("  {dot} {BOLD}{FG_MAIN}{desc}{RESET} {DIM}(ctrl+o to collapse){RESET}"));
+                    out.push(format!("    {DIM}Output: {orig_bytes} bytes · {total_lines} lines (showing {shown_lines}, {hidden_lines} collapsed by TUI viewport){RESET}"));
                     for ol in output.lines().take(15) {
                         let clipped = clip_chars(ol, w.saturating_sub(8));
                         out.push(format!("    {FG_SEC}{clipped}{RESET}"));
                     }
-                    if output.lines().count() > 15 {
-                        out.push(format!("    {DIM}… (more lines hidden){RESET}"));
+                    if hidden_lines > 0 {
+                        out.push(format!("    {DIM}… ({hidden_lines} more lines collapsed in viewport · expand or inspect tool observation){RESET}"));
                     }
                 } else if !output.is_empty() {
-                    out.push(format!("  {dot} {BOLD}{FG_MAIN}{desc}{RESET} {DIM}(ctrl+o to expand){RESET}"));
+                    let total_lines = output.lines().count();
+                    let orig_bytes = output.len();
+                    out.push(format!("  {dot} {BOLD}{FG_MAIN}{desc}{RESET} {DIM}({orig_bytes} bytes, {total_lines} lines · ctrl+o to expand){RESET}"));
                 } else {
                     out.push(format!("  {dot} {BOLD}{FG_MAIN}{desc}{RESET}"));
                 }
@@ -2330,7 +2521,7 @@ impl<'a> Tui<'a> {
                     }
                 });
                 let time_ago = Self::format_relative_time(s.modified);
-                let desc = format!("{:>4} msgs · {:>7}", s.messages, time_ago);
+                let desc = format!("{:>2} turns ({} msgs) · {:>7}", s.user_turns, s.messages, time_ago);
                 if arg.is_empty()
                     || s.id.to_lowercase().contains(&arg.to_lowercase())
                     || display_title.to_lowercase().contains(&arg.to_lowercase())
@@ -3799,12 +3990,21 @@ impl<'a> Tui<'a> {
             "/connect" => self.open_connect_wizard(),
             "/model" | "/models" => {
                 if let Some(m) = arg {
+                    self.hm.context_budget = agent::model::context_window_for_model(m);
+                    self.hm.model = m.to_string();
                     if let Some(tx) = &self.ctl_tx {
                         let _ = tx.send(Ctl::SetModel(m.to_string()));
                     }
                     self.opts.model = Some(m.to_string());
+                    self.items.push(Item::Info(format!(
+                        "switched model to: {} (context window: {} tokens)",
+                        self.hm.model, self.hm.context_budget
+                    )));
                 } else {
-                    self.items.push(Item::Info(format!("model: {}", self.hm.model)));
+                    self.items.push(Item::Info(format!(
+                        "model: {} (context window: {} tokens)",
+                        self.hm.model, self.hm.context_budget
+                    )));
                 }
             }
             "/steps" => {
@@ -3864,7 +4064,7 @@ impl<'a> Tui<'a> {
                         sel.adaptive_status()
                     )));
                 } else {
-                    self.items.push(Item::Info("retrieval OFF (set ONYX_RETRIEVAL=1 to enable per-turn capability selection)".into()));
+                    self.items.push(Item::Info("retrieval OFF (disabled via ONYX_RETRIEVAL=0/off)".into()));
                 }
                 for n in self.gw.tools.names() {
                     let cap = tools::taxonomy::capability_of(&n).label();
@@ -3873,6 +4073,26 @@ impl<'a> Tui<'a> {
             }
             "/mode" => {
                 self.cycle_mode();
+            }
+            "/gain" => {
+                let _on = std::env::var("ONYX_COMPACT").map(|v| v == "1" || v == "true").unwrap_or(true);
+                let report = tools::compress::gain_report();
+                if report.raw_bytes == 0 {
+                    self.items.push(Item::Info(
+                        "unified output compression active · no qualifying tool outputs processed yet this session".into(),
+                    ));
+                } else {
+                    self.items.push(Item::Info(format!(
+                        "compact gain: {} bytes saved ({:.1}%) across {} call(s) · {} bytes shipped to model",
+                        report.bytes_saved, report.reduction_pct, report.calls, report.compacted_bytes
+                    )));
+                    self.items.push(Item::Info(format!(
+                        "estimated context tokens saved: ~{} tokens (estimate, ~4 chars/token) · avg processing latency: {} µs · formatter: {}",
+                        report.estimated_tokens_saved,
+                        report.avg_latency_us,
+                        report.formatter.map(|f| f.as_str()).unwrap_or("none")
+                    )));
+                }
             }
             "/skill" => {
                 if let Some(name) = arg {
@@ -3908,6 +4128,26 @@ impl<'a> Tui<'a> {
                         format!("dropped {n} staged skill update(s)")
                     }));
                 }
+                Some(cmd) if cmd.starts_with("rollback") => {
+                    let parts: Vec<&str> = cmd.split_whitespace().collect();
+                    if parts.len() < 2 {
+                        self.items.push(Item::Error("usage: /skillopt rollback <skill_name> [hash]".into()));
+                    } else {
+                        let skill_name = parts[1];
+                        let target_hash = parts.get(2).copied();
+                        let mut catalog = skills::SkillCatalog::new();
+                        catalog.scan_all_default();
+                        match catalog.rollback_skill(skill_name, target_hash) {
+                            Ok(restored) => {
+                                self.items.push(Item::Info(format!("✓ successfully rolled back `{skill_name}` to `{restored}`")));
+                                let mut refreshed = skills::SkillCatalog::new();
+                                refreshed.scan_all_default();
+                                self.skill_count = refreshed.count();
+                            }
+                            Err(e) => self.items.push(Item::Error(format!("rollback failed: {e}"))),
+                        }
+                    }
+                }
                 Some(name) => self.run_skillopt(Some(name)),
             },
             "/sessions" => {
@@ -3918,8 +4158,9 @@ impl<'a> Tui<'a> {
                 for s in list {
                     let pv = if s.preview.is_empty() { "(no prompt)".to_string() } else { s.preview };
                     self.items.push(Item::Info(format!(
-                        "  {} · {} msg · {}",
+                        "  {} · {} turn(s) ({} msgs) · {}",
                         s.id,
+                        s.user_turns,
                         s.messages,
                         pv
                     )));
@@ -4186,6 +4427,30 @@ impl<'a> Tui<'a> {
                         found = true;
                     }
                 }
+                // Check WorkMemory in workspace
+                let work_mem_path = std::path::Path::new(".onyx/memories/work_memory.json");
+                if work_mem_path.exists() {
+                    let mem = onyx_project::WorkMemory::load_or_init(std::path::Path::new("."));
+                    self.items.push(Item::Info(format!(
+                        "Onyx WorkMemory: {} task summary entries, {} pitfalls recorded",
+                        mem.task_summaries.len(),
+                        mem.pitfalls.len()
+                    )));
+                    found = true;
+                }
+                // Check Hermes Persistent Memory store (~/.onyx/memories/MEMORY.md or ~/.hermes/memories/MEMORY.md)
+                let hermes = tools::implementations::grok_build::HermesMemoryStore::default_paths();
+                let mem_content = hermes.read_memory();
+                let user_content = hermes.read_user();
+                if !mem_content.is_empty() || !user_content.is_empty() {
+                    self.items.push(Item::Info(format!(
+                        "Hermes Persistent Memory ({:?}): MEMORY.md ({} chars), USER.md ({} chars)",
+                        hermes.base_dir,
+                        mem_content.chars().count(),
+                        user_content.chars().count()
+                    )));
+                    found = true;
+                }
                 if !found {
                     self.items.push(Item::Info("no project memory file found (run /init to create ONYX.md)".into()));
                 }
@@ -4200,6 +4465,35 @@ impl<'a> Tui<'a> {
                 self.input = prompt;
                 self.cursor = self.input.len();
                 self.submit();
+            }
+            "/diff" => {
+                let target_file = arg.map(|s| s.trim()).filter(|s| !s.is_empty());
+                let mut cmd = std::process::Command::new("git");
+                cmd.arg("diff");
+                if let Some(file) = target_file {
+                    cmd.arg("--").arg(file);
+                }
+                match cmd.output() {
+                    Ok(out) => {
+                        let diff_text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                        if diff_text.is_empty() {
+                            let msg = match target_file {
+                                Some(f) => format!("No unstaged git changes found for `{f}`."),
+                                None => "No unstaged git changes in working tree.".to_string(),
+                            };
+                            self.items.push(Item::Info(msg));
+                        } else {
+                            let heading = match target_file {
+                                Some(f) => format!("### Git Diff: `{f}`\n\n```diff\n{diff_text}\n```"),
+                                None => format!("### Git Diff\n\n```diff\n{diff_text}\n```"),
+                            };
+                            self.items.push(Item::Answer(heading));
+                        }
+                    }
+                    Err(e) => {
+                        self.items.push(Item::Error(format!("failed to run git diff: {e}")));
+                    }
+                }
             }
             "/review" => {
                 let prompt = "Please inspect the current git diff and perform a comprehensive code review focusing on code quality, potential bugs, style consistency, and security considerations.";
@@ -4581,12 +4875,65 @@ impl<'a> Tui<'a> {
     }
 
     /// `$ONYX_HOME/skills`, defaulting to `~/.onyx/skills`.
+    #[allow(dead_code)]
     fn skills_root() -> Option<PathBuf> {
         let base = match std::env::var("ONYX_HOME") {
             Ok(h) if !h.is_empty() => PathBuf::from(h),
             _ => std::env::var_os("HOME").map(PathBuf::from).and_then(|h| Some(h.join(".onyx")))?,
         };
         Some(base.join("skills"))
+    }
+
+    /// Git diff short summary (+lines -lines) for the current workspace (cached for 5 seconds)
+    fn git_diff_summary(&mut self) -> Option<String> {
+        let now = std::time::Instant::now();
+        if let (Some(last), Some(cached)) = (self.last_diff_check, &self.cached_diff_stat) {
+            if now.duration_since(last) < Duration::from_secs(5) {
+                return Some(cached.clone());
+            }
+        } else if let Some(last) = self.last_diff_check {
+            if now.duration_since(last) < Duration::from_secs(5) {
+                return None;
+            }
+        }
+
+        self.last_diff_check = Some(now);
+
+        let out = std::process::Command::new("git")
+            .args(["diff", "--shortstat"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            self.cached_diff_stat = None;
+            return None;
+        }
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if s.is_empty() {
+            self.cached_diff_stat = None;
+            return None;
+        }
+        // Example output: "6 files changed, 331 insertions(+), 76 deletions(-)"
+        let mut ins = 0;
+        let mut del = 0;
+        for part in s.split(',') {
+            let part = part.trim();
+            if part.contains("insertion") {
+                if let Some(num) = part.split_whitespace().next().and_then(|n| n.parse::<usize>().ok()) {
+                    ins = num;
+                }
+            } else if part.contains("deletion") {
+                if let Some(num) = part.split_whitespace().next().and_then(|n| n.parse::<usize>().ok()) {
+                    del = num;
+                }
+            }
+        }
+        let res = if ins > 0 || del > 0 {
+            Some(format!("+{ins} -{del}"))
+        } else {
+            None
+        };
+        self.cached_diff_stat = res.clone();
+        res
     }
 
     /// Run the SkillOpt-Sleep offline cycle over saved transcripts and gate the
@@ -4850,6 +5197,16 @@ impl<'a> Tui<'a> {
             }
             Err(msg) => self.items.push(Item::Error(msg)),
         }
+
+        // Automatic context compression:
+        // Check if the real token usage has exceeded 85% of the model's total context window.
+        let (_, _, pct) = self.ctx_meter(100);
+        if pct >= 85 {
+            self.items.push(Item::Info(format!(
+                "context window reached {pct}% capacity → running automatic progressive compression"
+            )));
+            self.do_compact();
+        }
     }
 
     // --------------------------------------------------------------- the loop ----
@@ -4895,16 +5252,17 @@ impl<'a> Tui<'a> {
             }
 
             let poll = if self.thinking || self.running {
-                Duration::from_millis(120)
+                Duration::from_millis(100)
             } else {
-                Duration::from_millis(80)
+                Duration::from_millis(250)
             };
             let Some((chars, code)) = pump.next_key(poll) else {
-                // No key within the poll window: this is the idle/animation
-                // beat. Advance the shared tick so the gradient header shimmers
-                // and the thinking spinner turns, then repaint.
-                self.tick += 1;
-                paint(self);
+                // When actively running or thinking, advance tick and repaint to keep spinner lively.
+                // When completely idle with no pending popups or spinners, avoid constant redraw.
+                if self.thinking || self.running || self.connect.is_some() || self.resume_browser.is_some() || self.settings_active {
+                    self.tick += 1;
+                    paint(self);
+                }
                 continue;
             };
 
@@ -5173,16 +5531,22 @@ impl<'a> Tui<'a> {
                     }
                     ('\x03', _) => {
                         if self.running {
-                            *self.cancel.lock().unwrap() = true;
-                            self.items.push(Item::Info("esc pressed — cancelling after the current step…".into()));
+                            let mut c = self.cancel.lock().unwrap();
+                            if !*c {
+                                *c = true;
+                                self.items.push(Item::Info("cancelling after the current step…".into()));
+                            }
                         } else {
                             self.items.push(Item::Info("(ctrl+d ×2 or /exit to quit)".into()));
                         }
                     }
                     ('\x1b', _) => {
                         if self.running {
-                            *self.cancel.lock().unwrap() = true;
-                            self.items.push(Item::Info("cancelling after the current step…".into()));
+                            let mut c = self.cancel.lock().unwrap();
+                            if !*c {
+                                *c = true;
+                                self.items.push(Item::Info("cancelling after the current step…".into()));
+                            }
                         } else if self.input.starts_with('/') {
                             // Dismiss slash command popup and clear input
                             self.input.clear();
@@ -5264,7 +5628,7 @@ impl<'a> Tui<'a> {
                                 self.submit();
                             } else if !self.input.contains(' ') && self.input != *target {
                                 let cmd = target;
-                                if cmd == "/clear" || cmd == "/tools" || cmd == "/exit" || cmd == "/mode" || cmd == "/help" || cmd == "/usage" || cmd == "/audit" || cmd == "/sessions" || cmd == "/settings" {
+                                if cmd == "/clear" || cmd == "/tools" || cmd == "/gain" || cmd == "/exit" || cmd == "/mode" || cmd == "/help" || cmd == "/usage" || cmd == "/audit" || cmd == "/sessions" || cmd == "/settings" {
                                     self.input = cmd.to_string();
                                     self.cursor = self.input.len();
                                     self.slash_selected = 0;
@@ -5405,7 +5769,8 @@ impl<'a> Tui<'a> {
     /// Paint one frame and park the caret on the composer input cell.
     fn draw_ratatui(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) {
         self.sync_size();
-        let _ = terminal.draw(|f| self.render(f));
+        let diff_stat = self.git_diff_summary();
+        let _ = terminal.draw(|f| self.render(f, diff_stat.as_deref()));
     }
 
     /// Convert a legacy styled-ANSI string into a ratatui `Line`. We keep the
@@ -5442,27 +5807,44 @@ impl<'a> Tui<'a> {
                 }
                 let final_c = if j < bytes.len() { bytes[j] as char } else { 'm' };
                 if final_c == 'm' {
-                    match params.as_str() {
-                        "" | "0" => {
-                            pending = None;
-                            is_bold = false;
-                            is_dim = false;
-                        }
-                        "1" => is_bold = true,
-                        "2" => is_dim = true,
-                        p => {
-                            if let Some(rgb) = p.strip_prefix("38;2;") {
-                                let mut it = rgb.split(';');
-                                if let (Some(r), Some(g), Some(b)) =
-                                    (it.next(), it.next(), it.next())
-                                {
-                                    pending = Some((
-                                        r.parse().unwrap_or(255),
-                                        g.parse().unwrap_or(255),
-                                        b.parse().unwrap_or(255),
-                                    ));
-                                }
+                    for part in params.split(';') {
+                        match part {
+                            "" | "0" => {
+                                pending = None;
+                                is_bold = false;
+                                is_dim = false;
                             }
+                            "1" => is_bold = true,
+                            "2" => is_dim = true,
+                            "30" => pending = Some((40, 40, 40)),      // Black
+                            "31" => pending = Some((239, 68, 68)),    // Red
+                            "32" => pending = Some((34, 197, 94)),    // Green
+                            "33" => pending = Some((234, 179, 8)),    // Yellow
+                            "34" => pending = Some((59, 130, 246)),   // Blue
+                            "35" => pending = Some((168, 85, 247)),   // Magenta
+                            "36" => pending = Some((6, 182, 212)),    // Cyan
+                            "37" => pending = Some((240, 240, 240)),  // White
+                            "90" => pending = Some((120, 120, 120)),  // Bright Black / Gray
+                            "91" => pending = Some((248, 113, 113)),  // Bright Red
+                            "92" => pending = Some((74, 222, 128)),   // Bright Green
+                            "93" => pending = Some((250, 204, 21)),   // Bright Yellow
+                            "94" => pending = Some((96, 165, 250)),   // Bright Blue
+                            "95" => pending = Some((192, 132, 252)),  // Bright Magenta
+                            "96" => pending = Some((34, 211, 238)),   // Bright Cyan
+                            "97" => pending = Some((255, 255, 255)),  // Bright White
+                            _ => {}
+                        }
+                    }
+                    if let Some(rgb) = params.strip_prefix("38;2;") {
+                        let mut it = rgb.split(';');
+                        if let (Some(r), Some(g), Some(b)) =
+                            (it.next(), it.next(), it.next())
+                        {
+                            pending = Some((
+                                r.parse().unwrap_or(255),
+                                g.parse().unwrap_or(255),
+                                b.parse().unwrap_or(255),
+                            ));
                         }
                     }
                 }
@@ -5519,7 +5901,7 @@ impl<'a> Tui<'a> {
 
     /// Full-dashboard layout: header · status/context strip · scrolling
     /// transcript · [approval] · [slash dropdown] · composer · hints/footer.
-    fn render(&self, f: &mut Frame) {
+    fn render(&self, f: &mut Frame, diff_stat: Option<&str>) {
         let area = f.area();
         f.buffer_mut().set_style(area, theme::base());
         let w = area.width.max(20) as usize;
@@ -5581,7 +5963,7 @@ impl<'a> Tui<'a> {
         ]);
 
         // ── footer status bar (key-hint row removed per redesign) ──
-        let footer_status = RuLine::from(vec![
+        let mut footer_spans = vec![
             RuSpan::styled("◈ ", theme::accent_bold()),
             RuSpan::styled("ONYX", theme::strong()),
             RuSpan::styled("  ● ", theme::rgb(theme::active_success())),
@@ -5590,7 +5972,12 @@ impl<'a> Tui<'a> {
             RuSpan::styled(format!("{}", self.skill_count), theme::strong()),
             RuSpan::styled(" SKILLS   ", theme::dim()),
             RuSpan::styled(self.hm.model.to_uppercase(), theme::dim()),
-        ]);
+        ];
+        if let Some(ds) = diff_stat {
+            footer_spans.push(RuSpan::styled("   DIFF ", theme::dim()));
+            footer_spans.push(RuSpan::styled(ds.to_string(), theme::rgb(theme::active_success())));
+        }
+        let footer_status = RuLine::from(footer_spans);
 
         // ── settings modal (only when /settings active) ──
         let settings_lines: Vec<RuLine> = if self.settings_active {
@@ -5841,7 +6228,7 @@ impl<'a> Tui<'a> {
         f.render_widget(RuParagraph::new(vec![input_text]), comp_inner);
         // Park the caret inside the composer input row.
         if !self.running {
-            let col = comp_inner.left() + self.caret_col().saturating_sub(2);
+            let col = comp_inner.left() + self.caret_col();
             let row = comp_inner.top();
             f.set_cursor_position((col.min(comp_inner.right().saturating_sub(1)), row));
         }
@@ -5972,7 +6359,7 @@ impl<'a> Tui<'a> {
             let dur = fmt_duration(s.duration_secs);
             let branch = s.branch.clone().unwrap_or_else(|| "-".into());
             let size = fmt_bytes(s.bytes);
-            let meta_line = format!("   {dur} · {branch} · {size}");
+            let meta_line = format!("   {} turns ({} msgs) · {dur} · {branch} · {size}", s.user_turns, s.messages);
 
             let title_style = if is_sel {
                 theme::accent_bold()
@@ -6214,6 +6601,7 @@ pub fn tui_session(
     terminal
         .hide_cursor()
         .ok();
+    terminal.clear().ok();
 
     {
         let mut tui = Tui::new(gw, hm, opts, sel);

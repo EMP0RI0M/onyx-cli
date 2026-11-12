@@ -1,6 +1,5 @@
 use crate::skillopt::types::{BatchSpec, Edit, Patch, RolloutResult};
 use async_trait::async_trait;
-use serde_json::Value;
 
 /// Abstract Task Environment interface for rollouts.
 #[async_trait]

@@ -41,12 +41,12 @@ pub fn new_session_id() -> String {
 
 /// Append-only handle to one session's transcript file.
 pub struct Transcript {
-    path: PathBuf,
+    pub path: PathBuf,
 }
 
 /// The workspace directory recorded for scoping `/resume` to the current
 /// project. Best-effort: `None` when cwd cannot be read.
-fn detect_cwd() -> Option<String> {
+pub fn detect_cwd() -> Option<String> {
     std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned())
 }
 
@@ -126,7 +126,45 @@ impl Transcript {
             rec["tool_call"] = json!({ "name": tc.name, "args": tc.args });
         }
         if let (Ok(mut f), Ok(line)) =
-            (fs::OpenOptions::new().append(true).open(&self.path), serde_json::to_string(&rec))
+            (fs::OpenOptions::new().create(true).append(true).open(&self.path), serde_json::to_string(&rec))
+        {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+
+    /// Append a thinking / reasoning trace to the transcript so it survives TUI restarts.
+    pub fn push_thinking(&self, thinking: &str) {
+        self.push_step_thinking(0, thinking);
+    }
+
+    /// Append a per-step thinking trace with explicit step identifier.
+    pub fn push_step_thinking(&self, step: usize, thinking: &str) {
+        if thinking.trim().is_empty() {
+            return;
+        }
+        let rec = json!({
+            "kind": "thinking",
+            "step": step,
+            "content": thinking,
+            "ts": now_secs(),
+        });
+        if let (Ok(mut f), Ok(line)) =
+            (fs::OpenOptions::new().create(true).append(true).open(&self.path), serde_json::to_string(&rec))
+        {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+
+    /// Append a structured operational event (such as StepCompleted or StallDetected).
+    pub fn push_event(&self, kind: &str, step: usize, detail: &str) {
+        let rec = json!({
+            "kind": kind,
+            "step": step,
+            "content": detail,
+            "ts": now_secs(),
+        });
+        if let (Ok(mut f), Ok(line)) =
+            (fs::OpenOptions::new().create(true).append(true).open(&self.path), serde_json::to_string(&rec))
         {
             let _ = writeln!(f, "{line}");
         }
@@ -151,6 +189,71 @@ impl Transcript {
             .last()
             .map_or(false, |m| m.role == "user" && m.content == content)
     }
+}
+
+/// One restored transcript entry for UI playback on restart or resume.
+#[derive(Debug, Clone)]
+pub enum RestoredItem {
+    User(String),
+    Assistant(String),
+    Tool {
+        name: String,
+        args: String,
+        output: String,
+    },
+    Thinking(String),
+}
+
+/// Load full transcript items (messages, thinking, tool output) for UI replay.
+pub fn load_transcript_items(path: &PathBuf) -> Vec<RestoredItem> {
+    let mut out = Vec::new();
+    let Ok(file) = fs::File::open(path) else { return out };
+    let mut pending_tool_call: Option<(String, String)> = None;
+
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else { break };
+        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        let kind = v.get("kind").and_then(Value::as_str).unwrap_or("");
+        match kind {
+            "thinking" => {
+                if let Some(c) = v.get("content").and_then(Value::as_str) {
+                    out.push(RestoredItem::Thinking(c.to_string()));
+                }
+            }
+            "message" => {
+                let role = v.get("role").and_then(Value::as_str).unwrap_or("");
+                let content = v.get("content").and_then(Value::as_str).unwrap_or("");
+                match role {
+                    "user" => {
+                        pending_tool_call = None;
+                        out.push(RestoredItem::User(content.to_string()));
+                    }
+                    "assistant" => {
+                        if let Some(tc) = v.get("tool_call") {
+                            let name = tc.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                            let args = tc.get("args").map(|a| a.to_string()).unwrap_or_else(|| "{}".to_string());
+                            pending_tool_call = Some((name, args));
+                        } else if !content.is_empty() {
+                            pending_tool_call = None;
+                            out.push(RestoredItem::Assistant(content.to_string()));
+                        }
+                    }
+                    "tool" => {
+                        if let Some((name, args)) = pending_tool_call.take() {
+                            out.push(RestoredItem::Tool {
+                                name,
+                                args,
+                                output: content.to_string(),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Read a stored transcript back into messages, skipping the header and any
@@ -185,6 +288,8 @@ pub struct SessionInfo {
     pub id: String,
     pub preview: String,
     pub messages: usize,
+    /// Number of actual user prompts (turns), distinct from total message entries.
+    pub user_turns: usize,
     /// Analyst-set title from the meta record (`/rename`), if any.
     pub title: Option<String>,
     #[allow(dead_code)]
@@ -316,10 +421,12 @@ pub fn list_sessions_scoped(limit: usize, scope_cwd: Option<&str>) -> Vec<Sessio
                 None
             }
         });
+        let user_turns = msgs.iter().filter(|m| m.role == "user").count();
         infos.push(SessionInfo {
             id,
             preview,
             messages: msgs.len(),
+            user_turns,
             title,
             modified,
             cwd,

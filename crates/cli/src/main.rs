@@ -17,8 +17,10 @@ use agent::model::{omniroute_config, HttpModel};
 use agent::{AgentError, Message, ToolCallAgent};
 use std::env;
 use std::io::{self, BufRead, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::exit;
+use std::time::Duration;
 use tools::audit::{Approval, Gateway};
 use guardian::HttpJudge;
 use tools::policy::{AllowAll, BashGuard, Chained, DynChained, Guardian, Policy};
@@ -34,12 +36,20 @@ fn catalog_for(gw: &Gateway<dyn Policy>) -> String {
 }
 
 /// Build the per-turn capability retriever from the live gateway + skill catalog,
-/// or `None` when retrieval is disabled. Off unless `ONYX_RETRIEVAL` is set to a
-/// non-empty value, so onyx's default behavior (ship the whole catalog every step)
-/// is unchanged until an operator opts in. `ONYX_USAGE_RANKING=1` additionally
-/// wires the adaptive usage arm.
+/// or `None` when retrieval is disabled.
+///
+/// Deterministic BM25 retrieval is activated by default:
+/// - Unset: BM25 enabled.
+/// - "1", "true", "bm25": BM25 enabled.
+/// - "0", "false", "off": explicitly disabled.
+/// - "hybrid": hybrid retrieval (only when embeddings & models are available).
+/// `ONYX_USAGE_RANKING=1` additionally wires the adaptive usage arm.
 fn build_selector(gw: &Gateway<dyn Policy>) -> Option<agent::retrieval::CapabilitySelector> {
-    let enabled = env::var("ONYX_RETRIEVAL").map(|v| !v.is_empty()).unwrap_or(false);
+    let mode = env::var("ONYX_RETRIEVAL").unwrap_or_else(|_| "bm25".to_string()).to_lowercase();
+    let enabled = match mode.trim() {
+        "0" | "false" | "off" => false,
+        _ => true,
+    };
     if !enabled {
         return None;
     }
@@ -86,22 +96,27 @@ fn build_selector(gw: &Gateway<dyn Policy>) -> Option<agent::retrieval::Capabili
 }
 
 struct Opts {
+    doctor: bool,
     model: Option<String>,
     max_steps: usize,
     allow_all: bool,
     guardian: bool,
     sandbox: bool,
     skill: Option<String>,
+    resume: Option<String>,
+    fresh: bool,
     print: Option<String>,
     legacy: bool,
 }
 
 fn parse_args(args: Vec<String>) -> Result<Opts, String> {
-    let mut o = Opts { model: None, max_steps: 8, allow_all: false, guardian: false, sandbox: false, skill: None, print: None, legacy: false };
+    let mut o = Opts { doctor: false, model: None, max_steps: 8, allow_all: false, guardian: false, sandbox: false, skill: None, resume: None, fresh: false, print: None, legacy: false };
     let mut i = 0;
     let mut positional: Vec<String> = Vec::new();
     while i < args.len() {
         match args[i].as_str() {
+            "doctor" | "--doctor" => o.doctor = true,
+            "--fresh" | "-f" => o.fresh = true,
             "--model" => {
                 i += 1;
                 o.model = Some(args.get(i).ok_or("--model needs a value")?.clone());
@@ -117,6 +132,10 @@ fn parse_args(args: Vec<String>) -> Result<Opts, String> {
             "--skill" => {
                 i += 1;
                 o.skill = Some(args.get(i).ok_or("--skill needs a name")?.clone());
+            }
+            "--resume" | "-r" => {
+                i += 1;
+                o.resume = Some(args.get(i).ok_or("--resume needs a task ID or session ID")?.clone());
             }
             "--print" | "-p" => {
                 i += 1;
@@ -135,12 +154,168 @@ fn parse_args(args: Vec<String>) -> Result<Opts, String> {
 
 fn usage() {
     eprintln!(
-        "usage: onyx [--model auto] [--max-steps N] [--allow-all] [--guardian] [--sandbox] [--skill NAME]\n\
-         \t  [--print PROMPT | --legacy]\n\
+        "usage: onyx [--model auto] [--max-steps N] [--allow-all] [--guardian] [--sandbox] [--skill NAME] [--resume TASK_ID]\n\
+         \t  [--fresh] [--print PROMPT | --legacy]\n\
+         \t  onyx doctor\n\
          env: ONYX_BASE_URL (default http://127.0.0.1:20128/v1), ONYX_API_KEY, ONYX_MODEL,\n\
               ONYX_MAX_TOKENS, ONYX_WORKDIR, ONYX_GUARDIAN=1 (LLM risk judge before actions),\n\
               ONYX_SANDBOX=1 (kernel-enforced sandbox for bash)"
     );
+}
+
+fn doctor_result(label: &str, result: Result<String, String>, failures: &mut usize) {
+    match result {
+        Ok(detail) => println!("[OK]   {label}: {detail}"),
+        Err(detail) => {
+            *failures += 1;
+            println!("[FAIL] {label}: {detail}");
+        }
+    }
+}
+
+fn base_path(base: &str) -> String {
+    let after_scheme = base.split_once("://").map(|(_, rest)| rest).unwrap_or(base);
+    let path = after_scheme
+        .find('/')
+        .map(|idx| &after_scheme[idx..])
+        .unwrap_or("");
+    path.trim_end_matches('/').to_string()
+}
+
+fn doctor_mcp(failures: &mut usize) {
+    let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
+        println!("[WARN] HOME: not set; skipped MCP configuration");
+        return;
+    };
+    let path = home.join(".onyx/mcp.json");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            println!("[WARN] MCP: no configuration at {}", path.display());
+            return;
+        }
+        Err(err) => {
+            *failures += 1;
+            println!("[FAIL] MCP: cannot read {}: {err}", path.display());
+            return;
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(value) => value,
+        Err(err) => {
+            *failures += 1;
+            println!("[FAIL] MCP: invalid JSON in {}: {err}", path.display());
+            return;
+        }
+    };
+    let Some(servers) = value.get("mcpServers").and_then(|v| v.as_object()) else {
+        *failures += 1;
+        println!("[FAIL] MCP: expected an object at `mcpServers`");
+        return;
+    };
+    if servers.is_empty() {
+        println!("[WARN] MCP: configuration contains no servers");
+        return;
+    }
+    for (name, server) in servers {
+        let host = server.get("host").and_then(|v| v.as_str());
+        let port = server.get("port").and_then(|v| v.as_u64()).and_then(|p| u16::try_from(p).ok());
+        let (Some(host), Some(port)) = (host, port) else {
+            *failures += 1;
+            println!("[FAIL] MCP {name}: expected string `host` and u16 `port`");
+            continue;
+        };
+        let address = match (host, port).to_socket_addrs().ok().and_then(|mut addrs| addrs.next()) {
+            Some(address) => address,
+            None => {
+                *failures += 1;
+                println!("[FAIL] MCP {name}: cannot resolve {host}:{port}");
+                continue;
+            }
+        };
+        match TcpStream::connect_timeout(&address, Duration::from_secs(2)) {
+            Ok(_) => println!("[OK]   MCP {name}: reachable at {host}:{port}"),
+            Err(err) => {
+                *failures += 1;
+                println!("[FAIL] MCP {name}: {host}:{port} unreachable: {err}");
+            }
+        }
+    }
+}
+
+fn run_doctor() -> i32 {
+    println!("onyx doctor");
+    println!("-----------");
+    let cfg = omniroute_config();
+    println!("Gateway: {}:{} ({})", cfg.host, cfg.port, cfg.base);
+    println!("Model: {}", cfg.model);
+    println!("API key: {}", if cfg.key.is_empty() { "not set (may be valid for local gateways)" } else { "set (value hidden)" });
+
+    let mut failures = 0;
+    doctor_result(
+        "Configuration",
+        if cfg.base.is_empty() || cfg.host.is_empty() {
+            Err("gateway base URL is empty".into())
+        } else {
+            Ok("loaded".into())
+        },
+        &mut failures,
+    );
+
+    let workdir = env::var("ONYX_WORKDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| env::current_dir().unwrap_or_else(|_| env::temp_dir()));
+    doctor_result(
+        "Workdir",
+        match std::fs::metadata(&workdir) {
+            Ok(meta) if meta.is_dir() => Ok(workdir.display().to_string()),
+            Ok(_) => Err(format!("{} is not a directory", workdir.display())),
+            Err(err) => Err(format!("{}: {err}", workdir.display())),
+        },
+        &mut failures,
+    );
+
+    let health_base = base_path(&cfg.base);
+    let health_paths = if health_base.is_empty() {
+        vec!["/health".to_string()]
+    } else {
+        vec![format!("{health_base}/health"), "/health".to_string()]
+    };
+    let mut health = Err("no health endpoint responded".to_string());
+    for path in health_paths {
+        let auth = (!cfg.key.is_empty()).then_some(cfg.key.as_str());
+        match agent::model::http_request("GET", &cfg.host, cfg.port, &path, auth, None) {
+            Ok(body) => {
+                health = Ok(format!("{path} responded ({})", body.trim().chars().take(80).collect::<String>()));
+                break;
+            }
+            Err(err) => health = Err(err),
+        }
+    }
+    doctor_result("Gateway health", health, &mut failures);
+
+    let model_probe = agent::model::HttpModel::from_cfg(&cfg, String::new(), Vec::new()).list_models();
+    doctor_result(
+        "Model discovery",
+        model_probe.map(|models| {
+            if models.is_empty() {
+                "endpoint responded but returned no models".to_string()
+            } else {
+                format!("{} model(s) available", models.len())
+            }
+        }),
+        &mut failures,
+    );
+
+    doctor_mcp(&mut failures);
+    println!();
+    if failures == 0 {
+        println!("Doctor found no blocking issues.");
+        0
+    } else {
+        println!("Doctor found {failures} blocking issue(s).");
+        1
+    }
 }
 
 /// Ask-before-execute approver wired into the BashGuard policy's `Ask` arm.
@@ -175,6 +350,29 @@ fn do_turn<P: Policy + ?Sized>(
         agent = agent.with_selector(sel);
     }
     agent.max_steps = opts.max_steps;
+
+    let workdir = std::env::var("ONYX_WORKDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()));
+
+    let assembler = agent::context_assembler::ContextAssembler::new(
+        &workdir,
+        agent::context_assembler::ContextBudgetConfig::default(),
+    );
+    agent = agent.with_context_assembler(&assembler);
+
+    // If genuine engineering task, create or load checkpoint
+    if agent::autonomous::is_engineering_task(prompt) {
+        let task_id = format!("task-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0));
+        let arch = assembler.get_arch_ref();
+        let engine = agent::autonomous::AutonomousEngine::new(&arch, &workdir);
+        let plan = engine.plan_task(&task_id, prompt);
+        let mut cp = agent::autonomous::TaskCheckpoint::new(&task_id, prompt, plan);
+        let _ = cp.save_atomic(&workdir);
+        let cp_arc = std::sync::Arc::new(std::sync::Mutex::new(cp));
+        agent = agent.with_checkpoint(cp_arc);
+    }
+
     match agent.run_turn(hm, prompt, history) {
         Ok(rep) => {
             let start = history.iter().rposition(|m| m.role == "user").unwrap_or(0);
@@ -185,11 +383,13 @@ fn do_turn<P: Policy + ?Sized>(
                     "tool" => "TOOL ",
                     r => r,
                 };
-                let one = m.content.replace('\n', " ");
+                let (clean_m, _) = agent::repetition::strip_think_tags(&m.content);
+                let one = clean_m.replace('\n', " ");
                 let one = if one.len() > 200 { format!("{}…", one.chars().take(200).collect::<String>()) } else { one };
                 println!("{tag}│ {one}");
             }
-            println!("\nANSWER: {}", rep.answer);
+            let (clean_ans, _) = agent::repetition::strip_think_tags(&rep.answer);
+            println!("\nANSWER: {}", clean_ans);
         }
         Err(AgentError::MaxSteps) => {
             eprintln!("error: reached max_steps ({}) without terminating", opts.max_steps);
@@ -319,7 +519,16 @@ fn build_model(cfg: &agent::model::GatewayCfg, opts: &Opts, catalog: String, def
     if let Some(m) = &opts.model {
         hm.model = m.clone();
     }
-    hm.system = "You are onyx, a precise agentic coding assistant. Use tools to act; when done, call terminate with the final answer.".to_string();
+    let mut cat = skills::SkillCatalog::new();
+    cat.scan_all_default();
+    let mut skill_names: Vec<_> = cat.skills.keys().cloned().collect();
+    skill_names.sort();
+    let skill_summary = format!(
+        "You are onyx, a precise agentic coding assistant. You have {} installed skills available in your workspace (loadable via /skill <name>): {}. Use tools to act; when done, call terminate with the final answer.",
+        cat.count(),
+        skill_names.join(", ")
+    );
+    hm.system = skill_summary;
     hm
 }
 
@@ -341,6 +550,10 @@ fn main() {
         Err(e) if e == "help" => { usage(); exit(0); }
         Err(e) => { eprintln!("onyx: {e}"); usage(); exit(2); }
     };
+
+    if opts.doctor {
+        exit(run_doctor());
+    }
 
     let cfg = omniroute_config();
     let workdir = env::var("ONYX_WORKDIR")
@@ -456,6 +669,67 @@ fn main() {
         eprintln!("onyx: --allow-all → AUTO approval mode (every action runs unattended)");
     }
     let sel = build_selector(&gw);
+    // Handle --resume <task-id>
+    if let Some(target_id) = &opts.resume {
+        println!("Checking checkpoint recovery for task: {target_id}...");
+        if let Some(cp) = agent::autonomous::TaskCheckpoint::load_checkpoint(&workdir, target_id) {
+            println!("Loaded checkpoint for task `{}`:", cp.task_id);
+            println!("  Objective: {}", cp.objective);
+            println!("  Completed steps: {:?}", cp.completed_steps);
+            println!("  Remaining steps: {:?}", cp.remaining_steps);
+            println!("  Modified files: {:?}", cp.modified_files);
+
+            let (unchanged, modified_or_missing) = cp.validate_file_hashes(&workdir);
+            if !modified_or_missing.is_empty() {
+                println!("  ⚠️ WARNING: Files modified outside checkpoint: {:?}", modified_or_missing);
+            } else {
+                println!("  ✓ File integrity verified: {} file(s) intact", unchanged.len());
+            }
+
+            if !cp.verification_results.is_empty() {
+                println!("  Previous verifications: {:?}", cp.verification_results);
+            }
+
+            // Restore conversation history if transcript exists
+            let mut resumed_history = Vec::new();
+            if let Some(sess_id) = &cp.session_id {
+                let sess_path = agent::session::sessions_dir().join(format!("{sess_id}.jsonl"));
+                resumed_history = agent::session::load_messages(&sess_path);
+            }
+            if resumed_history.is_empty() {
+                resumed_history.push(Message::text("system", hm.system.clone()));
+                resumed_history.push(Message::text("user", format!("Resume task {}: {}", cp.task_id, cp.objective)));
+            }
+
+            println!("Resuming task execution with {} history message(s)...", resumed_history.len());
+            let cp_arc = std::sync::Arc::new(std::sync::Mutex::new(cp));
+            let assembler = agent::context_assembler::ContextAssembler::new(
+                &workdir,
+                agent::context_assembler::ContextBudgetConfig::default(),
+            );
+            let mut agent = ToolCallAgent::new(&gw)
+                .with_context_assembler(&assembler)
+                .with_checkpoint(cp_arc);
+            if let Some(s) = sel.as_ref() {
+                agent = agent.with_selector(s);
+            }
+            agent.max_steps = opts.max_steps;
+
+            match agent.run_turn(&mut hm, &format!("Continue task {}", target_id), &mut resumed_history) {
+                Ok(rep) => {
+                    println!("\nANSWER: {}", rep.answer);
+                }
+                Err(e) => {
+                    eprintln!("Execution error during resumed turn: {:?}", e);
+                }
+            }
+            return;
+        } else {
+            eprintln!("onyx: no checkpoint found for task `{target_id}` in .onyx/checkpoints/");
+            exit(1);
+        }
+    }
+
     match &print {
         Some(p) => run_once(&gw, &mut hm, &opts, p, sel.as_ref()),
         None if opts.legacy => repl(&mut gw, &mut hm, &mut opts, sel.as_ref()),

@@ -289,6 +289,7 @@ impl CapabilitySelector {
             catalog,
             defs,
             skills: self.skill_instructions(&selection.skills),
+            project_context: String::new(),
         });
     }
 
@@ -453,6 +454,16 @@ impl CapabilitySelector {
     /// stream (the inspector, a JSONL file, or a fanout to both).
     pub fn tool_sink(&self) -> Arc<dyn TraceSink> {
         self.tools.sink()
+    }
+
+    /// Access the underlying ToolRegistry.
+    pub fn tool_registry(&self) -> &ToolRegistry {
+        &self.tools
+    }
+
+    /// Access the underlying SkillRegistry.
+    pub fn skill_registry(&self) -> &SkillRegistry {
+        &self.skills
     }
 }
 

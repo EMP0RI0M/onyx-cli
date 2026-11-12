@@ -7,7 +7,7 @@ use skillopt::skillopt::optimizer::scheduler::{LRScheduler, SchedulerMode};
 use skillopt::skillopt::optimizer::slow_update::{
     has_slow_update_field, inject_empty_slow_update_field, replace_slow_update_field,
 };
-use skillopt::skillopt::types::{Edit, EditOp, GateAction, Patch, RolloutResult};
+use skillopt::skillopt::types::{Edit, EditOp, GateAction, Patch};
 use skillopt::skillopt::utils::scoring::{compute_score, skill_hash};
 
 #[tokio::main]

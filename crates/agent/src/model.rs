@@ -249,15 +249,49 @@ pub fn parse_host_port(base: &str) -> (String, u16) {
     }
 }
 
-/// ONYX_CONTEXT_TOKENS (or legacy TEK_CONTEXT_TOKENS) overrides the default
-/// request budget; 0 disables compaction entirely. Default assumes a ~16k
-/// context model with room left for the reply.
+/// Determine the model's native context window limit.
+/// Explicit ONYX_CONTEXT_TOKENS overrides; otherwise detects based on model name
+/// and known model architectures (from 12k up to 1M+ tokens).
+pub fn context_window_for_model(model_name: &str) -> usize {
+    if let Ok(v) = std::env::var("ONYX_CONTEXT_TOKENS").or_else(|_| std::env::var("TEK_CONTEXT_TOKENS")) {
+        if let Ok(n) = v.parse::<usize>() {
+            return n;
+        }
+    }
+    let m = model_name.to_lowercase();
+    if m.contains("1m") || m.contains("1000k") || m.contains("1250k") {
+        1_000_000
+    } else if m.contains("nemotron-3.5-lightning:free") {
+        1_000_000
+    } else if m.contains("nemotron-3.5-lightning") || m.contains("nemotron-3-nano") {
+        256_000
+    } else if m.contains("gemini") {
+        if m.contains("flash") || m.contains("pro") || m.contains("1.5") || m.contains("2.0") {
+            1_000_000
+        } else {
+            128_000
+        }
+    } else if m.contains("claude") {
+        200_000
+    } else if m.contains("qwen") || m.contains("qwq") {
+        131_072
+    } else if m.contains("deepseek") {
+        64_000
+    } else if m.contains("gpt-4") || m.contains("gpt-4o") || m.contains("o1") || m.contains("o3") {
+        128_000
+    } else if m.contains("llama-3") {
+        128_000
+    } else if m.contains("mistral") || m.contains("mixtral") {
+        32_768
+    } else {
+        // Safe conservative default for unspecified models
+        64_000
+    }
+}
+
 pub fn default_context_budget() -> usize {
-    std::env::var("ONYX_CONTEXT_TOKENS")
-        .or_else(|_| std::env::var("TEK_CONTEXT_TOKENS"))
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(12_000)
+    let model = std::env::var("ONYX_MODEL").unwrap_or_default();
+    context_window_for_model(&model)
 }
 
 /// The tool surface for one turn, projected from the full catalog by retrieval.
@@ -273,9 +307,34 @@ pub struct TurnTools {
     /// Retrieved skill bodies to append after the tool catalog — instructions, so
     /// they belong with the system prompt rather than as a synthetic user message.
     pub skills: String,
+    /// Project context string dynamically added to this turn.
+    pub project_context: String,
 }
 
 impl TurnTools {
+    /// Add a tool definition dynamically to this turn.
+    pub fn add_tool(&mut self, name: &str, description: &str, schema: Value) {
+        if self.offered_names().iter().any(|n| n == name) {
+            return;
+        }
+        self.catalog.push_str(&format!("  - {name}: {description}\n"));
+        self.defs.push(json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": schema,
+            }
+        }));
+    }
+
+    /// Add a skill instruction dynamically to this turn.
+    pub fn add_skill(&mut self, name: &str, description: &str, body: &str) {
+        let tag = format!("[Retrieved skill: {name}]");
+        if !self.skills.contains(&tag) {
+            self.skills.push_str(&format!("\n\n[Retrieved skill: {name}]\n{description}\n{body}"));
+        }
+    }
     /// The names of exactly the tools this turn offers, in ranked order. The agent
     /// loop uses this so its own tool list agrees with what the model was shown.
     pub fn offered_names(&self) -> Vec<String> {
@@ -690,15 +749,36 @@ impl HttpModel {
         None
     }
 
+    /// Helper to validate tool name conforms to identifier rules `^[a-zA-Z0-9_-]+$`.
+    pub fn is_valid_tool_name(name: &str) -> bool {
+        !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    }
+
     fn to_step(&self, content: &str, native_tools: Vec<ToolCall>) -> Step {
         if !native_tools.is_empty() {
-            return Step::Calls(native_tools);
+            let mut valid_tools = Vec::new();
+            for tc in native_tools {
+                if Self::is_valid_tool_name(&tc.name) && tc.args.is_object() {
+                    valid_tools.push(tc);
+                } else {
+                    return Step::Final(format!("[model error: malformed tool call `{}` with invalid name or arguments]", tc.name));
+                }
+            }
+            if !valid_tools.is_empty() {
+                return Step::Calls(valid_tools);
+            }
         }
         match Self::extract_json(content) {
             Some(v) => {
                 let name = v.get("tool").and_then(|s| s.as_str()).unwrap_or("");
                 if !name.is_empty() {
+                    if !Self::is_valid_tool_name(name) {
+                        return Step::Final(format!("[model error: malformed fallback tool call with invalid tool name `{name}`]"));
+                    }
                     let args = v.get("args").cloned().unwrap_or_else(|| json!({}));
+                    if !args.is_object() {
+                        return Step::Final(format!("[model error: malformed fallback tool call `{name}` arguments must be a JSON object]"));
+                    }
                     return Step::Calls(vec![ToolCall { name: name.to_string(), args }]);
                 }
                 if let Some(f) = v.get("final").and_then(|s| s.as_str()) {
@@ -707,7 +787,47 @@ impl HttpModel {
                 // JSON without a recognizable shape → treat whole text as answer
                 Step::Final(content.trim().to_string())
             }
-            None => Step::Final(content.trim().to_string()),
+            None => {
+                let trimmed = content.trim();
+                // Check if the model emitted malformed pseudo-call like `→ list_dir(...)`, `→ ask_human(...)` or `→ ask_humanquestion":"...`
+                if let Some(rest) = trimmed.strip_prefix("→ ") {
+                    let rest = rest.trim();
+                    // Pattern 1: Standard function syntax `tool_name(...)`
+                    if let Some(pp) = rest.find('(') {
+                        let cand_name = rest[..pp].trim();
+                        let after_paren = &rest[pp + 1..];
+                        if let Some(cp) = after_paren.rfind(')') {
+                            let inside = after_paren[..cp].trim();
+                            if Self::is_valid_tool_name(cand_name) {
+                                if let Ok(args) = serde_json::from_str::<Value>(inside) {
+                                    if args.is_object() {
+                                        return Step::Calls(vec![ToolCall { name: cand_name.to_string(), args }]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Pattern 2: Stream-corrupted syntax like `ask_humanquestion":"...`
+                    for key in ["question", "content", "command", "query"] {
+                        let marker = format!("{key}\":\"");
+                        if let Some(idx) = rest.find(&marker) {
+                            let prefix = rest[..idx].trim_end_matches(|c: char| {
+                                c == '(' || c == '{' || c == '[' || c == '"' || c == '\'' || c.is_whitespace()
+                            });
+                            if !prefix.is_empty() && Self::is_valid_tool_name(prefix) {
+                                let val_start = idx + marker.len();
+                                if let Some(val_end) = rest[val_start..].rfind('\"') {
+                                    let extracted_val = &rest[val_start..val_start + val_end];
+                                    let args = json!({ key: extracted_val });
+                                    return Step::Calls(vec![ToolCall { name: prefix.to_string(), args }]);
+                                }
+                            }
+                        }
+                    }
+                }
+                Step::Final(trimmed.to_string())
+            }
         }
     }
 
@@ -746,6 +866,8 @@ impl HttpModel {
             .and_then(|c| c.as_str())
             .unwrap_or("")
             .to_string();
+
+        let (content, _extracted_think) = crate::repetition::strip_think_tags(&content);
 
         if let Some(u) = v.get("usage") {
             let prompt_tokens = u.get("prompt_tokens").and_then(|p| p.as_u64()).unwrap_or(0) as usize;
@@ -853,6 +975,7 @@ impl HttpModel {
         let mut calls: std::collections::BTreeMap<usize, (String, String)> =
             std::collections::BTreeMap::new();
         let mut reported_usage: Option<crate::TokenUsage> = None;
+        let mut think_filter = crate::repetition::ThinkTagFilter::new();
 
         let result = http_sse(
             "POST",
@@ -884,15 +1007,27 @@ impl HttpModel {
                 let Some(choice) = v.get("choices").and_then(|c| c.get(0)).map(|c| c.clone())
                 else { return true };
                 let delta = choice.get("delta").cloned().unwrap_or(json!({}));
-                if let Some(r) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
+                let r_opt = delta.get("reasoning_content")
+                    .or_else(|| delta.get("reasoning"))
+                    .or_else(|| delta.get("thought"))
+                    .and_then(|c| c.as_str());
+                if let Some(r) = r_opt {
                     if !r.is_empty() {
                         on_reasoning(r);
                     }
                 }
                 if let Some(txt) = delta.get("content").and_then(|c| c.as_str()) {
                     if !txt.is_empty() {
-                        on_delta(txt);
-                        content.push_str(txt);
+                        think_filter.push(
+                            txt,
+                            |clean_chunk| {
+                                on_delta(clean_chunk);
+                                content.push_str(clean_chunk);
+                            },
+                            |reasoning_chunk| {
+                                on_reasoning(reasoning_chunk);
+                            },
+                        );
                     }
                 }
                 if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
@@ -910,6 +1045,16 @@ impl HttpModel {
                     }
                 }
                 true
+            },
+        );
+
+        think_filter.finish(
+            |clean_chunk| {
+                on_delta(clean_chunk);
+                content.push_str(clean_chunk);
+            },
+            |reasoning_chunk| {
+                on_reasoning(reasoning_chunk);
             },
         );
 

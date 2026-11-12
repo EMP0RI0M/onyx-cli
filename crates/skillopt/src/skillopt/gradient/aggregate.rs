@@ -1,6 +1,6 @@
 use crate::skillopt::model::ChatBackend;
 use crate::skillopt::prompts;
-use crate::skillopt::types::{Edit, Patch};
+use crate::skillopt::types::Patch;
 
 /// Merges a slice of patches in a batch into a single combined patch.
 pub async fn merge_batch(
@@ -143,7 +143,7 @@ pub async fn merge_patches(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::skillopt::types::EditOp;
+    use crate::skillopt::types::{Edit, EditOp};
 
     #[tokio::test]
     async fn test_hierarchical_merge_empty() {

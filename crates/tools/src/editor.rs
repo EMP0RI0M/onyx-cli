@@ -59,9 +59,11 @@ impl Tool for StrReplaceEditor {
                 Ok(txt) => Ok(Output::ok(txt)),
                 Err(e) => Err(ToolError::Io(e)),
             },
-            "create" => {
+            "create" | "write" => {
                 let text = args
                     .get("file_text")
+                    .or_else(|| args.get("content"))
+                    .or_else(|| args.get("text"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 if let Some(parent) = full.parent() {
@@ -82,10 +84,18 @@ impl Tool for StrReplaceEditor {
                 let cur = fs::read_to_string(&full).map_err(ToolError::Io)?;
                 let count = cur.matches(old).count();
                 if count == 0 {
-                    return Ok(Output::err("old_str not found"));
+                    // Try whitespace-normalized match before failing
+                    let norm_old = old.replace("\r\n", "\n");
+                    let norm_cur = cur.replace("\r\n", "\n");
+                    if norm_cur.contains(&norm_old) {
+                        let replaced = norm_cur.replacen(&norm_old, new, 1);
+                        fs::write(&full, &replaced).map_err(ToolError::Io)?;
+                        return Ok(Output::ok(format!("patched {path} (with newline normalization)")));
+                    }
+                    return Ok(Output::err(format!("old_str not found in `{path}`. Inspect the file with `read_file` or `editor view` first.")));
                 }
                 if count > 1 {
-                    return Ok(Output::err(format!("old_str not unique ({count} matches)")));
+                    return Ok(Output::err(format!("old_str not unique ({count} matches in `{path}`). Provide more surrounding context lines.")));
                 }
                 let updated = cur.replace(old, new);
                 fs::write(&full, &updated).map_err(ToolError::Io)?;

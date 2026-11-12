@@ -157,6 +157,10 @@ pub fn sse(
     let mut buf: Vec<u8> = Vec::new();
     let mut tmp = [0u8; 4096];
     let mut past_headers = false;
+    let mut saw_data = false;
+    let mut header_status_code: Option<u16> = None;
+    let mut non_sse_body: Vec<u8> = Vec::new();
+
     loop {
         match sock.read(&mut tmp) {
             Ok(0) => break,
@@ -164,6 +168,14 @@ pub fn sse(
                 buf.extend_from_slice(&tmp[..n]);
                 if !past_headers {
                     if let Some(idx) = find_subslice(&buf, b"\r\n\r\n") {
+                        let header_bytes = &buf[..idx];
+                        let header_text = String::from_utf8_lossy(header_bytes);
+                        if let Some(first_line) = header_text.lines().next() {
+                            let parts: Vec<&str> = first_line.split_whitespace().collect();
+                            if parts.len() >= 2 {
+                                header_status_code = parts[1].parse().ok();
+                            }
+                        }
                         buf.drain(..idx + 4);
                         past_headers = true;
                     } else {
@@ -178,17 +190,35 @@ pub fn sse(
                     let line = line.trim_end_matches(['\r', '\n']);
                     if let Some(data) = line.strip_prefix("data:") {
                         let data = data.trim_start();
+                        saw_data = true;
                         if data == "[DONE]" {
                             return Ok(());
                         }
                         if !data.is_empty() && !on_data(data) {
                             return Ok(());
                         }
+                    } else if !saw_data && !line.trim().is_empty() {
+                        non_sse_body.extend_from_slice(line_raw.as_slice());
                     }
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => break, // timeout / EOF-ish: stop pumping
+        }
+    }
+    if !saw_data {
+        if !buf.is_empty() {
+            non_sse_body.extend_from_slice(&buf);
+        }
+        let remaining = String::from_utf8_lossy(&non_sse_body);
+        let status = header_status_code.unwrap_or(200);
+        if status >= 400 || !remaining.trim().is_empty() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(remaining.trim()) {
+                if let Some(msg) = v.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
+                    return Err(format!("HTTP {status}: {msg}"));
+                }
+            }
+            return Err(format!("HTTP {status}: {}", remaining.trim()));
         }
     }
     Ok(())

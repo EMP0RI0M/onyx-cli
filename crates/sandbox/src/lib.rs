@@ -400,9 +400,8 @@ impl tools::Tool for SandboxedBash {
             .find_map(|k| args.get(*k).and_then(|v| v.as_str()))
             .ok_or_else(|| tools::ToolError::BadArgs("missing `command`".into()))?;
         let (text, code) = run(self.level, cmd, self.cwd.as_deref()).map_err(tools::ToolError::Io)?;
-        let mut content = text;
-        content.push_str(&format!("\n[exit {code}]"));
-        Ok(tools::Output { content, is_error: code != 0 })
+        let is_success = code == 0;
+        Ok(tools::bash::format_command_output(cmd, &text, code, is_success))
     }
 }
 

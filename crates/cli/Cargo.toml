@@ -19,7 +19,12 @@ mcp = { path = "../mcp" }
 skills = { path = "../skills" }
 skillopt = { workspace = true }
 tools = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 libc = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+onyx-project = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.17"

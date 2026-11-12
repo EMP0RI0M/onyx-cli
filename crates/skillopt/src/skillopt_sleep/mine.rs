@@ -97,6 +97,90 @@ pub fn heuristic_mine(digests: &[SessionDigest], max_tasks: usize) -> Vec<TaskRe
     tasks
 }
 
+/// Enrich mined tasks with real Project Intelligence evidence: WorkMemory tasks,
+/// regressions, decisions, and unverified/failing coverage components.
+pub fn mine_with_project_intelligence(
+    digests: &[SessionDigest],
+    work_memory: Option<&onyx_project::WorkMemory>,
+    coverage: Option<&onyx_project::CoverageTracker>,
+    max_tasks: usize,
+) -> Vec<TaskRecord> {
+    let mut tasks = heuristic_mine(digests, max_tasks);
+
+    // If WorkMemory is present, add high-value tasks from project regressions or pitfalls
+    if let Some(mem) = work_memory {
+        for t in &mem.task_summaries {
+            if !t.regressions_discovered.is_empty() || !t.unresolved_questions.is_empty() {
+                let context_desc = format!(
+                    "Regressions: {} | Decisions: {}",
+                    t.regressions_discovered.join("; "),
+                    t.decisions.join("; ")
+                );
+
+                tasks.push(TaskRecord {
+                    id: format!("proj-regress-{}", t.task_id),
+                    project: "project-intelligence".to_string(),
+                    intent: truncate_text(&format!("Prevent regression in {}: {}", t.components_involved.join(", "), t.objective), 800),
+                    context_excerpt: truncate_text(&context_desc, 600),
+                    system: String::new(),
+                    attempted_solution: truncate_text(&t.successful_changes.join("; "), 600),
+                    outcome: "fail".to_string(), // Regression implies prior failure to learn from
+                    reference_kind: "regression_history".to_string(),
+                    reference: t.task_id.clone(),
+                    judge: HashMap::new(),
+                    tags: vec!["evidence:work_memory".to_string(), "type:regression".to_string()],
+                    source_sessions: t.session_id.clone().into_iter().collect(),
+                    split: "train".to_string(),
+                    origin: "work_memory".to_string(),
+                    derived_from: t.task_id.clone(),
+                    skill_hint: String::new(),
+                });
+            }
+
+            if tasks.len() >= max_tasks {
+                break;
+            }
+        }
+    }
+
+    // Ingest failing test evidence from CoverageTracker
+    if let Some(cov) = coverage {
+        for (file, record) in &cov.files {
+            let has_failures = record.evidence_history.iter().any(|ev| {
+                ev.status == onyx_project::VerificationStatus::Failed
+            });
+
+            if has_failures {
+                tasks.push(TaskRecord {
+                    id: format!("cov-fail-{}", generate_task_id("coverage", file)),
+                    project: "coverage".to_string(),
+                    intent: format!("Fix failing verification and regressions in `{file}`"),
+                    context_excerpt: format!("File has failing test evidence. Last hash: {}", record.last_known_hash),
+                    system: String::new(),
+                    attempted_solution: String::new(),
+                    outcome: "fail".to_string(),
+                    reference_kind: "test_failure".to_string(),
+                    reference: file.clone(),
+                    judge: HashMap::new(),
+                    tags: vec!["evidence:coverage_tracker".to_string(), "status:failing_test".to_string()],
+                    source_sessions: vec![],
+                    split: "train".to_string(),
+                    origin: "coverage_tracker".to_string(),
+                    derived_from: file.clone(),
+                    skill_hint: String::new(),
+                });
+            }
+
+            if tasks.len() >= max_tasks {
+                break;
+            }
+        }
+    }
+
+    tasks.truncate(max_tasks);
+    tasks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

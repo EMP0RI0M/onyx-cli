@@ -55,6 +55,14 @@ impl AgentEvent {
                 ItemStatus::Completed,
                 ItemKind::Info { text: text.clone() },
             ),
+            AgentEvent::StallDetected { phrase, step } => (
+                ItemStatus::Failed,
+                ItemKind::Info { text: format!("Generation stall detected at step {step}: repeating '{phrase}'") },
+            ),
+            AgentEvent::StepCompleted { step, summary } => (
+                ItemStatus::Completed,
+                ItemKind::Info { text: format!("Step {step}: {summary}") },
+            ),
         };
         CoreEvent::new(thread_id, turn_id, item_id, status, kind)
     }

@@ -304,8 +304,8 @@ impl SkillCatalog {
     }
 
     /// Write a skill's instructions back to its `SKILL.md`, preserving the
-    /// front-matter. Returns the previous content hash so callers can report
-    /// exactly what changed.
+    /// front-matter. Automatically archives the previous version to `.onyx/skills/backups/`.
+    /// Returns the previous content hash so callers can report exactly what changed.
     ///
     /// Written atomically — temp file beside the target, then rename — so an
     /// interrupted save cannot leave a half-written skill.
@@ -317,6 +317,11 @@ impl SkillCatalog {
             fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
         let skill = Skill::parse(&original).map_err(|e| format!("parse {}: {e}", path.display()))?;
         let previous_hash = skill.content_hash();
+
+        // 1. Archive snapshot to .onyx/skills/backups/
+        if let Err(e) = Self::archive_backup(name, &previous_hash, &original) {
+            eprintln!("warning: failed to write skill backup for {name}: {e}");
+        }
 
         let front = front_matter_of(&original)?;
         let mut doc = String::with_capacity(front.len() + instructions.len() + 16);
@@ -330,6 +335,88 @@ impl SkillCatalog {
         fs::write(&tmp, &doc).map_err(|e| format!("write {}: {e}", tmp.display()))?;
         fs::rename(&tmp, &path).map_err(|e| format!("rename {}: {e}", path.display()))?;
         Ok(previous_hash)
+    }
+
+    /// Archive a previous version snapshot of a skill under `.onyx/skills/backups/`.
+    pub fn archive_backup(name: &str, hash: &str, content: &str) -> Result<(), String> {
+        let root = std::env::var("ONYX_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::env::var("HOME")
+                    .map(|h| std::path::Path::new(&h).join(".onyx"))
+                    .unwrap_or_else(|_| std::path::PathBuf::from(".onyx"))
+            });
+
+        let backup_dir = root.join("skills").join("backups");
+        fs::create_dir_all(&backup_dir).map_err(|e| format!("create backup dir: {e}"))?;
+
+        let filename = format!("{name}.{hash}.md");
+        let target = backup_dir.join(&filename);
+        let tmp = backup_dir.join(format!(".{filename}.tmp"));
+
+        fs::write(&tmp, content).map_err(|e| format!("write backup: {e}"))?;
+        fs::rename(&tmp, &target).map_err(|e| format!("rename backup: {e}"))?;
+        Ok(())
+    }
+
+    /// Roll back a skill to a specific previous hash or the most recent backup.
+    pub fn rollback_skill(&self, name: &str, target_hash: Option<&str>) -> Result<String, String> {
+        let path = self
+            .skill_path(name)
+            .ok_or_else(|| format!("no SKILL.md found for `{name}`"))?;
+
+        let root = std::env::var("ONYX_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::env::var("HOME")
+                    .map(|h| std::path::Path::new(&h).join(".onyx"))
+                    .unwrap_or_else(|_| std::path::PathBuf::from(".onyx"))
+            });
+
+        let backup_dir = root.join("skills").join("backups");
+        if !backup_dir.exists() {
+            return Err("no backups directory found".to_string());
+        }
+
+        let backup_file = match target_hash {
+            Some(h) => {
+                let candidate = backup_dir.join(format!("{name}.{h}.md"));
+                if !candidate.exists() {
+                    return Err(format!("backup for hash `{h}` not found"));
+                }
+                candidate
+            }
+            None => {
+                // Find most recent backup for this skill name
+                let mut matches = Vec::new();
+                for entry in fs::read_dir(&backup_dir).map_err(|e| e.to_string())?.flatten() {
+                    let fname = entry.file_name().to_string_lossy().to_string();
+                    if fname.starts_with(&format!("{name}.")) && fname.ends_with(".md") {
+                        if let Ok(meta) = entry.metadata() {
+                            let mod_time = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                            matches.push((entry.path(), mod_time));
+                        }
+                    }
+                }
+                matches.sort_by(|a, b| b.1.cmp(&a.1));
+                matches
+                    .into_iter()
+                    .next()
+                    .map(|(p, _)| p)
+                    .ok_or_else(|| format!("no backup found for skill `{name}`"))?
+            }
+        };
+
+        let backup_content = fs::read_to_string(&backup_file).map_err(|e| format!("read backup: {e}"))?;
+        let restored_skill = Skill::parse(&backup_content).map_err(|e| format!("parse backup: {e}"))?;
+        let restored_hash = restored_skill.content_hash();
+
+        // Atomically write restored content back
+        let tmp = path.with_file_name(".SKILL.md.onyx-tmp");
+        fs::write(&tmp, &backup_content).map_err(|e| format!("write rollback: {e}"))?;
+        fs::rename(&tmp, &path).map_err(|e| format!("rename rollback: {e}"))?;
+
+        Ok(restored_hash)
     }
 }
 

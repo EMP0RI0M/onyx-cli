@@ -8,7 +8,6 @@
 
 use crate::skillopt::model::ChatBackend;
 use crate::skillopt::optimizer::scheduler::{LRScheduler, SchedulerMode};
-use crate::skillopt_sleep::mine::heuristic_mine;
 use crate::skillopt_sleep::onyx_consolidate::consolidate_once;
 use crate::skillopt_sleep::onyx_harvest::harvest_onyx_sessions_dir;
 use crate::skillopt_sleep::types::{SessionDigest, SkillGroupReport, TaskRecord};
@@ -28,6 +27,8 @@ pub struct SleepCycleInput {
     pub max_edits: usize,
     pub min_edits: usize,
     pub steps: usize,
+    /// Optional workspace root to ingest Project Intelligence (WorkMemory & CoverageTracker).
+    pub workspace_root: Option<std::path::PathBuf>,
 }
 
 impl Default for SleepCycleInput {
@@ -42,6 +43,7 @@ impl Default for SleepCycleInput {
             max_edits: 6,
             min_edits: 1,
             steps: 3,
+            workspace_root: None,
         }
     }
 }
@@ -85,7 +87,21 @@ pub async fn run_sleep_cycle(
     let n = digests.len();
     out.notes.push(format!("harvested {n} session transcript(s)"));
 
-    let tasks = heuristic_mine(&digests, input.max_tasks);
+    let (work_mem, cov_tracker) = if let Some(ws) = &input.workspace_root {
+        (
+            Some(onyx_project::WorkMemory::load_or_init(ws)),
+            Some(onyx_project::CoverageTracker::load_or_init(ws)),
+        )
+    } else {
+        (None, None)
+    };
+
+    let tasks = crate::skillopt_sleep::mine::mine_with_project_intelligence(
+        &digests,
+        work_mem.as_ref(),
+        cov_tracker.as_ref(),
+        input.max_tasks,
+    );
     if tasks.is_empty() {
         out.notes.push("miner found no tasks with a substantive first prompt".to_string());
     } else {

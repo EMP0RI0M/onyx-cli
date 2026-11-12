@@ -14,6 +14,7 @@ pub mod todo;
 pub mod update_goal;
 pub mod web_fetch;
 pub mod web_search;
+pub mod write_file;
 
 pub use ask_user_question::{clear_question_hook, set_question_hook, AskUserQuestion, QuestionHook};
 pub use enter_plan_mode::{EnterPlanMode, ExitPlanMode, PlanState};
@@ -30,3 +31,4 @@ pub use todo::TodoTool;
 pub use update_goal::{GoalState, GoalStatus, ProgressEntry, UpdateGoalTool};
 pub use web_fetch::WebFetch;
 pub use web_search::WebSearchTool;
+pub use write_file::WriteFile;
