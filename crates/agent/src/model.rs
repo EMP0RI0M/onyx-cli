@@ -754,6 +754,69 @@ impl HttpModel {
         !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     }
 
+    /// Extract any `→ tool_name({...})` pseudo tool calls emitted in text,
+    /// supporting multiple calls and resilient brace matching even if mixed with prose.
+    pub fn extract_arrow_calls(content: &str) -> Vec<ToolCall> {
+        let mut calls = Vec::new();
+        let trimmed = content.trim();
+        let mut pos = 0;
+        while pos < trimmed.len() {
+            let remainder = &trimmed[pos..];
+            let Some(arrow_idx) = remainder.find('→') else { break; };
+            let start = pos + arrow_idx + '→'.len_utf8();
+            let rest = trimmed[start..].trim_start();
+            if let Some(open_paren) = rest.find('(') {
+                let cand_name = rest[..open_paren].trim();
+                if Self::is_valid_tool_name(cand_name) {
+                    let after_paren = &rest[open_paren + 1..];
+                    if let Some(open_brace_rel) = after_paren.find('{') {
+                        let mut depth = 0usize;
+                        let mut in_str = false;
+                        let mut esc = false;
+                        let mut close_brace_rel = None;
+                        for (i, c) in after_paren[open_brace_rel..].char_indices() {
+                            if in_str {
+                                if esc {
+                                    esc = false;
+                                } else if c == '\\' {
+                                    esc = true;
+                                } else if c == '"' {
+                                    in_str = false;
+                                }
+                                continue;
+                            }
+                            match c {
+                                '"' => in_str = true,
+                                '{' => depth += 1,
+                                '}' if depth > 0 => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        close_brace_rel = Some(open_brace_rel + i);
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        if let Some(cb) = close_brace_rel {
+                            let inside = &after_paren[open_brace_rel..=cb];
+                            if let Ok(args) = serde_json::from_str::<Value>(inside) {
+                                if args.is_object() {
+                                    calls.push(ToolCall { name: cand_name.to_string(), args });
+                                    // Advance position past this call
+                                    pos = start + open_paren + 1 + cb + 1;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            pos = start + 1;
+        }
+        calls
+    }
+
     fn to_step(&self, content: &str, native_tools: Vec<ToolCall>) -> Step {
         if !native_tools.is_empty() {
             let mut valid_tools = Vec::new();
@@ -768,6 +831,14 @@ impl HttpModel {
                 return Step::Calls(valid_tools);
             }
         }
+
+        // Prioritize extracting explicit arrow pseudo-calls `→ tool_name({...})` before JSON fallback.
+        // If the model writes `→ read_file({...})` or multiple calls, execute them directly!
+        let arrow_calls = Self::extract_arrow_calls(content);
+        if !arrow_calls.is_empty() {
+            return Step::Calls(arrow_calls);
+        }
+
         match Self::extract_json(content) {
             Some(v) => {
                 let name = v.get("tool").and_then(|s| s.as_str()).unwrap_or("");
@@ -789,39 +860,19 @@ impl HttpModel {
             }
             None => {
                 let trimmed = content.trim();
-                // Check if the model emitted malformed pseudo-call like `→ list_dir(...)`, `→ ask_human(...)` or `→ ask_humanquestion":"...`
-                if let Some(rest) = trimmed.strip_prefix("→ ") {
-                    let rest = rest.trim();
-                    // Pattern 1: Standard function syntax `tool_name(...)`
-                    if let Some(pp) = rest.find('(') {
-                        let cand_name = rest[..pp].trim();
-                        let after_paren = &rest[pp + 1..];
-                        if let Some(cp) = after_paren.rfind(')') {
-                            let inside = after_paren[..cp].trim();
-                            if Self::is_valid_tool_name(cand_name) {
-                                if let Ok(args) = serde_json::from_str::<Value>(inside) {
-                                    if args.is_object() {
-                                        return Step::Calls(vec![ToolCall { name: cand_name.to_string(), args }]);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Pattern 2: Stream-corrupted syntax like `ask_humanquestion":"...`
-                    for key in ["question", "content", "command", "query"] {
-                        let marker = format!("{key}\":\"");
-                        if let Some(idx) = rest.find(&marker) {
-                            let prefix = rest[..idx].trim_end_matches(|c: char| {
-                                c == '(' || c == '{' || c == '[' || c == '"' || c == '\'' || c.is_whitespace()
-                            });
-                            if !prefix.is_empty() && Self::is_valid_tool_name(prefix) {
-                                let val_start = idx + marker.len();
-                                if let Some(val_end) = rest[val_start..].rfind('\"') {
-                                    let extracted_val = &rest[val_start..val_start + val_end];
-                                    let args = json!({ key: extracted_val });
-                                    return Step::Calls(vec![ToolCall { name: prefix.to_string(), args }]);
-                                }
+                // Stream-corrupted syntax like `ask_humanquestion":"...`
+                for key in ["question", "content", "command", "query"] {
+                    let marker = format!("{key}\":\"");
+                    if let Some(idx) = trimmed.find(&marker) {
+                        let prefix = trimmed[..idx].trim_end_matches(|c: char| {
+                            c == '(' || c == '{' || c == '[' || c == '"' || c == '\'' || c == '→' || c.is_whitespace()
+                        });
+                        if !prefix.is_empty() && Self::is_valid_tool_name(prefix) {
+                            let val_start = idx + marker.len();
+                            if let Some(val_end) = trimmed[val_start..].rfind('\"') {
+                                let extracted_val = &trimmed[val_start..val_start + val_end];
+                                let args = json!({ key: extracted_val });
+                                return Step::Calls(vec![ToolCall { name: prefix.to_string(), args }]);
                             }
                         }
                     }
@@ -1398,5 +1449,32 @@ mod tests {
                 .contains("[Context compacted:")
         }));
     }
+
+    #[test]
+    fn extract_arrow_calls_single_and_multiple() {
+        let text = "I am now inspecting the code:\n→ read_file({\"path\":\"./.notebooklm-mcp-venv/lib/python3.14/site-packages/notebooklm_tools/mcp/server.py\"})\nAnd checking directory:\n→ list_dir({\"path\":\"./src\"})";
+        let calls = HttpModel::extract_arrow_calls(text);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].args["path"], "./.notebooklm-mcp-venv/lib/python3.14/site-packages/notebooklm_tools/mcp/server.py");
+        assert_eq!(calls[1].name, "list_dir");
+        assert_eq!(calls[1].args["path"], "./src");
+    }
+
+    #[test]
+    fn to_step_extracts_arrow_calls_over_final_text() {
+        let m = model_with_budget(4096);
+        let text = "→ read_file({\"path\":\"./server.py\"})";
+        let step = m.to_step(text, Vec::new());
+        match step {
+            Step::Calls(calls) => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].name, "read_file");
+                assert_eq!(calls[0].args["path"], "./server.py");
+            }
+            Step::Final(f) => panic!("Expected Step::Calls, got Step::Final: {f}"),
+        }
+    }
 }
+
 
