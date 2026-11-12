@@ -1255,6 +1255,23 @@ impl Tui<'_> {
         });
     }
 
+    /// Open connect wizard directly at the API key entry step for a chosen provider ID
+    fn open_connect_wizard_for_provider(&mut self, prov_id: &str) {
+        let catalog = agent::provider::load_catalog();
+        if let Some(ci) = catalog.iter().position(|p| p.id.eq_ignore_ascii_case(prov_id) || p.name.eq_ignore_ascii_case(prov_id)) {
+            self.connect = Some(ConnectWizard {
+                step: ConnectStep::Key,
+                query: String::new(),
+                selected: 0,
+                provider: ci,
+                key_input: String::new(),
+                key_cursor: 0,
+            });
+        } else {
+            self.open_connect_wizard();
+        }
+    }
+
     /// Catalog indices matching the wizard's query, popular ones first and
     /// grouped so the list reads "Popular" then alphabetical — the grouping IS
     /// the sort order.
@@ -3162,6 +3179,18 @@ impl<'a> Tui<'a> {
                 }
             }
             target_id => {
+                let spec_opt = agent::provider::find_spec(target_id);
+                let storage = agent::provider::load_storage();
+                let has_key = storage.providers.get(target_id)
+                    .and_then(|c| c.api_key.as_ref().map(|k| !k.is_empty()))
+                    .unwrap_or(false);
+                if let Some(spec) = spec_opt {
+                    if spec.auth_type != "none" && !has_key {
+                        // Needs an API key: open the input popup immediately!
+                        self.open_connect_wizard_for_provider(target_id);
+                        return;
+                    }
+                }
                 self.switch_to_provider(target_id);
             }
         }
