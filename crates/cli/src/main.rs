@@ -97,6 +97,7 @@ fn build_selector(gw: &Gateway<dyn Policy>) -> Option<agent::retrieval::Capabili
 
 struct Opts {
     doctor: bool,
+    update: bool,
     model: Option<String>,
     max_steps: usize,
     allow_all: bool,
@@ -110,12 +111,13 @@ struct Opts {
 }
 
 fn parse_args(args: Vec<String>) -> Result<Opts, String> {
-    let mut o = Opts { doctor: false, model: None, max_steps: 8, allow_all: false, guardian: false, sandbox: false, skill: None, resume: None, fresh: false, print: None, legacy: false };
+    let mut o = Opts { doctor: false, update: false, model: None, max_steps: 8, allow_all: false, guardian: false, sandbox: false, skill: None, resume: None, fresh: false, print: None, legacy: false };
     let mut i = 0;
     let mut positional: Vec<String> = Vec::new();
     while i < args.len() {
         match args[i].as_str() {
             "doctor" | "--doctor" => o.doctor = true,
+            "update" | "--update" => o.update = true,
             "--fresh" | "-f" => o.fresh = true,
             "--model" => {
                 i += 1;
@@ -157,6 +159,7 @@ fn usage() {
         "usage: onyx [--model auto] [--max-steps N] [--allow-all] [--guardian] [--sandbox] [--skill NAME] [--resume TASK_ID]\n\
          \t  [--fresh] [--print PROMPT | --legacy]\n\
          \t  onyx doctor\n\
+         \t  onyx update\n\
          env: ONYX_BASE_URL (default http://127.0.0.1:20128/v1), ONYX_API_KEY, ONYX_MODEL,\n\
               ONYX_MAX_TOKENS, ONYX_WORKDIR, ONYX_GUARDIAN=1 (LLM risk judge before actions),\n\
               ONYX_SANDBOX=1 (kernel-enforced sandbox for bash)"
@@ -315,6 +318,29 @@ fn run_doctor() -> i32 {
     } else {
         println!("Doctor found {failures} blocking issue(s).");
         1
+    }
+}
+
+fn run_self_update() -> i32 {
+    println!("Checking for latest Onyx CLI updates from GitHub...");
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("curl -fsSL https://raw.githubusercontent.com/EMP0RI0M/onyx-cli/main/install.sh | bash")
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            println!("✓ Onyx CLI update completed successfully.");
+            0
+        }
+        Ok(s) => {
+            eprintln!("onyx: update script failed with exit code: {}", s.code().unwrap_or(1));
+            1
+        }
+        Err(e) => {
+            eprintln!("onyx: failed to execute updater: {e}");
+            1
+        }
     }
 }
 
@@ -553,6 +579,10 @@ fn main() {
 
     if opts.doctor {
         exit(run_doctor());
+    }
+
+    if opts.update {
+        exit(run_self_update());
     }
 
     let cfg = omniroute_config();
