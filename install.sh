@@ -51,11 +51,20 @@ fi
 chmod +x "${DOWNLOADED_BIN}"
 
 # Installation target check
-if [ ! -w "${INSTALL_DIR}" ]; then
+mkdir -p "${INSTALL_DIR}" 2>/dev/null || true
+
+if [ -w "${INSTALL_DIR}" ]; then
+    install -m 755 "${DOWNLOADED_BIN}" "${INSTALL_DIR}/onyx"
+elif command -v sudo >/dev/null 2>&1; then
     echo "→ Writing to ${INSTALL_DIR} requires sudo privileges:"
     sudo install -m 755 "${DOWNLOADED_BIN}" "${INSTALL_DIR}/onyx"
 else
-    install -m 755 "${DOWNLOADED_BIN}" "${INSTALL_DIR}/onyx"
+    # Fallback to user home directory if root/sudo is unavailable
+    FALLBACK_DIR="${HOME}/.local/bin"
+    mkdir -p "${FALLBACK_DIR}"
+    install -m 755 "${DOWNLOADED_BIN}" "${FALLBACK_DIR}/onyx"
+    INSTALL_DIR="${FALLBACK_DIR}"
+    echo "→ Installed to ${FALLBACK_DIR}/onyx (make sure ${FALLBACK_DIR} is in your PATH)."
 fi
 
 echo ""
