@@ -1613,9 +1613,40 @@ impl Tui<'_> {
                     wiz.key_input.remove(wiz.key_cursor);
                 }
             }
+            ('\0', 1002) => {
+                // Right arrow
+                let wiz = self.connect.as_mut().unwrap();
+                if wiz.key_cursor < wiz.key_input.len() {
+                    let next = wiz.key_input[wiz.key_cursor..]
+                        .chars()
+                        .next()
+                        .map(|c| c.len_utf8())
+                        .unwrap_or(0);
+                    wiz.key_cursor += next;
+                }
+            }
+            ('\0', 1003) => {
+                // Left arrow
+                let wiz = self.connect.as_mut().unwrap();
+                if wiz.key_cursor > 0 {
+                    let prev = wiz.key_input[..wiz.key_cursor]
+                        .chars()
+                        .next_back()
+                        .map(|c| c.len_utf8())
+                        .unwrap_or(0);
+                    wiz.key_cursor -= prev;
+                }
+            }
+            (_, 2000) => {
+                // Bracketed paste event into API key entry
+                let wiz = self.connect.as_mut().unwrap();
+                let clean: String = chars.iter().filter(|c| **c != '\r' && **c != '\n').collect();
+                wiz.key_input.replace_range(wiz.key_cursor..wiz.key_cursor, &clean);
+                wiz.key_cursor += clean.len();
+            }
             (c, 0) if !c.is_control() => {
                 let wiz = self.connect.as_mut().unwrap();
-                let run: String = chars.iter().collect();
+                let run: String = chars.iter().filter(|c| !c.is_control()).collect();
                 wiz.key_input.replace_range(wiz.key_cursor..wiz.key_cursor, &run);
                 wiz.key_cursor += run.len();
             }
