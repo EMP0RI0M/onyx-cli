@@ -2597,5 +2597,133 @@
     "function_calling": true,
     "vision": true,
     "reasoning": false
+  },
+  {
+    "id": "claude",
+    "name": "Anthropic Claude (CLIProxyAPI Gateway)",
+    "base_url": "http://127.0.0.1:8317/v1",
+    "env_var": "ANTHROPIC_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "claude-",
+      "claude/"
+    ],
+    "model_count": 10,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "codex",
+    "name": "OpenAI Codex / ChatGPT (CLIProxyAPI Gateway)",
+    "base_url": "http://127.0.0.1:8317/v1",
+    "env_var": "OPENAI_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "gpt-",
+      "codex-",
+      "o1",
+      "o3"
+    ],
+    "model_count": 15,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "antigravity",
+    "name": "Google Antigravity (CLIProxyAPI Gateway)",
+    "base_url": "http://127.0.0.1:8317/v1",
+    "env_var": "ANTIGRAVITY_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "gemini-",
+      "antigravity-"
+    ],
+    "model_count": 10,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "kimi",
+    "name": "Moonshot Kimi (CLIProxyAPI Gateway)",
+    "base_url": "http://127.0.0.1:8317/v1",
+    "env_var": "MOONSHOT_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "moonshot-",
+      "kimi-"
+    ],
+    "model_count": 6,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "grok",
+    "name": "xAI Grok (CLIProxyAPI Gateway)",
+    "base_url": "http://127.0.0.1:8317/v1",
+    "env_var": "XAI_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "grok-"
+    ],
+    "model_count": 6,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "muse",
+    "name": "Meta Muse (CLIProxyAPI Gateway)",
+    "base_url": "http://127.0.0.1:8317/v1",
+    "env_var": "META_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "llama-",
+      "muse-"
+    ],
+    "model_count": 8,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "devin",
+    "name": "Cognition Devin (CLIProxyAPI Gateway)",
+    "base_url": "http://127.0.0.1:8317/v1",
+    "env_var": "DEVIN_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "devin-"
+    ],
+    "model_count": 4,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
+  },
+  {
+    "id": "vertex",
+    "name": "Google Cloud Vertex AI (CLIProxyAPI Gateway)",
+    "base_url": "http://127.0.0.1:8317/v1",
+    "env_var": "VERTEX_API_KEY",
+    "auth_type": "bearer",
+    "streaming_format": "sse",
+    "model_prefixes": [
+      "vertex-",
+      "gemini-"
+    ],
+    "model_count": 12,
+    "function_calling": true,
+    "vision": true,
+    "reasoning": true
   }
 ]

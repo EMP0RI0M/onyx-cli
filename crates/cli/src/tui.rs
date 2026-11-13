@@ -3008,6 +3008,8 @@ impl<'a> Tui<'a> {
             let _ = tx.send(Ctl::SetModel(self.hm.model.clone()));
         }
 
+        // Run non-blocking health check diagnosis on switch
+        let health = agent::provider::check_provider_health(&spec, Some(cfg));
         let _ = agent::provider::save_storage(&storage);
         // Refresh cached models
         self.cached_models = self.hm.list_models().unwrap_or_default();
@@ -3015,6 +3017,24 @@ impl<'a> Tui<'a> {
             "switched provider to {} ({}) · endpoint {}",
             spec.name, spec.id, self.hm.host
         )));
+
+        match health {
+            agent::provider::HealthStatus::Ok(detail) => {
+                self.items.push(Item::Info(format!("health: {detail}")));
+            }
+            agent::provider::HealthStatus::ConnectionRefused(hint) => {
+                self.items.push(Item::Error(format!("health: {hint}")));
+            }
+            agent::provider::HealthStatus::AuthFailure(err) => {
+                self.items.push(Item::Error(format!("health: {err}")));
+            }
+            agent::provider::HealthStatus::Timeout(err) => {
+                self.items.push(Item::Error(format!("health: {err}")));
+            }
+            agent::provider::HealthStatus::Error(err) => {
+                self.items.push(Item::Info(format!("health check: {err}")));
+            }
+        }
     }
 
     /// Handle `/provider` command execution
@@ -3114,9 +3134,80 @@ impl<'a> Tui<'a> {
                     self.switch_to_provider(prov_id);
                 }
             }
+            "status" => {
+                let prov_id = parts.get(2).copied().unwrap_or(&storage.active_provider);
+                if prov_id == "cliproxyapi" || prov_id == "cliproxy" || prov_id == "claude" || prov_id == "codex" || prov_id == "antigravity" || prov_id == "kimi" || prov_id == "grok" || prov_id == "muse" || prov_id == "devin" || prov_id == "vertex" {
+                    let info = agent::provider::cliproxy::inspect_gateway(None);
+                    self.items.push(Item::Info(format!("CLIProxyAPI Gateway: endpoint={} running={}", info.endpoint, info.running)));
+                    if let Some(bin) = &info.binary_path {
+                        self.items.push(Item::Info(format!("  Binary: {}", bin.display())));
+                    }
+                    if let Some(ver) = &info.version {
+                        self.items.push(Item::Info(format!("  Version: {ver}")));
+                    }
+                    let key = storage.providers.get("cliproxyapi").and_then(|c| c.api_key.as_deref());
+                    match agent::provider::cliproxy::query_gateway_status(&info.endpoint, key) {
+                        Ok(stat) => {
+                            for l in stat.lines() {
+                                self.items.push(Item::Info(format!("  {l}")));
+                            }
+                        }
+                        Err(e) => {
+                            self.items.push(Item::Error(format!("Gateway query error: {e}")));
+                        }
+                    }
+                } else if let Some(spec) = agent::provider::find_spec(prov_id) {
+                    let cfg = storage.providers.get(prov_id);
+                    let health = agent::provider::check_provider_health(&spec, cfg);
+                    self.items.push(Item::Info(format!("Provider `{prov_id}` status: {:?}", health)));
+                } else {
+                    self.items.push(Item::Error(format!("unknown provider `{prov_id}`")));
+                }
+            }
+            "quota" => {
+                let info = agent::provider::cliproxy::inspect_gateway(None);
+                let key = storage.providers.get("cliproxyapi").and_then(|c| c.api_key.as_deref());
+                match agent::provider::cliproxy::query_gateway_status(&info.endpoint, key) {
+                    Ok(stat) => {
+                        self.items.push(Item::Info("CLIProxyAPI Gateway Model Quota & Status:".into()));
+                        for l in stat.lines() {
+                            self.items.push(Item::Info(format!("  {l}")));
+                        }
+                    }
+                    Err(e) => {
+                        self.items.push(Item::Error(format!("Failed to retrieve gateway quota: {e}")));
+                    }
+                }
+            }
             "login" | "oauth" => {
                 let target = parts.get(2).copied().unwrap_or("copilot");
-                if target == "copilot" || target == "github" || target == "github_copilot" {
+                if agent::provider::cliproxy::resolve_login_target(target).is_some() {
+                    self.items.push(Item::Info(format!("Initiating CLIProxyAPI login flow for `{target}`...")));
+                    match agent::provider::cliproxy::execute_gateway_login(target) {
+                        Ok(msg) => {
+                            self.items.push(Item::Info(msg));
+                            // Also ensure provider config exists
+                            let entry = storage.providers.entry(target.to_string()).or_insert_with(|| {
+                                agent::provider::ProviderConfig {
+                                    provider_id: target.to_string(),
+                                    base_url: Some(agent::provider::cliproxy::DEFAULT_GATEWAY_URL.to_string() + "/v1"),
+                                    api_key: None,
+                                    oauth_token: None,
+                                    oauth_refresh_token: None,
+                                    oauth_expires_at: None,
+                                    active_model: None,
+                                    custom_headers: std::collections::HashMap::new(),
+                                }
+                            });
+                            entry.base_url = Some(agent::provider::cliproxy::DEFAULT_GATEWAY_URL.to_string() + "/v1");
+                            let _ = agent::provider::save_storage(&storage);
+                            self.switch_to_provider(target);
+                        }
+                        Err(e) => {
+                            self.items.push(Item::Error(format!("Login failed: {e}")));
+                        }
+                    }
+                } else if target == "copilot" || target == "github" || target == "github_copilot" {
                     self.items.push(Item::Info("Starting GitHub Copilot OAuth Device Flow...".into()));
                     match agent::provider::start_copilot_device_flow() {
                         Ok(resp) => {

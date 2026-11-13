@@ -98,6 +98,7 @@ fn build_selector(gw: &Gateway<dyn Policy>) -> Option<agent::retrieval::Capabili
 struct Opts {
     doctor: bool,
     update: bool,
+    provider_cmd: Option<Vec<String>>,
     model: Option<String>,
     max_steps: usize,
     allow_all: bool,
@@ -111,7 +112,27 @@ struct Opts {
 }
 
 fn parse_args(args: Vec<String>) -> Result<Opts, String> {
-    let mut o = Opts { doctor: false, update: false, model: None, max_steps: 8, allow_all: false, guardian: false, sandbox: false, skill: None, resume: None, fresh: false, print: None, legacy: false };
+    let mut o = Opts {
+        doctor: false,
+        update: false,
+        provider_cmd: None,
+        model: None,
+        max_steps: 8,
+        allow_all: false,
+        guardian: false,
+        sandbox: false,
+        skill: None,
+        resume: None,
+        fresh: false,
+        print: None,
+        legacy: false,
+    };
+    if let Some(first) = args.first() {
+        if first == "provider" {
+            o.provider_cmd = Some(args.into_iter().skip(1).collect());
+            return Ok(o);
+        }
+    }
     let mut i = 0;
     let mut positional: Vec<String> = Vec::new();
     while i < args.len() {
@@ -160,6 +181,7 @@ fn usage() {
          \t  [--fresh] [--print PROMPT | --legacy]\n\
          \t  onyx doctor\n\
          \t  onyx update\n\
+         \t  onyx provider [login <target> | logout <target> | status [name] | quota | list]\n\
          env: ONYX_BASE_URL (default http://127.0.0.1:20128/v1), ONYX_API_KEY, ONYX_MODEL,\n\
               ONYX_MAX_TOKENS, ONYX_WORKDIR, ONYX_GUARDIAN=1 (LLM risk judge before actions),\n\
               ONYX_SANDBOX=1 (kernel-enforced sandbox for bash)"
@@ -340,6 +362,144 @@ fn run_self_update() -> i32 {
         Err(e) => {
             eprintln!("onyx: failed to execute updater: {e}");
             1
+        }
+    }
+}
+
+/// Handle `onyx provider ...` standalone commands
+fn run_provider_cli(args: &[String]) -> i32 {
+    let sub = args.first().map(|s| s.as_str()).unwrap_or("status");
+    let mut storage = agent::provider::load_storage();
+
+    match sub {
+        "login" | "auth" => {
+            let target = match args.get(1) {
+                Some(t) => t.as_str(),
+                None => {
+                    eprintln!("usage: onyx provider login <target>");
+                    eprintln!("available targets: claude, codex, codex-device, antigravity, kimi, grok, muse, devin, copilot, google");
+                    return 2;
+                }
+            };
+            if agent::provider::cliproxy::resolve_login_target(target).is_some() {
+                println!("Initiating CLIProxyAPI login flow for `{target}`...");
+                match agent::provider::cliproxy::execute_gateway_login(target) {
+                    Ok(msg) => {
+                        println!("{msg}");
+                        let entry = storage.providers.entry(target.to_string()).or_insert_with(|| {
+                            agent::provider::ProviderConfig {
+                                provider_id: target.to_string(),
+                                base_url: Some(agent::provider::cliproxy::DEFAULT_GATEWAY_URL.to_string() + "/v1"),
+                                api_key: None,
+                                oauth_token: None,
+                                oauth_refresh_token: None,
+                                oauth_expires_at: None,
+                                active_model: None,
+                                custom_headers: std::collections::HashMap::new(),
+                            }
+                        });
+                        entry.base_url = Some(agent::provider::cliproxy::DEFAULT_GATEWAY_URL.to_string() + "/v1");
+                        let _ = agent::provider::save_storage(&storage);
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("Login failed: {e}");
+                        1
+                    }
+                }
+            } else if target == "copilot" || target == "github" {
+                println!("Initiating GitHub Copilot OAuth flow...");
+                match agent::provider::start_copilot_device_flow() {
+                    Ok(resp) => {
+                        println!("Visit: {}", resp.verification_uri);
+                        println!("Enter code: {}", resp.user_code);
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to start Copilot flow: {e}");
+                        1
+                    }
+                }
+            } else {
+                eprintln!("Unknown provider target `{target}`.");
+                2
+            }
+        }
+        "logout" => {
+            let target = match args.get(1) {
+                Some(t) => t.as_str(),
+                None => {
+                    eprintln!("usage: onyx provider logout <target>");
+                    return 2;
+                }
+            };
+            if let Some(entry) = storage.providers.get_mut(target) {
+                entry.api_key = None;
+                entry.oauth_token = None;
+                entry.oauth_refresh_token = None;
+                let _ = agent::provider::save_storage(&storage);
+                println!("Cleared cached credentials for provider `{target}` in Onyx.");
+            } else {
+                println!("Provider `{target}` had no saved credentials.");
+            }
+            0
+        }
+        "status" => {
+            let target = args.get(1).map(|s| s.as_str()).unwrap_or(&storage.active_provider);
+            println!("Onyx Active Provider: {}", storage.active_provider);
+            println!("Target Provider: {target}");
+            let info = agent::provider::cliproxy::inspect_gateway(None);
+            println!("CLIProxyAPI Gateway: endpoint={} running={}", info.endpoint, info.running);
+            if let Some(bin) = &info.binary_path {
+                println!("  Binary: {}", bin.display());
+            }
+            if let Some(ver) = &info.version {
+                println!("  Version: {ver}");
+            }
+            let key = storage.providers.get("cliproxyapi").and_then(|c| c.api_key.as_deref());
+            match agent::provider::cliproxy::query_gateway_status(&info.endpoint, key) {
+                Ok(stat) => {
+                    for l in stat.lines() {
+                        println!("  {l}");
+                    }
+                }
+                Err(e) => {
+                    println!("  Gateway status query: {e}");
+                }
+            }
+            0
+        }
+        "quota" => {
+            let info = agent::provider::cliproxy::inspect_gateway(None);
+            let key = storage.providers.get("cliproxyapi").and_then(|c| c.api_key.as_deref());
+            match agent::provider::cliproxy::query_gateway_status(&info.endpoint, key) {
+                Ok(stat) => {
+                    println!("CLIProxyAPI Gateway Model Quota & Status:");
+                    for l in stat.lines() {
+                        println!("  {l}");
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("Failed to retrieve gateway quota: {e}");
+                    1
+                }
+            }
+        }
+        "list" => {
+            let catalog = agent::provider::load_catalog();
+            println!("Provider Catalog ({} providers):", catalog.len());
+            for p in catalog.iter().take(30) {
+                let is_act = if p.id == storage.active_provider { " [ACTIVE]" } else { "" };
+                println!("  {:<16} · {:<30} (auth: {}){is_act}", p.id, p.name, p.auth_type);
+            }
+            println!("... use `onyx provider status <name>` or `/provider <name>` to select");
+            0
+        }
+        other => {
+            eprintln!("unknown provider command `{other}`");
+            eprintln!("usage: onyx provider [login <target> | logout <target> | status [name] | quota | list]");
+            2
         }
     }
 }
@@ -583,6 +743,10 @@ fn main() {
 
     if opts.update {
         exit(run_self_update());
+    }
+
+    if let Some(cmd_args) = opts.provider_cmd {
+        exit(run_provider_cli(&cmd_args));
     }
 
     let cfg = omniroute_config();

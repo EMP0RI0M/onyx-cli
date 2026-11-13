@@ -5,6 +5,7 @@
 //! provider by `registry::protocol_for`.
 
 pub mod anthropic;
+pub mod cliproxy;
 pub mod gemini;
 pub mod openai;
 pub mod registry;
@@ -57,7 +58,7 @@ fn default_streaming_format() -> String {
 }
 
 /// Active user configuration for an individual provider stored in `~/.onyx/providers.json`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProviderConfig {
     pub provider_id: String,
     #[serde(default)]
@@ -178,6 +179,13 @@ fn write_secret_file(path: &std::path::Path, contents: &str) -> Result<(), Strin
 /// `vault:` reference can't be resolved we treat it as absent rather than erroring.
 pub fn resolve_api_key(spec: &ProviderSpec, config: Option<&ProviderConfig>) -> Option<String> {
     // 1. Environment override first.
+    if spec.id == "cliproxyapi" {
+        if let Ok(val) = std::env::var("CLIPROXYAPI_API_KEY") {
+            if !val.trim().is_empty() {
+                return Some(val.trim().to_string());
+            }
+        }
+    }
     if let Some(ref env_name) = spec.env_var {
         if let Ok(val) = std::env::var(env_name) {
             if !val.trim().is_empty() {
@@ -253,8 +261,15 @@ pub fn vault_path() -> PathBuf {
     onyx_dir().join("credentials.json")
 }
 
-/// Resolve effective Base URL for a provider (from config -> spec -> loopback).
+/// Resolve effective Base URL for a provider (from config -> env -> spec -> loopback).
 pub fn resolve_base_url(spec: &ProviderSpec, config: Option<&ProviderConfig>) -> String {
+    if spec.id == "cliproxyapi" {
+        if let Ok(val) = std::env::var("CLIPROXYAPI_BASE_URL") {
+            if !val.trim().is_empty() {
+                return val.trim().trim_end_matches('/').to_string();
+            }
+        }
+    }
     if let Some(cfg) = config {
         if let Some(ref u) = cfg.base_url {
             if !u.trim().is_empty() {
@@ -420,3 +435,102 @@ pub fn exchange_google_service_account_token(_key_json_path: &str) -> Result<Str
     }
     Err("gcloud CLI not authenticated. Run `gcloud auth application-default login` or set GOOGLE_APPLICATION_CREDENTIALS / GEMINI_API_KEY".to_string())
 }
+
+/// Provider health diagnostic result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HealthStatus {
+    Ok(String),
+    ConnectionRefused(String),
+    AuthFailure(String),
+    Timeout(String),
+    Error(String),
+}
+
+/// Redact sensitive API keys or OAuth credentials from strings for safe diagnostics and logs.
+pub fn redact_secret(secret: &str) -> String {
+    let trimmed = secret.trim();
+    if trimmed.is_empty() {
+        return "(none)".to_string();
+    }
+    if trimmed.len() <= 8 {
+        return "***".to_string();
+    }
+    let prefix = &trimmed[..4];
+    let suffix = &trimmed[trimmed.len() - 4..];
+    format!("{prefix}...{suffix}")
+}
+
+/// Check the health of a provider endpoint without leaking credentials.
+pub fn check_provider_health(spec: &ProviderSpec, config: Option<&ProviderConfig>) -> HealthStatus {
+    let base_url = resolve_base_url(spec, config);
+    let key = resolve_api_key(spec, config);
+
+    let (host, port, _sub) = crate::provider::registry::split_base(&base_url);
+    let timeout = std::time::Duration::from_secs(3);
+
+    // 1. TCP connection test
+    let socket_addr = format!("{host}:{port}");
+    let stream = match std::net::TcpStream::connect_timeout(
+        &socket_addr
+            .parse()
+            .unwrap_or_else(|_| std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), port)),
+        timeout,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::ConnectionRefused {
+                let hint = if spec.id == "cliproxyapi" {
+                    format!("CLIProxyAPI is not running on {socket_addr}. Start CLIProxyAPI-Rust (`cliproxyapi-rust` or via Docker on port {port}) before connecting.")
+                } else {
+                    format!("connection refused on {socket_addr}")
+                };
+                return HealthStatus::ConnectionRefused(hint);
+            } else if e.kind() == std::io::ErrorKind::TimedOut {
+                return HealthStatus::Timeout(format!("timed out connecting to {socket_addr}"));
+            } else {
+                return HealthStatus::Error(format!("network error connecting to {socket_addr}: {e}"));
+            }
+        }
+    };
+    drop(stream);
+
+    // 2. HTTP probe to /models endpoint
+    let models_path = if base_url.ends_with("/v1") {
+        "/v1/models"
+    } else {
+        "/models"
+    };
+
+    let auth_hdr = key.as_deref();
+    match crate::model::http_request("GET", &host, port, models_path, auth_hdr, None) {
+        Ok(body) => {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                if let Some(err) = v.get("error") {
+                    let code = err.get("code").and_then(|c| c.as_u64()).unwrap_or(0);
+                    let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown error");
+                    if code == 401 || msg.to_lowercase().contains("unauthorized") || msg.to_lowercase().contains("auth") {
+                        return HealthStatus::AuthFailure(format!("authentication failed (HTTP 401): {msg}"));
+                    }
+                    return HealthStatus::Error(format!("provider error: {msg}"));
+                }
+                if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
+                    return HealthStatus::Ok(format!("reachable on {socket_addr} · {} models discovered", arr.len()));
+                }
+            }
+            HealthStatus::Ok(format!("reachable on {socket_addr}"))
+        }
+        Err(e) => {
+            let lower = e.to_lowercase();
+            if lower.contains("401") || lower.contains("unauthorized") {
+                HealthStatus::AuthFailure("authentication failed (HTTP 401)".to_string())
+            } else if lower.contains("timed out") || lower.contains("timeout") {
+                HealthStatus::Timeout(format!("HTTP probe to {socket_addr} timed out"))
+            } else if lower.contains("refused") {
+                HealthStatus::ConnectionRefused(format!("connection refused on {socket_addr}"))
+            } else {
+                HealthStatus::Error(format!("health check probe error: {e}"))
+            }
+        }
+    }
+}
+
