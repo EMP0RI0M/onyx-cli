@@ -1,12 +1,12 @@
 //! tektile kernel: hand-written AArch64 NEON math + portable fallback.
 //! Rust owns orchestration & safety; assembly owns the hot numeric loop.
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 extern "C" {
     fn dot_kernel(a: *const f32, b: *const f32, n: usize) -> f32;
 }
 
-/// f32 dot product. On aarch64 dispatches to the NEON kernel; elsewhere a
+/// f32 dot product. On aarch64 Linux dispatches to the NEON kernel; elsewhere a
 /// portable loop that LLVM auto-vectorizes.
 #[inline]
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
@@ -14,12 +14,12 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     if a.is_empty() {
         return 0.0;
     }
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     {
         // SAFETY: equal non-zero lengths; kernel reads exactly n elements from each.
         unsafe { dot_kernel(a.as_ptr(), b.as_ptr(), a.len()) }
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
     {
         a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
     }
