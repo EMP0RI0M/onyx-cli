@@ -7,3 +7,6 @@ license.workspace = true
 [lib]
 name = "kernel"
 path = "src/lib.rs"
+
+[build-dependencies]
+cc = "1.0"
