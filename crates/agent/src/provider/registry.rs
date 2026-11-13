@@ -59,7 +59,8 @@ fn auth_scheme_for(spec: &ProviderSpec, proto: &dyn ProviderProtocol) -> AuthSch
     match proto.name() {
         "anthropic" | "gemini" => AuthScheme::HeaderOnly,
         _ => {
-            if spec.auth_type == "none" {
+            // If base_url is proxy (port 8317) or spec has a key configured, use Bearer
+            if spec.auth_type == "none" && !spec.base_url.as_deref().unwrap_or("").contains(":8317") {
                 AuthScheme::None
             } else {
                 AuthScheme::Bearer
