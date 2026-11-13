@@ -168,9 +168,18 @@ pub fn execute_gateway_login(target: &str) -> Result<String, String> {
         format!("Unknown login provider `{target}`. Supported login providers: claude, codex, codex-device, antigravity, kimi, grok, muse, devin")
     })?;
 
-    // Execute the login command interactively / synchronously
-    let status = Command::new(&binary)
-        .arg(flag)
+    // Ensure config.yaml is available in working directory or pass explicit config path if located
+    let mut cmd = Command::new(&binary);
+    cmd.arg(flag);
+    if let Some(parent) = binary.parent() {
+        let cfg_path = parent.join("config.yaml");
+        if cfg_path.is_file() {
+            cmd.arg("-config").arg(cfg_path.display().to_string());
+        }
+    }
+
+    // Execute the login command interactively
+    let status = cmd
         .status()
         .map_err(|e| format!("failed to spawn `{}` with flag `{}`: {}", binary.display(), flag, e))?;
 

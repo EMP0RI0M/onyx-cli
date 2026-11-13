@@ -2603,7 +2603,7 @@
     "name": "Claude (Anthropic)",
     "base_url": "http://127.0.0.1:8317/v1",
     "env_var": "ANTHROPIC_API_KEY",
-    "auth_type": "bearer",
+    "auth_type": "none",
     "streaming_format": "sse",
     "model_prefixes": [
       "claude-",
@@ -2619,7 +2619,7 @@
     "name": "Codex / ChatGPT (OpenAI)",
     "base_url": "http://127.0.0.1:8317/v1",
     "env_var": "OPENAI_API_KEY",
-    "auth_type": "bearer",
+    "auth_type": "none",
     "streaming_format": "sse",
     "model_prefixes": [
       "gpt-",
@@ -2637,7 +2637,7 @@
     "name": "Google Antigravity",
     "base_url": "http://127.0.0.1:8317/v1",
     "env_var": "ANTIGRAVITY_API_KEY",
-    "auth_type": "bearer",
+    "auth_type": "none",
     "streaming_format": "sse",
     "model_prefixes": [
       "gemini-",
@@ -2653,7 +2653,7 @@
     "name": "Kimi (Moonshot AI)",
     "base_url": "http://127.0.0.1:8317/v1",
     "env_var": "MOONSHOT_API_KEY",
-    "auth_type": "bearer",
+    "auth_type": "none",
     "streaming_format": "sse",
     "model_prefixes": [
       "moonshot-",
@@ -2669,7 +2669,7 @@
     "name": "Grok (xAI)",
     "base_url": "http://127.0.0.1:8317/v1",
     "env_var": "XAI_API_KEY",
-    "auth_type": "bearer",
+    "auth_type": "none",
     "streaming_format": "sse",
     "model_prefixes": [
       "grok-"
@@ -2684,7 +2684,7 @@
     "name": "Meta Muse",
     "base_url": "http://127.0.0.1:8317/v1",
     "env_var": "META_API_KEY",
-    "auth_type": "bearer",
+    "auth_type": "none",
     "streaming_format": "sse",
     "model_prefixes": [
       "llama-",
@@ -2700,7 +2700,7 @@
     "name": "Devin (Cognition)",
     "base_url": "http://127.0.0.1:8317/v1",
     "env_var": "DEVIN_API_KEY",
-    "auth_type": "bearer",
+    "auth_type": "none",
     "streaming_format": "sse",
     "model_prefixes": [
       "devin-"
@@ -2715,7 +2715,7 @@
     "name": "Google Vertex AI",
     "base_url": "http://127.0.0.1:8317/v1",
     "env_var": "VERTEX_API_KEY",
-    "auth_type": "bearer",
+    "auth_type": "none",
     "streaming_format": "sse",
     "model_prefixes": [
       "vertex-",
