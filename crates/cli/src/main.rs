@@ -382,8 +382,14 @@ fn run_provider_cli(args: &[String]) -> i32 {
                 }
             };
             if agent::provider::cliproxy::resolve_login_target(target).is_some() {
-                println!("Initiating CLIProxyAPI login flow for `{target}`...");
-                match agent::provider::cliproxy::execute_gateway_login(target) {
+                println!("Initiating OAuth login flow for `{target}`...");
+                match agent::provider::cliproxy::execute_gateway_login_with_callback(target, |url_or_code| {
+                    if url_or_code.starts_with("https://") {
+                        println!("\n  🔗 Visit to authorize:\n  \x1b[1;36m{url_or_code}\x1b[0m\n");
+                    } else {
+                        println!("  {url_or_code}");
+                    }
+                }) {
                     Ok(msg) => {
                         println!("{msg}");
                         let entry = storage.providers.entry(target.to_string()).or_insert_with(|| {

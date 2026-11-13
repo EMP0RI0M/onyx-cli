@@ -3188,11 +3188,17 @@ impl<'a> Tui<'a> {
             "login" | "oauth" => {
                 let target = parts.get(2).copied().unwrap_or("copilot");
                 if agent::provider::cliproxy::resolve_login_target(target).is_some() {
-                    self.items.push(Item::Info(format!("Initiating CLIProxyAPI login flow for `{target}`...")));
-                    match agent::provider::cliproxy::execute_gateway_login(target) {
+                    self.items.push(Item::Info(format!("Initiating OAuth flow for `{target}`...")));
+                    let mut found_links = Vec::new();
+                    let res = agent::provider::cliproxy::execute_gateway_login_with_callback(target, |url_or_code| {
+                        found_links.push(url_or_code.to_string());
+                    });
+                    for link in found_links {
+                        self.items.push(Item::Info(format!("🔗 OAuth Link: {BOLD}{CYAN}{link}{RESET}")));
+                    }
+                    match res {
                         Ok(msg) => {
                             self.items.push(Item::Info(msg));
-                            // Also ensure provider config exists
                             let entry = storage.providers.entry(target.to_string()).or_insert_with(|| {
                                 agent::provider::ProviderConfig {
                                     provider_id: target.to_string(),

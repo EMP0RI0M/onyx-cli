@@ -159,7 +159,12 @@ pub fn resolve_login_target(target: &str) -> Option<&'static str> {
 }
 
 /// Spawn a login flow via the detected CLIProxyAPI binary without exposing any credentials.
-pub fn execute_gateway_login(target: &str) -> Result<String, String> {
+/// Captures output stream to surface login URLs and device codes directly to the UI,
+/// similar to Grok's external auth mechanism.
+pub fn execute_gateway_login_with_callback<F>(target: &str, mut on_url: F) -> Result<String, String>
+where
+    F: FnMut(&str),
+{
     let binary = find_gateway_binary().ok_or_else(|| {
         "CLIProxyAPI binary (`cliproxyapi-rust` or `cli-proxy-api`) was not found in PATH or standard directories.\nInstall CLIProxyAPI-Rust or set CLIPROXYAPI_PATH to the binary path.".to_string()
     })?;
@@ -168,7 +173,6 @@ pub fn execute_gateway_login(target: &str) -> Result<String, String> {
         format!("Unknown login provider `{target}`. Supported login providers: claude, codex, codex-device, antigravity, kimi, grok, muse, devin")
     })?;
 
-    // Ensure config.yaml is available in working directory or pass explicit config path if located
     let mut cmd = Command::new(&binary);
     cmd.arg(flag);
     if let Some(parent) = binary.parent() {
@@ -178,16 +182,87 @@ pub fn execute_gateway_login(target: &str) -> Result<String, String> {
         }
     }
 
-    // Execute the login command interactively
-    let status = cmd
-        .status()
-        .map_err(|e| format!("failed to spawn `{}` with flag `{}`: {}", binary.display(), flag, e))?;
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
 
-    if status.success() {
-        Ok(format!("Successfully completed login flow for `{target}` via CLIProxyAPI gateway."))
-    } else {
-        Err(format!("Login process for `{target}` exited with status: {status}"))
+    let mut child = cmd.spawn().map_err(|e| {
+        format!("failed to spawn `{}` with flag `{}`: {}", binary.display(), flag, e)
+    })?;
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    if let Some(out) = stdout {
+        let tx1 = tx.clone();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            let reader = std::io::BufReader::new(out);
+            for line in reader.lines().flatten() {
+                let _ = tx1.send(line);
+            }
+        });
     }
+
+    if let Some(err) = stderr {
+        let tx2 = tx;
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            let reader = std::io::BufReader::new(err);
+            for line in reader.lines().flatten() {
+                let _ = tx2.send(line);
+            }
+        });
+    }
+
+    // Monitor stream for login URLs or device codes
+    let mut url_found = false;
+    let start_time = std::time::Instant::now();
+
+    while start_time.elapsed() < Duration::from_secs(120) {
+        if let Ok(line) = rx.recv_timeout(Duration::from_millis(250)) {
+            // Check for OAuth URLs or device codes
+            for word in line.split_whitespace() {
+                if word.starts_with("https://") {
+                    on_url(word.trim_end_matches([')', ']', '.', ',']));
+                    url_found = true;
+                }
+            }
+            if line.contains("Codex device code:") || line.contains("Enter code:") {
+                on_url(&line);
+            }
+            if line.contains("successfully") || line.contains("Authenticated") {
+                let _ = child.kill();
+                return Ok(format!("Authentication successful for `{target}`!"));
+            }
+            if line.contains("timed out") || line.contains("failed") {
+                let _ = child.kill();
+                return Err(line);
+            }
+        }
+
+        // Check if child process has exited
+        if let Ok(Some(status)) = child.try_wait() {
+            if status.success() {
+                return Ok(format!("Successfully completed login flow for `{target}` via CLIProxyAPI gateway."));
+            } else if !url_found {
+                return Err(format!("Login process exited with status: {status}"));
+            }
+        }
+    }
+
+    let _ = child.kill();
+    if url_found {
+        Ok(format!("OAuth link generated for `{target}`. Complete authorization in browser."))
+    } else {
+        Err(format!("Login process for `{target}` timed out."))
+    }
+}
+
+/// Legacy synchronous executor
+pub fn execute_gateway_login(target: &str) -> Result<String, String> {
+    execute_gateway_login_with_callback(target, |_| {})
 }
 
 /// Query account / quota status from the gateway
