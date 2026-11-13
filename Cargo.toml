@@ -56,4 +56,4 @@ codegen-units = 1
 # candle-core pulls gemm with default features, so feature unification makes
 # disabling `f16` from our side impossible; patching the crate is the only fix.
 [patch.crates-io]
-gemm-common = { path = "/root/gemm-common-vendor" }
+gemm-common = { path = "vendor/gemm-common" }
