@@ -489,9 +489,20 @@ fn run_provider_cli(args: &[String]) -> i32 {
         "list" => {
             let catalog = agent::provider::load_catalog();
             println!("Provider Catalog ({} providers):", catalog.len());
-            for p in catalog.iter().take(30) {
-                let is_act = if p.id == storage.active_provider { " [ACTIVE]" } else { "" };
-                println!("  {:<16} · {:<30} (auth: {}){is_act}", p.id, p.name, p.auth_type);
+            let priority_ids = ["claude", "codex", "antigravity", "kimi", "grok", "muse", "devin", "vertex", "gemini", "openai", "anthropic"];
+            println!("  --- Popular & Gateway Providers ---");
+            for id in &priority_ids {
+                if let Some(p) = catalog.iter().find(|x| x.id == *id) {
+                    let is_act = if p.id == storage.active_provider { " [ACTIVE]" } else { "" };
+                    println!("  {:<16} · {:<30} (auth: {}){is_act}", p.id, p.name, p.auth_type);
+                }
+            }
+            println!("  --- Standard Providers ---");
+            for p in catalog.iter().take(20) {
+                if !priority_ids.contains(&p.id.as_str()) {
+                    let is_act = if p.id == storage.active_provider { " [ACTIVE]" } else { "" };
+                    println!("  {:<16} · {:<30} (auth: {}){is_act}", p.id, p.name, p.auth_type);
+                }
             }
             println!("... use `onyx provider status <name>` or `/provider <name>` to select");
             0
