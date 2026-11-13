@@ -90,6 +90,7 @@ onyx --allow-all
 
 ## Contributors
 
+- [Rafi Ullah Khan](https://github.com/EMP0RI0M) 
 - [Tanay Soni](https://github.com/TNInjas)
 
 ---
