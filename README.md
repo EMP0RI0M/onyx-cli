@@ -88,6 +88,12 @@ onyx --allow-all
 
 ---
 
+## Contributors
+
+- [Tanay Soni](https://github.com/TNInjas)
+
+---
+
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
