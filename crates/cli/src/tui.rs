@@ -3055,18 +3055,18 @@ impl<'a> Tui<'a> {
                 let is_act = if id == &storage.active_provider { " [ACTIVE]" } else { "" };
                 self.items.push(Item::Info(format!("  {:<16} · {:<24} ({auth_stat}){is_act}", id, name)));
             }
-            self.items.push(Item::Info("Usage: /provider <name> | /provider key <name> <api_key> | /provider login copilot".into()));
+            self.items.push(Item::Info("Usage: /provider <name> | /provider key <name> <api_key> | /provider login <claude|codex|antigravity|kimi|grok>".into()));
             return;
         }
 
         match parts[1] {
             "list" => {
                 let catalog = agent::provider::load_catalog();
-                self.items.push(Item::Info(format!("liter-llm Provider Catalog ({} providers):", catalog.len())));
-                for p in catalog.iter().take(20) {
+                self.items.push(Item::Info(format!("Available Providers ({} providers):", catalog.len())));
+                for p in catalog.iter().take(25) {
                     self.items.push(Item::Info(format!("  {:<16} · {:<28} (auth: {})", p.id, p.name, p.auth_type)));
                 }
-                self.items.push(Item::Info("... use /provider <name> to activate any of the 174 providers".into()));
+                self.items.push(Item::Info("... use /provider <name> (e.g. /provider claude, /provider codex, /provider antigravity)".into()));
             }
             "key" | "set-key" => {
                 if parts.len() < 4 {
