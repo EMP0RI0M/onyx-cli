@@ -14,10 +14,13 @@
 //! - L1 `RestrictedEnv`: no kernel primitives available — scrubbed environment
 //!   only. Honest label, weakest guarantee.
 
+#[cfg(target_os = "linux")]
 use std::io::Write;
+#[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
+#[cfg(target_os = "linux")]
 pub mod filter;
 
 /// What the kernel lets us do, discovered at runtime.
@@ -76,21 +79,29 @@ pub fn probe() -> Caps {
 /// Like `probe`, plus `[seccomp_rc, seccomp_errno]` diagnostics (zero when
 /// the install succeeded or nnp was unavailable so seccomp was not attempted).
 pub fn probe_diag() -> (Caps, [i32; 2]) {
-    let (userns, mountns) = probe_namespaces();
-    let mut diag = [0i32; 2];
-    let (nnp, sec) = probe_primitives_diag(&mut diag);
-    (
-        Caps {
-            userns,
-            mountns,
-            no_new_privs: nnp,
-            seccomp_filter: sec,
-            ptrace_emulator: filter::under_ptrace_emulator(),
-        },
-        diag,
-    )
+    #[cfg(target_os = "linux")]
+    {
+        let (userns, mountns) = probe_namespaces();
+        let mut diag = [0i32; 2];
+        let (nnp, sec) = probe_primitives_diag(&mut diag);
+        (
+            Caps {
+                userns,
+                mountns,
+                no_new_privs: nnp,
+                seccomp_filter: sec,
+                ptrace_emulator: filter::under_ptrace_emulator(),
+            },
+            diag,
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        (Caps::none(), [0, 0])
+    }
 }
 
+#[cfg(target_os = "linux")]
 fn wait_child(pid: libc::pid_t) -> u8 {
     unsafe {
         let mut status: i32 = 0;
@@ -108,6 +119,7 @@ fn wait_child(pid: libc::pid_t) -> u8 {
 /// Child: unshare user+mount(+ipc+uts) namespaces, write identity uid/gid maps
 /// (`unshare -r` style), require euid==0 inside, then prove the mount namespace
 /// by mounting a tmpfs at a scratch dir. Bits: 1=userns real, 2=mountns works.
+#[cfg(target_os = "linux")]
 pub fn probe_namespaces() -> (bool, bool) {
     unsafe {
         let pid = libc::fork();
@@ -149,6 +161,7 @@ pub fn probe_namespaces() -> (bool, bool) {
 /// Bits: 1=nnp ok, 2=filter install ok. On failure the child writes the raw
 /// syscall return and errno to `diag` so the parent can report WHY — probe
 /// results without diagnostics are how silent false negatives hide.
+#[cfg(target_os = "linux")]
 fn probe_primitives_diag(diag: &mut [i32; 2]) -> (bool, bool) {
     unsafe {
         let mut pipefd = [0i32; 2];
@@ -209,6 +222,7 @@ fn probe_primitives_diag(diag: &mut [i32; 2]) -> (bool, bool) {
 /// Write identity maps so our real uid appears as root inside the namespace
 /// (what `unshare --map-root-user` does). setgroups must be denied before a
 /// gid_map with group entries is accepted.
+#[cfg(target_os = "linux")]
 fn map_root_identity() {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
@@ -224,6 +238,7 @@ fn map_root_identity() {
 
 /// Which verdict this host can enforce, discovered behaviorally (PRoot fakes
 /// maps/env, so parent-side probes lie). Cached: costs one fork+exec.
+#[cfg(target_os = "linux")]
 fn strict_enforcement_ok() -> bool {
     use std::sync::OnceLock;
     static OK: OnceLock<bool> = OnceLock::new();
@@ -231,6 +246,7 @@ fn strict_enforcement_ok() -> bool {
 }
 
 /// Strict RET EPERM when demonstrably enforced; advisory ALLOW otherwise.
+#[cfg(target_os = "linux")]
 fn install_verdict_aware_filter() -> Result<bool, std::io::Error> {
     let mut prog = filter::build_deny_program().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "seccomp program too large")
@@ -268,40 +284,44 @@ pub fn run(level: Level, command: &str, cwd: Option<&str>) -> std::io::Result<(S
     if let Some(dir) = cwd {
         c.current_dir(dir);
     }
-    // Retain full parent environment under PRoot guests; scrub on native hosts.
-    // PRoot requires PROOT_* and related dynamic linker environment variables
-    // to track child execve hooks.
-    if !filter::under_ptrace_emulator() {
-        c.env_clear();
-        c.env("PATH", "/usr/bin:/bin:/usr/local/bin");
-        c.env("HOME", cwd.unwrap_or("/tmp"));
-        c.env("TMPDIR", "/tmp");
-        c.env("LANG", "C.UTF-8");
-    }
 
-    match level {
-        Level::Namespace => unsafe {
-            c.pre_exec(|| {
-                let flags = libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWIPC | libc::CLONE_NEWUTS;
-                if libc::unshare(flags) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                map_root_identity();
-                make_mounts_private();
-                install_verdict_aware_filter()?;
-                Ok(())
-            });
-        },
-        Level::SeccompOnly => unsafe {
-            c.pre_exec(|| {
-                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                install_verdict_aware_filter()?;
-                Ok(())
-            });
-        },
-        Level::RestrictedEnv => {}
+    #[cfg(target_os = "linux")]
+    {
+        // Retain full parent environment under PRoot guests; scrub on native hosts.
+        // PRoot requires PROOT_* and related dynamic linker environment variables
+        // to track child execve hooks.
+        if !filter::under_ptrace_emulator() {
+            c.env_clear();
+            c.env("PATH", "/usr/bin:/bin:/usr/local/bin");
+            c.env("HOME", cwd.unwrap_or("/tmp"));
+            c.env("TMPDIR", "/tmp");
+            c.env("LANG", "C.UTF-8");
+        }
+
+        match level {
+            Level::Namespace => unsafe {
+                c.pre_exec(|| {
+                    let flags = libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWIPC | libc::CLONE_NEWUTS;
+                    if libc::unshare(flags) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    map_root_identity();
+                    make_mounts_private();
+                    install_verdict_aware_filter()?;
+                    Ok(())
+                });
+            },
+            Level::SeccompOnly => unsafe {
+                c.pre_exec(|| {
+                    if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    install_verdict_aware_filter()?;
+                    Ok(())
+                });
+            },
+            Level::RestrictedEnv => {}
+        }
     }
 
     let out = c.output().map_err(|e| std::io::Error::new(
@@ -343,22 +363,30 @@ pub fn run(level: Level, command: &str, cwd: Option<&str>) -> std::io::Result<(S
 /// detection that matters for choosing strict vs advisory, because PRoot fakes
 /// both /proc/self/maps and the environment — parent-side probes see nothing.
 pub fn seccomp_enforcement_works() -> Option<bool> {
-    if filter::under_ptrace_emulator() {
-        return Some(false);
+    #[cfg(target_os = "linux")]
+    {
+        if filter::under_ptrace_emulator() {
+            return Some(false);
+        }
+        let out = run(Level::SeccompOnly, "umount /nonexistent-xyz 2>&1; echo rc=$?", None).ok()?;
+        if !out.0.contains("rc=0") {
+            return Some(true); // umount failed => EPERM denial reached the child
+        }
+        if out.0.contains("Operation not permitted") || out.0.contains("rc=32") {
+            return Some(true);
+        }
+        Some(false)
     }
-    let out = run(Level::SeccompOnly, "umount /nonexistent-xyz 2>&1; echo rc=$?", None).ok()?;
-    if !out.0.contains("rc=0") {
-        return Some(true); // umount failed => EPERM denial reached the child
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
     }
-    if out.0.contains("Operation not permitted") || out.0.contains("rc=32") {
-        return Some(true);
-    }
-    Some(false)
 }
 
 /// Inside the fresh mount namespace mark all mounts recursively private so
 /// nothing propagates back to the host. Deeper masking (hiding host paths) is
 /// a later-phase knob; Phase C keeps the workspace usable.
+#[cfg(target_os = "linux")]
 fn make_mounts_private() {
     unsafe {
         let slash = b"/\0".as_ptr() as *const libc::c_char;
