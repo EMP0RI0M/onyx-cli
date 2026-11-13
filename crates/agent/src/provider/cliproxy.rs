@@ -238,6 +238,10 @@ where
             if line.contains("Codex device code:") || line.contains("Enter code:") {
                 on_url(&line);
             }
+            // Once URL or code is displayed, return immediately so TUI never blocks or hangs!
+            if url_found {
+                return Ok(format!("OAuth link generated for `{target}`. Complete authorization in browser."));
+            }
             if line.contains("successfully") || line.contains("Authenticated") {
                 let _ = child.kill();
                 return Ok(format!("Authentication successful for `{target}`!"));
