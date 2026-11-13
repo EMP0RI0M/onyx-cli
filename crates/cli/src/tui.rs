@@ -1231,7 +1231,12 @@ enum ConnectStep {
 impl Tui<'_> {
     /// Curated providers shown under "Popular", mirroring what people actually
     /// wire up first: hosted flagships, subscriptions, and local engines.
-    const POPULAR_PROVIDERS: [&'static str; 10] = [
+    const POPULAR_PROVIDERS: [&'static str; 16] = [
+        "antigravity",
+        "claude",
+        "codex",
+        "kimi",
+        "grok",
         "anthropic",
         "openai",
         "openrouter",
@@ -1242,6 +1247,7 @@ impl Tui<'_> {
         "llamacpp",
         "custom_openai",
         "deepseek",
+        "cliproxyapi",
     ];
 
     fn open_connect_wizard(&mut self) {
@@ -4156,6 +4162,13 @@ impl<'a> Tui<'a> {
                         let _ = tx.send(Ctl::SetModel(m.to_string()));
                     }
                     self.opts.model = Some(m.to_string());
+                    // Also persist active_model in storage for active provider
+                    let mut storage = agent::provider::load_storage();
+                    if let Some(cfg) = storage.providers.get_mut(&storage.active_provider) {
+                        cfg.active_model = Some(m.to_string());
+                        let _ = agent::provider::save_storage(&storage);
+                    }
+                    self.save_persisted_config();
                     self.items.push(Item::Info(format!(
                         "switched model to: {} (context window: {} tokens)",
                         self.hm.model, self.hm.context_budget
