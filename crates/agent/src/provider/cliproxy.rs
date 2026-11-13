@@ -173,6 +173,12 @@ where
         format!("Unknown login provider `{target}`. Supported login providers: claude, codex, codex-device, antigravity, kimi, grok, muse, devin")
     })?;
 
+    // Kill any previous lingering login processes that might hold the callback port
+    let _ = Command::new("pkill")
+        .arg("-f")
+        .arg(format!("cliproxy.*{flag}"))
+        .status();
+
     let mut cmd = Command::new(&binary);
     cmd.arg(flag);
     if let Some(parent) = binary.parent() {
