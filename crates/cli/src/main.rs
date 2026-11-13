@@ -767,6 +767,9 @@ fn main() {
     }
 
     let cfg = omniroute_config();
+    if cfg.host == "127.0.0.1" || cfg.host == "localhost" || cfg.port == 8317 {
+        agent::provider::cliproxy::ensure_gateway_running(&cfg.base);
+    }
     let workdir = env::var("ONYX_WORKDIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| env::current_dir().unwrap_or_else(|_| env::temp_dir()));

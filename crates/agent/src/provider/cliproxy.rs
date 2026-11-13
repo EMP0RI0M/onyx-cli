@@ -122,6 +122,54 @@ pub fn is_gateway_running(host: &str, port: u16) -> bool {
     ).is_ok()
 }
 
+/// Automatically launch the CLIProxyAPI daemon in the background if it is not running
+pub fn ensure_gateway_running(endpoint: &str) -> bool {
+    let (host, port, _) = crate::provider::registry::split_base(endpoint);
+    if is_gateway_running(&host, port) {
+        return true;
+    }
+
+    // Only auto-launch for local loopback addresses
+    if host != "127.0.0.1" && host != "localhost" && host != "0.0.0.0" {
+        return false;
+    }
+
+    let Some(binary) = find_gateway_binary() else {
+        return false;
+    };
+
+    let mut cmd = Command::new(&binary);
+    if let Some(parent) = binary.parent() {
+        let cfg_path = parent.join("config.yaml");
+        if cfg_path.is_file() {
+            cmd.arg("-config").arg(cfg_path.display().to_string());
+        }
+    } else {
+        let default_cfg = PathBuf::from("/root/cliproxy/config.yaml");
+        if default_cfg.is_file() {
+            cmd.arg("-config").arg(default_cfg.display().to_string());
+        }
+    }
+
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
+    cmd.stdin(Stdio::null());
+
+    if let Ok(mut child) = cmd.spawn() {
+        // Detach child process so it survives Onyx turns
+        let _ = child.try_wait();
+        // Wait up to 1.5s for the port to become ready
+        for _ in 0..15 {
+            std::thread::sleep(Duration::from_millis(100));
+            if is_gateway_running(&host, port) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 /// Inspect the full status of the CLIProxyAPI gateway.
 pub fn inspect_gateway(custom_base_url: Option<&str>) -> GatewayInfo {
     let endpoint = custom_base_url

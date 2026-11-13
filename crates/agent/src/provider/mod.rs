@@ -465,6 +465,11 @@ pub fn check_provider_health(spec: &ProviderSpec, config: Option<&ProviderConfig
     let base_url = resolve_base_url(spec, config);
     let key = resolve_api_key(spec, config);
 
+    // Auto-launch local gateway if target is loopback or cliproxyapi
+    if spec.id == "cliproxyapi" || base_url.contains("127.0.0.1") || base_url.contains("localhost") || base_url.contains(":8317") {
+        let _ = crate::provider::cliproxy::ensure_gateway_running(&base_url);
+    }
+
     let (host, port, _sub) = crate::provider::registry::split_base(&base_url);
     let timeout = std::time::Duration::from_secs(3);
 
