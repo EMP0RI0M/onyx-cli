@@ -160,12 +160,14 @@ pub fn save_storage(storage: &ProvidersStorage) -> Result<(), String> {
 
 /// Write a file with mode 0600 before contents land (config may still hold refs).
 fn write_secret_file(path: &std::path::Path, contents: &str) -> Result<(), String> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
         .open(path)
         .map_err(|e| format!("write {}: {e}", path.display()))?;
     std::io::Write::write_all(&mut f, contents.as_bytes()).map_err(|e| format!("write: {e}"))?;

@@ -341,12 +341,14 @@ fn read_slots(doc: &Value) -> Result<Slots, String> {
 /// Write with mode 0600 BEFORE contents land, so the secret is never world- or
 /// group-readable even momentarily. Uses OpenOptions + Unix permission bits.
 fn write_secret_file(path: &PathBuf, contents: &str) -> Result<(), String> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
         .open(path)
         .map_err(|e| format!("open {}: {e}", path.display()))?;
     std::io::Write::write_all(&mut f, contents.as_bytes()).map_err(|e| format!("write: {e}"))?;
@@ -414,9 +416,12 @@ mod tests {
             v.tier = Tier::Plaintext;
             v.save().unwrap();
         }
-        use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "plaintext vault must be owner-only, got {:o}", mode);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "plaintext vault must be owner-only, got {:o}", mode);
+        }
         let v2 = Vault::load(path.clone(), None).unwrap();
         assert_eq!(v2.resolve("groq/api_key").as_deref(), Some("gsk_plain"));
         let _ = fs::remove_dir_all(&dir);
