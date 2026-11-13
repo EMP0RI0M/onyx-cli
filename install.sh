@@ -53,6 +53,10 @@ chmod +x "${DOWNLOADED_BIN}"
 # Installation target check
 mkdir -p "${INSTALL_DIR}" 2>/dev/null || true
 
+# If running as root or user has ~/.local/bin in PATH, update all matching onyx binaries found
+USER_BIN="${HOME}/.local/bin"
+mkdir -p "${USER_BIN}" 2>/dev/null || true
+
 if [ -w "${INSTALL_DIR}" ]; then
     install -m 755 "${DOWNLOADED_BIN}" "${INSTALL_DIR}/onyx"
 elif command -v sudo >/dev/null 2>&1; then
@@ -65,6 +69,13 @@ else
     install -m 755 "${DOWNLOADED_BIN}" "${FALLBACK_DIR}/onyx"
     INSTALL_DIR="${FALLBACK_DIR}"
     echo "→ Installed to ${FALLBACK_DIR}/onyx (make sure ${FALLBACK_DIR} is in your PATH)."
+fi
+
+# Also update ~/.local/bin/onyx if it exists or if INSTALL_DIR was different
+if [ -d "${USER_BIN}" ] && [ -w "${USER_BIN}" ] && [ "${INSTALL_DIR}" != "${USER_BIN}" ]; then
+    if [ -f "${USER_BIN}/onyx" ]; then
+        install -m 755 "${DOWNLOADED_BIN}" "${USER_BIN}/onyx"
+    fi
 fi
 
 echo ""

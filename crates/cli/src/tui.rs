@@ -1012,6 +1012,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/insights", "build session profiling analysis report"),
     ("/context", "visualize context window capacity limits"),
     ("/doctor", "validate setup and diagnose configuration"),
+    ("/update", "check for and install latest Onyx CLI updates"),
     ("/ping", "measure server latency to API endpoint"),
     ("/logs", "print local error traces and session logs"),
     ("/audit", "gateway policy audit logs"),
@@ -3649,6 +3650,35 @@ impl<'a> Tui<'a> {
         self.items.push(Item::Info("╰──────────────────────────────────────────────────────────────╯".into()));
     }
 
+    fn do_update(&mut self) {
+        self.items.push(Item::Info("Checking for latest Onyx CLI updates from GitHub...".into()));
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("curl -fsSL https://raw.githubusercontent.com/EMP0RI0M/onyx-cli/main/install.sh | bash")
+            .output();
+
+        match output {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                for l in stdout.lines() {
+                    let trimmed = l.trim();
+                    if !trimmed.is_empty() {
+                        self.items.push(Item::Info(trimmed.to_string()));
+                    }
+                }
+                if out.status.success() {
+                    self.items.push(Item::Info("✓ Onyx CLI update completed successfully.".into()));
+                } else {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    self.items.push(Item::Error(format!("Update failed (exit code {}): {}", out.status.code().unwrap_or(1), stderr.trim())));
+                }
+            }
+            Err(e) => {
+                self.items.push(Item::Error(format!("Failed to run update: {e}")));
+            }
+        }
+    }
+
     fn set_theme(&mut self, idx: usize) {
         const NAMES: [&str; 3] = ["onyx-cyan", "amber-term", "emerald"];
         theme::set_palette(idx);
@@ -4965,6 +4995,7 @@ impl<'a> Tui<'a> {
                 }
             }
             "/doctor" => self.do_doctor(),
+            "/update" => self.do_update(),
             "/ping" => self.do_ping(),
             "/context" => {
                 let (filled, empty, pct) = self.ctx_meter(24);
