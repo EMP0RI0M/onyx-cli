@@ -85,7 +85,6 @@ impl Tool for Bash {
         }
 
         let mut child = c.spawn().map_err(ToolError::Io)?;
-        let pid = child.id() as libc::pid_t;
 
         // Default command timeout: 60 seconds (prevents hanging indefinitely on dev servers like `npm run dev`)
         let timeout_secs = std::env::var("ONYX_BASH_TIMEOUT")
@@ -101,9 +100,7 @@ impl Tool for Bash {
                 None => {
                     if start.elapsed() > std::time::Duration::from_secs(timeout_secs) {
                         timed_out = true;
-                        unsafe {
-                            libc::kill(pid, libc::SIGKILL);
-                        }
+                        let _ = child.kill();
                         let _ = child.wait();
                         break std::process::ExitStatus::default();
                     }
