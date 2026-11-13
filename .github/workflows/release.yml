@@ -41,9 +41,9 @@ jobs:
             use_cross: false
             binary_name: onyx
             asset_name: onyx-darwin-arm64
-          # macOS Intel
+          # macOS Intel (built on Apple Silicon runner via Xcode target)
           - target: x86_64-apple-darwin
-            os: macos-14
+            os: macos-latest
             use_cross: false
             binary_name: onyx
             asset_name: onyx-darwin-amd64
