@@ -99,58 +99,6 @@ mod glyphs {
     pub const THUMB_CHAR: char = '█';
 }
 
-/// Raw-mode guard: restores termios on drop, including panic unwind.
-#[cfg(unix)]
-struct RawMode(libc::termios);
-
-#[cfg(unix)]
-impl RawMode {
-    fn enter() -> Option<Self> {
-        let mut t: libc::termios = unsafe { std::mem::zeroed() };
-        if unsafe { libc::tcgetattr(0, &mut t) } != 0 {
-            return None;
-        }
-        let mut raw = t;
-        unsafe { libc::cfmakeraw(&mut raw) };
-        // Retain standard post-processing (OPOST and ONLCR) so \n translates
-        // to CR+LF (\r\n) on output and doesn't stair-step across the screen.
-        raw.c_oflag |= libc::OPOST | libc::ONLCR;
-        // Keep signals we want delivered as BYTES off the signal path: ISIG
-        // would turn ctrl+c into SIGINT and kill us before the reader sees it.
-        raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
-        raw.c_cc[libc::VMIN] = 1;
-        raw.c_cc[libc::VTIME] = 0;
-        if unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw) } != 0 {
-            return None;
-        }
-        Some(Self(t))
-    }
-}
-
-#[cfg(unix)]
-impl Drop for RawMode {
-    fn drop(&mut self) {
-        unsafe { libc::tcsetattr(0, libc::TCSANOW, &self.0) };
-    }
-}
-
-#[cfg(not(unix))]
-struct RawMode;
-
-#[cfg(not(unix))]
-impl RawMode {
-    fn enter() -> Option<Self> {
-        let _ = crossterm::terminal::enable_raw_mode();
-        Some(Self)
-    }
-}
-
-#[cfg(not(unix))]
-impl Drop for RawMode {
-    fn drop(&mut self) {
-        let _ = crossterm::terminal::disable_raw_mode();
-    }
-}
 
 fn term_size() -> (u16, u16) {
     #[cfg(unix)]
@@ -405,7 +353,7 @@ fn decode_key(buf: &[u8]) -> (Vec<char>, u32) {
 /// Background stdin pump: reads raw bytes, splits them into key events, and
 /// forwards each event over an mpsc channel. On exit the joiner drops the
 /// sender, the thread sees send() fail and exits, cooked mode is restored by
-/// RawMode's Drop, and any unread keystrokes flush to the shell afterwards.
+/// AltScreenGuard's Drop, and any unread keystrokes flush to the shell afterwards.
 struct InputPump {
     rx: Receiver<Vec<u8>>,
     stop: Arc<Mutex<bool>>,
@@ -6839,21 +6787,10 @@ pub fn tui_session(
     opts: &mut Opts,
     sel: Option<&agent::retrieval::CapabilitySelector>,
 ) {
-    // termios raw-mode guard drives the byte-level InputPump (VMIN=1 blocking
-    // read with ISIG/ECHO off). Kept alongside crossterm's raw mode so key
-    // decoding and the tick cadence are unchanged from the ANSI renderer.
-    let _raw = match RawMode::enter() {
-        Some(r) => r,
-        None => {
-            eprintln!("onyx: cannot enter raw mode — stdin is not a tty?");
-            return;
-        }
-    };
-
-    // Crossterm owns the alternate-screen buffer + cursor visibility that the
-    // ratatui renderer draws into. RAII guard restores on every exit path.
+    // Crossterm manages raw mode (disabling ICANON/ECHO/ISIG with VMIN=1) and snapshots
+    // the true cooked terminal state cleanly. RAII AltScreenGuard restores it on all exit paths.
     if ct_enable_raw().is_err() {
-        eprintln!("onyx: cannot enable crossterm raw mode");
+        eprintln!("onyx: cannot enter raw mode — stdin is not a tty?");
         return;
     }
     {

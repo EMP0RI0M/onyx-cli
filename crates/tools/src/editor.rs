@@ -26,13 +26,13 @@ impl StrReplaceEditor {
                     self.base_dir.join(rel)
                 } else {
                     return Err(ToolError::BadArgs(format!(
-                        "path `{path}` is outside working directory `{}`",
+                        "absolute path `{path}` is outside working directory `{}`",
                         self.base_dir.display()
                     )));
                 }
             } else {
                 return Err(ToolError::BadArgs(format!(
-                    "path `{path}` is outside working directory `{}`",
+                    "absolute path `{path}` is outside working directory `{}`",
                     self.base_dir.display()
                 )));
             }
