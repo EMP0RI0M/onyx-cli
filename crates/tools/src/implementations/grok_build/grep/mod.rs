@@ -12,7 +12,10 @@ impl Grep {
         Self { base_dir: base_dir.as_ref().to_path_buf() }
     }
 
-    fn search_dir(&self, dir: &Path, pattern: &str, case_insensitive: bool, results: &mut Vec<String>, max_matches: usize) {
+    fn search_dir(&self, dir: &Path, pattern: &str, case_insensitive: bool, results: &mut Vec<String>, max_matches: usize, depth: usize) {
+        if depth > 12 {
+            return;
+        }
         let Ok(entries) = fs::read_dir(dir) else { return };
         for entry in entries.flatten() {
             if results.len() >= max_matches {
@@ -20,13 +23,30 @@ impl Grep {
             }
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
-            // Skip common hidden or target dirs
-            if name.starts_with('.') || name == "target" || name == "node_modules" {
+            // Skip common hidden, target, dependency, or cache dirs
+            if name.starts_with('.')
+                || name == "target"
+                || name.contains("node_modules")
+                || name == "dist"
+                || name == "build"
+                || name == ".git"
+                || name == "vendor"
+                || name == ".cache"
+                || name == "__pycache__"
+                || name == ".venv"
+                || name == "venv"
+            {
                 continue;
             }
             if path.is_dir() {
-                self.search_dir(&path, pattern, case_insensitive, results, max_matches);
+                self.search_dir(&path, pattern, case_insensitive, results, max_matches, depth + 1);
             } else if path.is_file() {
+                // Skip binary or huge files (> 2 MB)
+                if let Ok(metadata) = entry.metadata() {
+                    if metadata.len() > 2 * 1024 * 1024 {
+                        continue;
+                    }
+                }
                 if let Ok(content) = fs::read_to_string(&path) {
                     for (idx, line) in content.lines().enumerate() {
                         let matched = if case_insensitive {
@@ -70,7 +90,7 @@ impl Tool for Grep {
         let case_insensitive = args.get("case_insensitive").and_then(|v| v.as_bool()).unwrap_or(false);
 
         let mut results = Vec::new();
-        self.search_dir(&start_dir, pattern, case_insensitive, &mut results, 100);
+        self.search_dir(&start_dir, pattern, case_insensitive, &mut results, 100, 0);
 
         if results.is_empty() {
             Ok(Output::ok("no matches found"))
