@@ -86,6 +86,27 @@ impl Tool for Bash {
 
         let mut child = c.spawn().map_err(ToolError::Io)?;
 
+        // Immediately start background readers triggered by OS kernel when data arrives,
+        // draining stdout/stderr pipes so the 64KB pipe buffer is freed up instantly.
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+
+        let stdout_handle = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = stdout_pipe {
+                let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
+            }
+            buf
+        });
+
+        let stderr_handle = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = stderr_pipe {
+                let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
+            }
+            buf
+        });
+
         // Default command timeout: 60 seconds (prevents hanging indefinitely on dev servers like `npm run dev`)
         let timeout_secs = std::env::var("ONYX_BASH_TIMEOUT")
             .ok()
@@ -109,14 +130,8 @@ impl Tool for Bash {
             }
         };
 
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        if let Some(mut out) = child.stdout.take() {
-            let _ = std::io::Read::read_to_end(&mut out, &mut stdout);
-        }
-        if let Some(mut err) = child.stderr.take() {
-            let _ = std::io::Read::read_to_end(&mut err, &mut stderr);
-        }
+        let stdout = stdout_handle.join().unwrap_or_default();
+        let stderr = stderr_handle.join().unwrap_or_default();
 
         let stdout_str = String::from_utf8_lossy(&stdout);
         let stderr_str = String::from_utf8_lossy(&stderr);
@@ -140,5 +155,22 @@ impl Tool for Bash {
         let is_success = status.success() && !timed_out;
 
         Ok(format_command_output(cmd, &content, code, is_success))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn bash_large_output_does_not_deadlock() {
+        let tool = Bash::new();
+        // 200,000 bytes > 64KB OS pipe buffer
+        let args = json!({"command": "python3 -c \"print('A' * 200000)\""});
+        let start = std::time::Instant::now();
+        let res = tool.execute(&args).expect("must succeed without deadlocking");
+        assert!(start.elapsed() < std::time::Duration::from_secs(5), "execution must be immediate, took {:?}", start.elapsed());
+        assert!(!res.is_error);
     }
 }
