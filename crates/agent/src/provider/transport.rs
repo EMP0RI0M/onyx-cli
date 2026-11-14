@@ -333,7 +333,8 @@ pub(crate) fn decode_chunked(mut body: &[u8]) -> Vec<u8> {
             None => break,
         };
         let line = String::from_utf8_lossy(&body[..nl]);
-        let size = match usize::from_str_radix(line.trim(), 16) {
+        let hex_part = line.split(';').next().unwrap_or("").trim();
+        let size = match usize::from_str_radix(hex_part, 16) {
             Ok(s) => s,
             Err(_) => break,
         };
@@ -374,5 +375,12 @@ mod tests {
 
         let head_custom = build_head("POST", "localhost", 11434, "/v1/chat", None, &[], None);
         assert!(head_custom.contains("Host: localhost:11434\r\n"), "got: {head_custom}");
+    }
+
+    #[test]
+    fn test_decode_chunked_with_extensions() {
+        let raw = b"5;foo=bar\r\nhello\r\n6;ext1=val1;ext2\r\n world\r\n0\r\n\r\n";
+        let decoded = decode_chunked(raw);
+        assert_eq!(String::from_utf8_lossy(&decoded), "hello world");
     }
 }
