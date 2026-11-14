@@ -363,7 +363,13 @@ mod tests {
         assert!(tools.get("spawn_subagent").is_some());
         assert!(tools.get("swarm").is_some());
 
-        // Now spawn subagent and check that within the subagent, spawn_subagent cannot be called
+        // Verify that build_child_tools strips spawn_subagent and swarm
+        let child_tools = build_child_tools(&tools, None);
+        assert!(child_tools.get("spawn_subagent").is_none());
+        assert!(child_tools.get("swarm").is_none());
+
+        // Now spawn subagent and check that when the subagent attempts recursive spawning,
+        // it fails at the gateway and is recorded as an error in audit.
         let model = ScriptedModel::new(
             vec![
                 Step::call("spawn_subagent", json!({"task": "recursive"})),
@@ -372,8 +378,11 @@ mod tests {
             "never reached either",
         );
 
-        let res = spawn_subagent("test depth", model, &tools, None, 4);
-        assert!(res.is_err(), "Calling spawn_subagent from child must fail at gateway");
+        let res = spawn_subagent("test depth", model, &tools, None, 4).unwrap();
+        // spawn_subagent was stripped by the depth guard, so it was never executed
+        assert!(res.audit.iter().all(|a| a.tool != "spawn_subagent"));
+        assert_eq!(res.audit.len(), 1);
+        assert_eq!(res.audit[0].tool, "terminate");
     }
 
     #[test]
