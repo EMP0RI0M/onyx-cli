@@ -178,7 +178,6 @@ pub fn default_collection(editor_base: std::path::PathBuf) -> ToolCollection {
     c.add(python::PythonExecute::default());
     c.add(editor::StrReplaceEditor::new(editor_base.clone()));
     c.add(planning::Planning::default());
-    c.add(websearch::WebSearch);
     c.add(vecmath::VecMath);
     c.add(control::Terminate);
     c.add(control::AskHuman);
