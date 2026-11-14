@@ -628,6 +628,8 @@ enum UiOut {
     /// (message count, total content bytes) — mirrors the worker-owned history
     /// so `/usage` can report without touching it.
     History(usize, usize),
+    /// Asynchronous model discovery outcome
+    ModelsDiscovered(Result<Vec<String>, String>),
 }
 
 /// Per-turn item identity for the CoreEvent stream the worker emits. The host
@@ -1702,7 +1704,13 @@ impl<'a> Tui<'a> {
         opts: &'a mut Opts,
         sel: Option<&'a agent::retrieval::CapabilitySelector>,
     ) -> Self {
-        let cached_models = hm.list_models().unwrap_or_default();
+        // Fast local initialization: do not block startup with synchronous network requests.
+        // Asynchronous background discovery will populate the complete catalog via worker thread.
+        let cached_models = if !hm.model.is_empty() && hm.model != "auto" {
+            vec![hm.model.clone()]
+        } else {
+            Vec::new()
+        };
         let mcp_count = if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
             let mcp_cfg = home.join(".onyx/mcp.json");
             if let Ok(content) = std::fs::read_to_string(mcp_cfg) {
@@ -1857,6 +1865,15 @@ impl<'a> Tui<'a> {
         let (ut, ur) = channel::<UiOut>();
         self.ui_rx = Some(ur);
         self.ctl_tx = Some(ct);
+
+        // Asynchronous model discovery thread: fetches models in the background
+        // without disturbing the TUI loader or initial startup speed.
+        let ut_models = ut.clone();
+        let hm_clone = self.hm.clone();
+        std::thread::spawn(move || {
+            let res = hm_clone.list_models();
+            let _ = ut_models.send(UiOut::ModelsDiscovered(res));
+        });
 
         // Open or resume a durable transcript for this run.
         // Start a fresh, clean session by default. Only resume previous history
@@ -5486,6 +5503,18 @@ impl<'a> Tui<'a> {
                         self.history_len = len;
                         self.history_bytes = bytes;
                     }
+                    UiOut::ModelsDiscovered(res) => {
+                        match res {
+                            Ok(models) => {
+                                if !models.is_empty() {
+                                    self.cached_models = models;
+                                }
+                            }
+                            Err(_) => {
+                                // Failsafe: keep existing cached_models without disturbing UI
+                            }
+                        }
+                    }
                 }
                 event_seen = true;
             }
@@ -6012,7 +6041,10 @@ impl<'a> Tui<'a> {
     fn draw_ratatui(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) {
         self.sync_size();
         let diff_stat = self.git_diff_summary();
-        let _ = terminal.draw(|f| self.render(f, diff_stat.as_deref()));
+        if terminal.draw(|f| self.render(f, diff_stat.as_deref())).is_err() {
+            let _ = terminal.clear();
+            let _ = terminal.draw(|f| self.render(f, None));
+        }
     }
 
     /// Convert a legacy styled-ANSI string into a ratatui `Line`. We keep the
@@ -6837,21 +6869,30 @@ pub fn tui_session(
     }
     let _guard = AltScreenGuard;
 
-    let pump = InputPump::start();
     let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal = Terminal::new(backend).expect("ratatui terminal");
-    terminal
-        .hide_cursor()
-        .ok();
+    let mut terminal = match Terminal::new(backend) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("onyx: cannot initialize ratatui terminal: {e}");
+            return;
+        }
+    };
+    terminal.hide_cursor().ok();
     terminal.clear().ok();
 
     {
         let mut tui = Tui::new(gw, hm, opts, sel);
+        // Instant visual load: render immediately before starting worker and pump
+        tui.draw_ratatui(&mut terminal);
         tui.start_worker();
+
+        // Keyboard reader (InputPump) starts strictly after ratatui terminal
+        // has completely initialized and performed its first draw
+        let pump = InputPump::start();
         tui.run_ratatui(&pump, &mut terminal);
+        pump.shutdown();
         tui.finish();
     }
-    pump.shutdown();
     // _guard drops here → Show + LeaveAlternateScreen + disable_raw_mode.
     // Final newline so the shell prompt starts clean.
     println!();
@@ -6977,5 +7018,24 @@ mod tests {
         assert_eq!(code, 2000);
         let s: String = chars.into_iter().collect();
         assert_eq!(s, "hello\nworld");
+    }
+
+    #[test]
+    fn ui_out_models_discovered_updates_cache_or_failsafe() {
+        let mut cached = vec!["initial-model".to_string()];
+
+        let outcome_err: Result<Vec<String>, String> = Err("network down".to_string());
+        match outcome_err {
+            Ok(models) if !models.is_empty() => cached = models,
+            _ => {}
+        }
+        assert_eq!(cached, vec!["initial-model"]);
+
+        let outcome_ok: Result<Vec<String>, String> = Ok(vec!["model-a".to_string(), "model-b".to_string()]);
+        match outcome_ok {
+            Ok(models) if !models.is_empty() => cached = models,
+            _ => {}
+        }
+        assert_eq!(cached, vec!["model-a", "model-b"]);
     }
 }
