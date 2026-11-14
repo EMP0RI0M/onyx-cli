@@ -6153,7 +6153,7 @@ impl<'a> Tui<'a> {
 
         // ── header (centered block-glyph ONYX banner + tagline) ──
         let account = std::env::var("ONYX_ACCOUNT").unwrap_or_else(|_| "local".to_string());
-        let wide_header = w >= 40 && area.height >= 12;
+        let wide_header = w >= 60 && area.height >= 24;
         const BANNER_ROWS: [&'static str; 6] = [
             "██████╗ ███╗   ██╗██╗   ██╗██╗  ██╗",
             "██╔═══██╗████╗  ██║╚██╗ ██╔╝╚██╗██╔╝",
@@ -6180,13 +6180,17 @@ impl<'a> Tui<'a> {
             RuSpan::styled("ONYX ", theme::strong()),
             RuSpan::styled(account.clone(), theme::rgb(theme::INFO)),
             RuSpan::styled(" · ", theme::dim()),
-            RuSpan::styled(model_title, theme::dim()),
+            RuSpan::styled(model_title.clone(), theme::dim()),
         ]);
-        // Header: 7 rows (banner + tagline) when wide, 1 compact row otherwise.
+        // Header: 7 rows (banner + tagline) when wide (h >= 24, w >= 60), 1 compact row otherwise.
         let header_h = if wide_header { 8u16 } else { 1u16 };
         let compact_mark = RuLine::from(vec![
             RuSpan::styled("◆ ", theme::accent_bold()),
             RuSpan::styled("ONYX · INTELLIGENCE ENGINE", theme::strong()),
+            RuSpan::styled("  ", theme::dim()),
+            RuSpan::styled(account.clone(), theme::rgb(theme::INFO)),
+            RuSpan::styled(" · ", theme::dim()),
+            RuSpan::styled(model_title, theme::dim()),
         ]);
 
         // ── status/context strip (session id · model · ctx sparkline · pct) ──
@@ -6990,5 +6994,65 @@ mod tests {
             _ => {}
         }
         assert_eq!(cached, vec!["model-a", "model-b"]);
+    }
+
+    #[test]
+    fn test_adaptive_header_rendering_for_small_and_large_terminals() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use tools::ToolCollection;
+        use tools::policy::{AllowAll, Policy};
+
+        let tool_col = ToolCollection::new();
+        let mut gw = tools::audit::Gateway::<dyn Policy>::from_boxed(tool_col, Box::new(AllowAll));
+        let mut hm = agent::model::HttpModel::new(
+            "localhost".into(),
+            8080,
+            "test-model".into(),
+            "key".into(),
+            "".into(),
+        );
+        let mut opts = crate::Opts {
+            doctor: false,
+            update: false,
+            provider_cmd: None,
+            model: None,
+            max_steps: 10,
+            allow_all: true,
+            guardian: false,
+            sandbox: false,
+            skill: None,
+            resume: None,
+            fresh: false,
+            print: None,
+            legacy: false,
+        };
+
+        let tui = Tui::new(&mut gw, &mut hm, &mut opts, None);
+
+        // 1. Small terminal (80 cols x 16 rows) -> must use compact 1-line header
+        let backend = TestBackend::new(80, 16);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| tui.render(f, None)).unwrap();
+
+        let buffer = term.backend().buffer();
+        let line0: String = (0..80).map(|x| buffer[(x, 0)].symbol().chars().next().unwrap_or(' ')).collect();
+        assert!(line0.contains("ONYX · INTELLIGENCE ENGINE"), "Expected compact header on small terminal, got: {line0}");
+
+        // 2. Large terminal (80 cols x 30 rows) -> must use wide block-glyph banner
+        let backend_large = TestBackend::new(80, 30);
+        let mut term_large = Terminal::new(backend_large).unwrap();
+        term_large.draw(|f| tui.render(f, None)).unwrap();
+
+        let buffer_large = term_large.backend().buffer();
+        let mut found_glyph = false;
+        for y in 0..7 {
+            let row: String = (0..80).map(|x| buffer_large[(x, y)].symbol().chars().next().unwrap_or(' ')).collect();
+            if row.contains('█') {
+                found_glyph = true;
+                break;
+            }
+        }
+        assert!(found_glyph, "Expected full block banner on large terminal");
     }
 }
