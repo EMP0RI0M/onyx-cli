@@ -3600,7 +3600,8 @@ impl<'a> Tui<'a> {
         match std::net::TcpStream::connect((host.as_str(), port)) {
             Ok(mut s) => {
                 use std::io::{Read, Write};
-                let req = format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
+                let host_hdr = if port == 80 || port == 443 { host.clone() } else { format!("{host}:{port}") };
+                let req = format!("GET {path} HTTP/1.1\r\nHost: {host_hdr}\r\nConnection: close\r\n\r\n");
                 let _ = s.write_all(req.as_bytes());
                 let mut buf = [0u8; 16];
                 let _ = s.read(&mut buf);

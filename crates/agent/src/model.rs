@@ -1163,7 +1163,8 @@ pub fn http_sse(
     sock.set_read_timeout(Some(Duration::from_secs(220))).ok();
 
     let mut req = String::new();
-    req.push_str(&format!("{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nAccept: text/event-stream\r\n"));
+    let host_hdr = crate::provider::transport::format_host_header(host, port);
+    req.push_str(&format!("{method} {path} HTTP/1.1\r\nHost: {host_hdr}\r\nAccept: text/event-stream\r\n"));
     if let Some(a) = auth {
         req.push_str(&format!("Authorization: Bearer {a}\r\n"));
     }

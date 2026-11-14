@@ -68,9 +68,14 @@ impl McpClient {
         sock.set_write_timeout(Some(Duration::from_secs(10))).ok();
         sock.set_read_timeout(Some(Duration::from_secs(30))).ok();
 
+        let host_header = if self.port == 80 || self.port == 443 {
+            self.host.clone()
+        } else {
+            format!("{}:{}", self.host, self.port)
+        };
         let req = format!(
-            "POST {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            self.path, self.host, self.port, req_body.len(), req_body
+            "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            self.path, host_header, req_body.len(), req_body
         );
 
         sock.write_all(req.as_bytes())
