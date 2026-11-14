@@ -1091,6 +1091,8 @@ pub struct Tui<'a> {
     last_browser_height: usize,
     cached_diff_stat: Option<String>,
     last_diff_check: Option<std::time::Instant>,
+    diff_stat_rx: Option<std::sync::mpsc::Receiver<Option<String>>>,
+    diff_stat_in_flight: bool,
 }
 
 /// Full-screen "Chat Sessions" picker opened by bare `/resume`. Complements —
@@ -1768,6 +1770,8 @@ impl<'a> Tui<'a> {
             last_browser_height: 10,
             cached_diff_stat: None,
             last_diff_check: None,
+            diff_stat_rx: None,
+            diff_stat_in_flight: false,
             workspace_dir: std::env::current_dir()
                 .map(|p| {
                     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
@@ -5091,56 +5095,68 @@ impl<'a> Tui<'a> {
         Some(base.join("skills"))
     }
 
-    /// Git diff short summary (+lines -lines) for the current workspace (cached for 5 seconds)
+    /// Git diff short summary (+lines -lines) for the current workspace (asynchronous non-blocking background query, cached for 5 seconds)
     fn git_diff_summary(&mut self) -> Option<String> {
+        // Collect any finished background result
+        if let Some(ref rx) = self.diff_stat_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.cached_diff_stat = res;
+                self.diff_stat_in_flight = false;
+                self.diff_stat_rx = None;
+            }
+        }
+
         let now = std::time::Instant::now();
-        if let (Some(last), Some(cached)) = (self.last_diff_check, &self.cached_diff_stat) {
-            if now.duration_since(last) < Duration::from_secs(5) {
-                return Some(cached.clone());
-            }
-        } else if let Some(last) = self.last_diff_check {
-            if now.duration_since(last) < Duration::from_secs(5) {
-                return None;
-            }
+        let should_spawn = !self.diff_stat_in_flight
+            && match self.last_diff_check {
+                Some(last) => now.duration_since(last) >= Duration::from_secs(5),
+                None => true,
+            };
+
+        if should_spawn {
+            self.last_diff_check = Some(now);
+            self.diff_stat_in_flight = true;
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.diff_stat_rx = Some(rx);
+
+            std::thread::spawn(move || {
+                let out = std::process::Command::new("git")
+                    .args(["diff", "--shortstat"])
+                    .output()
+                    .ok();
+                let res = out.and_then(|o| {
+                    if !o.status.success() {
+                        return None;
+                    }
+                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if s.is_empty() {
+                        return None;
+                    }
+                    let mut ins = 0;
+                    let mut del = 0;
+                    for part in s.split(',') {
+                        let part = part.trim();
+                        if part.contains("insertion") {
+                            if let Some(num) = part.split_whitespace().next().and_then(|n| n.parse::<usize>().ok()) {
+                                ins = num;
+                            }
+                        } else if part.contains("deletion") {
+                            if let Some(num) = part.split_whitespace().next().and_then(|n| n.parse::<usize>().ok()) {
+                                del = num;
+                            }
+                        }
+                    }
+                    if ins > 0 || del > 0 {
+                        Some(format!("+{ins} -{del}"))
+                    } else {
+                        None
+                    }
+                });
+                let _ = tx.send(res);
+            });
         }
 
-        self.last_diff_check = Some(now);
-
-        let out = std::process::Command::new("git")
-            .args(["diff", "--shortstat"])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            self.cached_diff_stat = None;
-            return None;
-        }
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if s.is_empty() {
-            self.cached_diff_stat = None;
-            return None;
-        }
-        // Example output: "6 files changed, 331 insertions(+), 76 deletions(-)"
-        let mut ins = 0;
-        let mut del = 0;
-        for part in s.split(',') {
-            let part = part.trim();
-            if part.contains("insertion") {
-                if let Some(num) = part.split_whitespace().next().and_then(|n| n.parse::<usize>().ok()) {
-                    ins = num;
-                }
-            } else if part.contains("deletion") {
-                if let Some(num) = part.split_whitespace().next().and_then(|n| n.parse::<usize>().ok()) {
-                    del = num;
-                }
-            }
-        }
-        let res = if ins > 0 || del > 0 {
-            Some(format!("+{ins} -{del}"))
-        } else {
-            None
-        };
-        self.cached_diff_stat = res.clone();
-        res
+        self.cached_diff_stat.clone()
     }
 
     /// Run the SkillOpt-Sleep offline cycle over saved transcripts and gate the
