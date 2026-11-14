@@ -100,8 +100,10 @@ mod glyphs {
 }
 
 /// Raw-mode guard: restores termios on drop, including panic unwind.
+#[cfg(unix)]
 struct RawMode(libc::termios);
 
+#[cfg(unix)]
 impl RawMode {
     fn enter() -> Option<Self> {
         let mut t: libc::termios = unsafe { std::mem::zeroed() };
@@ -125,19 +127,45 @@ impl RawMode {
     }
 }
 
+#[cfg(unix)]
 impl Drop for RawMode {
     fn drop(&mut self) {
         unsafe { libc::tcsetattr(0, libc::TCSANOW, &self.0) };
     }
 }
 
-fn term_size() -> (u16, u16) {
-    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    if unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_row > 0 && ws.ws_col > 0 {
-        (ws.ws_row, ws.ws_col)
-    } else {
-        (24, 80)
+#[cfg(not(unix))]
+struct RawMode;
+
+#[cfg(not(unix))]
+impl RawMode {
+    fn enter() -> Option<Self> {
+        let _ = crossterm::terminal::enable_raw_mode();
+        Some(Self)
     }
+}
+
+#[cfg(not(unix))]
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+fn term_size() -> (u16, u16) {
+    #[cfg(unix)]
+    {
+        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        if unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_row > 0 && ws.ws_col > 0 {
+            return (ws.ws_row, ws.ws_col);
+        }
+    }
+    if let Ok((cols, rows)) = crossterm::terminal::size() {
+        if rows > 0 && cols > 0 {
+            return (rows, cols);
+        }
+    }
+    (24, 80)
 }
 
 /// Terminal cells a char occupies: CJK/fullwidth blocks are 2, combining marks
@@ -397,7 +425,10 @@ impl InputPump {
                 if *stop2.lock().unwrap() {
                     break;
                 }
+                #[cfg(unix)]
                 let n = unsafe { libc::read(0, tmp.as_mut_ptr() as *mut libc::c_void, tmp.len()) };
+                #[cfg(not(unix))]
+                let n = unsafe { libc::read(0, tmp.as_mut_ptr() as *mut libc::c_void, tmp.len() as libc::c_uint) as isize };
                 if n <= 0 {
                     if n < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                         continue;
@@ -1902,6 +1933,7 @@ impl<'a> Tui<'a> {
             // New session so bash/python children get their OWN controlling
             // terminal: under raw mode a child reading inherited fd 0 would see
             // single raw keystrokes instead of cooked line input.
+            #[cfg(unix)]
             unsafe { libc::setsid() };
             let gw: &Gateway<dyn tools::policy::Policy> = unsafe { &*job.gw };
             let hm: &mut HttpModel = unsafe { &mut *job.hm };
