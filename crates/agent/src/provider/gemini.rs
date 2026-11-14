@@ -98,6 +98,10 @@ impl ProviderProtocol for Gemini {
 
     fn parse_reply(&self, raw: &str) -> Result<ParsedReply, String> {
         let v: Value = serde_json::from_str(raw).map_err(|e| format!("parse reply: {e}"))?;
+        if let Some(err) = v.get("error") {
+            let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("gemini error");
+            return Err(msg.to_string());
+        }
         Ok(parse_candidate(&v))
     }
 
@@ -110,6 +114,13 @@ impl ProviderProtocol for Gemini {
     ) -> bool {
         // Each SSE data payload is one generateContent-shaped object.
         let Ok(v) = serde_json::from_str::<Value>(data) else { return true };
+        if let Some(err) = v.get("error") {
+            let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("gemini error");
+            acc.content = format!("[error: {msg}]");
+            on_delta(&acc.content);
+            acc.done = true;
+            return false;
+        }
         let p = parse_candidate(&v);
         if !p.content.is_empty() {
             acc.content.push_str(&p.content);
@@ -250,5 +261,26 @@ mod tests {
         let decl = &body["tools"][0]["functionDeclarations"][0];
         assert!(decl["parameters"].get("additionalProperties").is_none());
         assert_eq!(decl["parameters"]["properties"]["x"]["type"], "string");
+    }
+
+    #[test]
+    fn parses_error_reply_and_stream_error() {
+        let err_json = r#"{"error":{"code":400,"message":"API key not valid. Please pass a valid API key.","status":"INVALID_ARGUMENT"}}"#;
+        let res = Gemini.parse_reply(err_json);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err(), "API key not valid. Please pass a valid API key.");
+
+        let mut acc = StreamAcc::default();
+        let mut delta_out = String::new();
+        let cont = Gemini.parse_stream_event(
+            err_json,
+            &mut acc,
+            &mut |d| delta_out.push_str(d),
+            &mut |_| {},
+        );
+        assert!(!cont, "stream should stop on error");
+        assert!(acc.done);
+        assert_eq!(acc.content, "[error: API key not valid. Please pass a valid API key.]");
+        assert_eq!(delta_out, "[error: API key not valid. Please pass a valid API key.]");
     }
 }

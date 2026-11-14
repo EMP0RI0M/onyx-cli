@@ -63,6 +63,10 @@ impl ProviderProtocol for OpenAiCompat {
 
     fn parse_reply(&self, raw: &str) -> Result<ParsedReply, String> {
         let v: Value = serde_json::from_str(raw).map_err(|e| format!("parse reply: {e}"))?;
+        if let Some(err) = v.get("error") {
+            let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown error");
+            return Err(msg.to_string());
+        }
         let choice = v.get("choices").and_then(|c| c.get(0));
         let msg = choice.and_then(|c| c.get("message"));
         let content = msg
@@ -104,6 +108,13 @@ impl ProviderProtocol for OpenAiCompat {
             return false;
         }
         let Ok(v) = serde_json::from_str::<Value>(data) else { return true };
+        if let Some(err) = v.get("error") {
+            let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown error");
+            acc.content = format!("[error: {msg}]");
+            on_delta(&acc.content);
+            acc.done = true;
+            return false;
+        }
         if let Some(u) = v.get("usage") {
             acc.usage = usage_from(&v).or(acc.usage.take());
             let _ = u;
@@ -252,5 +263,26 @@ mod tests {
         );
         assert_eq!(collected, vec!["Hello ".to_string(), "world!".to_string()]);
         assert_eq!(acc.content, "Hello world!");
+    }
+
+    #[test]
+    fn parses_error_reply_and_stream_error() {
+        let err_json = r#"{"error":{"message":"Invalid API key provided","type":"invalid_request_error"}}"#;
+        let res = OpenAiCompat.parse_reply(err_json);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err(), "Invalid API key provided");
+
+        let mut acc = StreamAcc::default();
+        let mut delta_out = String::new();
+        let cont = OpenAiCompat.parse_stream_event(
+            err_json,
+            &mut acc,
+            &mut |d| delta_out.push_str(d),
+            &mut |_| {},
+        );
+        assert!(!cont, "stream should stop on error");
+        assert!(acc.done);
+        assert_eq!(acc.content, "[error: Invalid API key provided]");
+        assert_eq!(delta_out, "[error: Invalid API key provided]");
     }
 }

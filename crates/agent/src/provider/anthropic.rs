@@ -118,6 +118,10 @@ impl ProviderProtocol for Anthropic {
 
     fn parse_reply(&self, raw: &str) -> Result<ParsedReply, String> {
         let v: Value = serde_json::from_str(raw).map_err(|e| format!("parse reply: {e}"))?;
+        if let Some(err) = v.get("error") {
+            let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("anthropic error");
+            return Err(msg.to_string());
+        }
         let mut content = String::new();
         let mut thinking = String::new();
         let mut tool_calls = Vec::new();
@@ -145,11 +149,17 @@ impl ProviderProtocol for Anthropic {
                 }
             }
         }
-        let usage = v.get("usage").map(|u| Usage {
-            prompt_tokens: u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
-            completion_tokens: u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
-            total_tokens: 0,
-            cached_prompt_tokens: 0,
+        let usage = v.get("usage").map(|u| {
+            let prompt_tokens = u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+            let completion_tokens = u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+            let cached_prompt_tokens = u.get("cache_read_input_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+            let total_tokens = prompt_tokens + completion_tokens;
+            Usage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                cached_prompt_tokens,
+            }
         });
         Ok(ParsedReply {
             content,
@@ -204,6 +214,18 @@ impl ProviderProtocol for Anthropic {
                     }
                 }
             }
+            Some("message_start") => {
+                if let Some(msg) = v.get("message") {
+                    if let Some(u) = msg.get("usage") {
+                        let inp = u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+                        let cached = u.get("cache_read_input_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+                        let e = acc.usage.get_or_insert_with(Usage::default);
+                        e.prompt_tokens = inp;
+                        e.cached_prompt_tokens = cached;
+                        e.total_tokens = e.prompt_tokens + e.completion_tokens;
+                    }
+                }
+            }
             Some("content_block_start") => {
                 if let Some(b) = v.get("content_block") {
                     if b.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
@@ -217,6 +239,7 @@ impl ProviderProtocol for Anthropic {
                     let out = u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
                     let e = acc.usage.get_or_insert_with(Usage::default);
                     e.completion_tokens = out;
+                    e.total_tokens = e.prompt_tokens + e.completion_tokens;
                 }
             }
             Some("message_stop") => {
@@ -225,6 +248,12 @@ impl ProviderProtocol for Anthropic {
                 return false;
             }
             Some("error") => {
+                let msg = v.get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("anthropic streaming error");
+                acc.content = format!("[error: {msg}]");
+                on_delta(&acc.content);
                 acc.done = true;
                 return false;
             }
@@ -333,7 +362,52 @@ mod tests {
         assert_eq!(p.content, "working");
         assert_eq!(p.tool_calls[0].name, "bash");
         assert_eq!(p.tool_calls[0].args["command"], "ls");
-        assert_eq!(p.usage.unwrap().prompt_tokens, 7);
+        assert_eq!(p.usage.as_ref().unwrap().prompt_tokens, 7);
+        assert_eq!(p.usage.as_ref().unwrap().completion_tokens, 4);
+        assert_eq!(p.usage.as_ref().unwrap().total_tokens, 11);
+    }
+
+    #[test]
+    fn parses_error_reply_and_stream_error() {
+        let err_json = r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#;
+        let res = Anthropic.parse_reply(err_json);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err(), "invalid x-api-key");
+
+        let mut acc = StreamAcc::default();
+        let mut delta_out = String::new();
+        let cont = Anthropic.parse_stream_event(
+            err_json,
+            &mut acc,
+            &mut |d| delta_out.push_str(d),
+            &mut |_| {},
+        );
+        assert!(!cont, "stream should stop on error");
+        assert!(acc.done);
+        assert_eq!(acc.content, "[error: invalid x-api-key]");
+        assert_eq!(delta_out, "[error: invalid x-api-key]");
+    }
+
+    #[test]
+    fn streams_tracks_usage_properly() {
+        let mut acc = StreamAcc::default();
+        Anthropic.parse_stream_event(
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":15,"cache_read_input_tokens":5}}}"#,
+            &mut acc,
+            &mut |_| {},
+            &mut |_| {},
+        );
+        Anthropic.parse_stream_event(
+            r#"{"type":"message_delta","usage":{"output_tokens":10}}"#,
+            &mut acc,
+            &mut |_| {},
+            &mut |_| {},
+        );
+        let u = acc.usage.expect("usage present");
+        assert_eq!(u.prompt_tokens, 15);
+        assert_eq!(u.cached_prompt_tokens, 5);
+        assert_eq!(u.completion_tokens, 10);
+        assert_eq!(u.total_tokens, 25);
     }
 
     #[test]
