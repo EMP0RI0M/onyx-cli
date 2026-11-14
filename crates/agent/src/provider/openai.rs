@@ -47,7 +47,6 @@ impl ProviderProtocol for OpenAiCompat {
             "temperature": ctx.temperature,
             "max_tokens": ctx.max_tokens,
             "stream": ctx.stream,
-            "include_reasoning": true,
         });
         if ctx.stream {
             body["stream_options"] = json!({ "include_usage": true });
