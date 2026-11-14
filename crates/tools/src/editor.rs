@@ -15,13 +15,30 @@ impl StrReplaceEditor {
         Self { base_dir: base_dir.as_ref().to_path_buf() }
     }
 
-    /// Join `path` under base_dir, refusing absolute paths and `..` escapes.
+    /// Join `path` under base_dir, refusing paths outside base_dir and `..` escapes.
     fn resolve(&self, path: &str) -> Result<PathBuf, ToolError> {
         let p = Path::new(path);
-        if p.is_absolute() {
-            return Err(ToolError::BadArgs("absolute paths not allowed".into()));
-        }
-        let joined = self.base_dir.join(p);
+        let joined = if p.is_absolute() {
+            if let Ok(rel) = p.strip_prefix(&self.base_dir) {
+                self.base_dir.join(rel)
+            } else if let Ok(base_canonical) = self.base_dir.canonicalize() {
+                if let Ok(rel) = p.strip_prefix(&base_canonical) {
+                    self.base_dir.join(rel)
+                } else {
+                    return Err(ToolError::BadArgs(format!(
+                        "path `{path}` is outside working directory `{}`",
+                        self.base_dir.display()
+                    )));
+                }
+            } else {
+                return Err(ToolError::BadArgs(format!(
+                    "path `{path}` is outside working directory `{}`",
+                    self.base_dir.display()
+                )));
+            }
+        } else {
+            self.base_dir.join(p)
+        };
         // Reject any `..` component before touching the filesystem.
         if joined
             .components()
@@ -143,6 +160,33 @@ mod tests {
         let ed = StrReplaceEditor::new(&dir);
         let bad = ed.execute(&json!({"command":"view","path":"../../etc/passwd"}));
         assert!(matches!(bad, Err(ToolError::BadArgs(_))));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn in_workspace_absolute_path_allowed_and_external_denied() {
+        let dir = std::env::temp_dir().join("tektile_editor_test_abs");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let ed = StrReplaceEditor::new(&dir);
+
+        let file_path = dir.join("test.txt");
+        let abs_str = file_path.to_str().unwrap();
+
+        // Writing via in-workspace absolute path should succeed
+        let o = ed
+            .execute(&json!({"command":"create","path": abs_str, "file_text":"hello abs"}))
+            .unwrap();
+        assert!(!o.is_error);
+
+        // Reading via in-workspace absolute path should succeed
+        let v = ed.execute(&json!({"command":"view","path": abs_str})).unwrap();
+        assert_eq!(v.content, "hello abs");
+
+        // External absolute path must be denied
+        let bad = ed.execute(&json!({"command":"view","path":"/etc/passwd"}));
+        assert!(matches!(bad, Err(ToolError::BadArgs(_))));
+
         fs::remove_dir_all(&dir).unwrap();
     }
 }
