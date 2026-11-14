@@ -163,6 +163,7 @@ impl ProviderProtocol for Anthropic {
         &self,
         data: &str,
         acc: &mut StreamAcc,
+        on_delta: &mut dyn FnMut(&str),
         on_reasoning: &mut dyn FnMut(&str),
     ) -> bool {
         // data is the JSON after "data:"; Anthropic tags each with "type".
@@ -173,7 +174,10 @@ impl ProviderProtocol for Anthropic {
                     match d.get("type").and_then(|t| t.as_str()) {
                         Some("text_delta") => {
                             if let Some(t) = d.get("text").and_then(|t| t.as_str()) {
-                                acc.content.push_str(t);
+                                if !t.is_empty() {
+                                    acc.content.push_str(t);
+                                    on_delta(t);
+                                }
                             }
                         }
                         Some("thinking_delta") => {
@@ -335,10 +339,10 @@ mod tests {
     #[test]
     fn streams_text_then_tool_input() {
         let mut acc = StreamAcc::default();
-        Anthropic.parse_stream_event(r#"{"type":"content_block_start","content_block":{"type":"tool_use","name":"vecmath"}}"#, &mut acc, &mut |_| {});
-        Anthropic.parse_stream_event(r#"{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"op\":"}}"#, &mut acc, &mut |_| {});
-        Anthropic.parse_stream_event(r#"{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"\"dot\"}"}}"#, &mut acc, &mut |_| {});
-        let stop = !Anthropic.parse_stream_event(r#"{"type":"message_stop"}"#, &mut acc, &mut |_| {});
+        Anthropic.parse_stream_event(r#"{"type":"content_block_start","content_block":{"type":"tool_use","name":"vecmath"}}"#, &mut acc, &mut |_| {}, &mut |_| {});
+        Anthropic.parse_stream_event(r#"{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"op\":"}}"#, &mut acc, &mut |_| {}, &mut |_| {});
+        Anthropic.parse_stream_event(r#"{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"\"dot\"}"}}"#, &mut acc, &mut |_| {}, &mut |_| {});
+        let stop = !Anthropic.parse_stream_event(r#"{"type":"message_stop"}"#, &mut acc, &mut |_| {}, &mut |_| {});
         assert!(stop);
         let p = acc.into_parsed();
         assert_eq!(p.tool_calls[0].name, "vecmath");

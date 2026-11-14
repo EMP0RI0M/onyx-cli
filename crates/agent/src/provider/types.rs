@@ -89,6 +89,7 @@ pub trait ProviderProtocol: Send + Sync {
         &self,
         data: &str,
         acc: &mut StreamAcc,
+        on_delta: &mut dyn FnMut(&str),
         on_reasoning: &mut dyn FnMut(&str),
     ) -> bool;
 

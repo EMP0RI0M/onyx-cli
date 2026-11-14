@@ -96,6 +96,7 @@ impl ProviderProtocol for OpenAiCompat {
         &self,
         data: &str,
         acc: &mut StreamAcc,
+        on_delta: &mut dyn FnMut(&str),
         on_reasoning: &mut dyn FnMut(&str),
     ) -> bool {
         if data == "[DONE]" {
@@ -110,7 +111,10 @@ impl ProviderProtocol for OpenAiCompat {
         let Some(choice) = v.get("choices").and_then(|c| c.get(0)) else { return true };
         let delta = choice.get("delta").cloned().unwrap_or_else(|| json!({}));
         if let Some(txt) = delta.get("content").and_then(|c| c.as_str()) {
-            acc.content.push_str(txt);
+            if !txt.is_empty() {
+                acc.content.push_str(txt);
+                on_delta(txt);
+            }
         }
         let r_opt = delta.get("reasoning_content")
             .or_else(|| delta.get("reasoning"))
@@ -209,21 +213,44 @@ mod tests {
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"vec"}}]}}]}"#,
             &mut acc,
             &mut |_| {},
+            &mut |_| {},
         );
         OpenAiCompat.parse_stream_event(
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"math","arguments":"{\"op\":"}}]}}]}"#,
             &mut acc,
+            &mut |_| {},
             &mut |_| {},
         );
         OpenAiCompat.parse_stream_event(
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"dot\"}"}}]}}]}"#,
             &mut acc,
             &mut |_| {},
+            &mut |_| {},
         );
-        let done = !OpenAiCompat.parse_stream_event("[DONE]", &mut acc, &mut |_| {});
+        let done = !OpenAiCompat.parse_stream_event("[DONE]", &mut acc, &mut |_| {}, &mut |_| {});
         assert!(done);
         let p = acc.into_parsed();
         assert_eq!(p.tool_calls[0].name, "vecmath");
         assert_eq!(p.tool_calls[0].args["op"], "dot");
+    }
+
+    #[test]
+    fn streams_content_deltas_live() {
+        let mut acc = StreamAcc::default();
+        let mut collected = Vec::new();
+        OpenAiCompat.parse_stream_event(
+            r#"{"choices":[{"delta":{"content":"Hello "}}]}"#,
+            &mut acc,
+            &mut |d| collected.push(d.to_string()),
+            &mut |_| {},
+        );
+        OpenAiCompat.parse_stream_event(
+            r#"{"choices":[{"delta":{"content":"world!"}}]}"#,
+            &mut acc,
+            &mut |d| collected.push(d.to_string()),
+            &mut |_| {},
+        );
+        assert_eq!(collected, vec!["Hello ".to_string(), "world!".to_string()]);
+        assert_eq!(acc.content, "Hello world!");
     }
 }

@@ -684,15 +684,12 @@ impl HttpModel {
             &extra,
             Some(&body_str),
             "text/event-stream",
-            &mut |data| proto.parse_stream_event(data, &mut acc, on_reasoning),
+            &mut |data| proto.parse_stream_event(data, &mut acc, on_delta, on_reasoning),
         );
         if let Err(e) = result {
             return Step::Final(format!("[model stream error: {e}]"));
         }
         let parsed = acc.into_parsed();
-        // Reasoning already streamed live via on_reasoning; do NOT re-emit it into
-        // the answer tail. Only the visible answer text goes to on_delta.
-        on_delta(&parsed.content);
         self.step_from_parsed(parsed)
     }
 

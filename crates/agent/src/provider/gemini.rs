@@ -105,12 +105,16 @@ impl ProviderProtocol for Gemini {
         &self,
         data: &str,
         acc: &mut StreamAcc,
+        on_delta: &mut dyn FnMut(&str),
         on_reasoning: &mut dyn FnMut(&str),
     ) -> bool {
         // Each SSE data payload is one generateContent-shaped object.
         let Ok(v) = serde_json::from_str::<Value>(data) else { return true };
         let p = parse_candidate(&v);
-        acc.content.push_str(&p.content);
+        if !p.content.is_empty() {
+            acc.content.push_str(&p.content);
+            on_delta(&p.content);
+        }
         if let Some(t) = p.thinking {
             if !t.is_empty() {
                 acc.thinking.push_str(&t);
