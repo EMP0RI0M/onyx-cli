@@ -78,6 +78,51 @@ if [ -d "${USER_BIN}" ] && [ -w "${USER_BIN}" ] && [ "${INSTALL_DIR}" != "${USER
     fi
 fi
 
+# ---------------------------------------------------------------------------
+# CLIProxyAPI Integration: Ensure gateway binary is available for OAuth/proxy
+# ---------------------------------------------------------------------------
+CLIPROXY_BIN_DIR="${HOME}/.cli-proxy-api"
+CLIPROXY_BIN="${CLIPROXY_BIN_DIR}/cli-proxy-api"
+
+if ! command -v cli-proxy-api >/dev/null 2>&1 && ! command -v cliproxyapi-rust >/dev/null 2>&1 && [ ! -f "${CLIPROXY_BIN}" ]; then
+    echo "→ Checking CLIProxyAPI gateway..."
+    mkdir -p "${CLIPROXY_BIN_DIR}" 2>/dev/null || true
+
+    # Map architecture for CLIProxyAPI releases
+    CP_ARCH="${ARCH}"
+    case "${ARCH}" in
+        amd64) CP_ARCH="amd64";;
+        arm64) CP_ARCH="arm64";;
+        arm32) CP_ARCH="armv7";;
+        *)     CP_ARCH="${ARCH}";;
+    esac
+
+    CP_REPO="router-for-me/CLIProxyAPI"
+    CP_TAG=$(curl -sSL "https://api.github.com/repos/${CP_REPO}/releases/latest" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || true)
+    if [ -n "${CP_TAG}" ]; then
+        CP_URL="https://github.com/${CP_REPO}/releases/download/${CP_TAG}/CLIProxyAPI_${CP_TAG#v}_${PLATFORM}_${CP_ARCH}.tar.gz"
+        echo "→ Setting up CLIProxyAPI background proxy gateway (${CP_TAG})..."
+        if curl -sSL -f "${CP_URL}" -o "${TMP_DIR}/cliproxy.tar.gz" 2>/dev/null; then
+            tar -xzf "${TMP_DIR}/cliproxy.tar.gz" -C "${TMP_DIR}" 2>/dev/null || true
+            for cand in "${TMP_DIR}/cli-proxy-api" "${TMP_DIR}/cliproxyapi-rust" "${TMP_DIR}/CLIProxyAPI"*; do
+                if [ -f "${cand}" ] && [ -x "${cand}" ]; then
+                    install -m 755 "${cand}" "${CLIPROXY_BIN}" 2>/dev/null || cp "${cand}" "${CLIPROXY_BIN}"
+                    chmod +x "${CLIPROXY_BIN}"
+                    # Symlink into INSTALL_DIR if writable
+                    if [ -w "${INSTALL_DIR}" ]; then
+                        ln -sf "${CLIPROXY_BIN}" "${INSTALL_DIR}/cliproxyapi-rust" 2>/dev/null || true
+                    fi
+                    echo "✓ CLIProxyAPI gateway installed to ${CLIPROXY_BIN}"
+                    break
+                fi
+            done
+        fi
+    fi
+fi
+
+# Ensure default ~/.onyx configuration directory exists
+mkdir -p "${HOME}/.onyx" 2>/dev/null || true
+
 echo ""
 echo "✓ Onyx CLI installed successfully to ${INSTALL_DIR}/onyx"
 echo "Run 'onyx --help' or 'onyx' to start."
