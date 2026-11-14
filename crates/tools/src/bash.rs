@@ -122,8 +122,8 @@ impl Tool for Bash {
                     if start.elapsed() > std::time::Duration::from_secs(timeout_secs) {
                         timed_out = true;
                         let _ = child.kill();
-                        let _ = child.wait();
-                        break std::process::ExitStatus::default();
+                        let term_status = child.wait().ok();
+                        break term_status.unwrap_or_default();
                     }
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
@@ -135,7 +135,11 @@ impl Tool for Bash {
 
         let stdout_str = String::from_utf8_lossy(&stdout);
         let stderr_str = String::from_utf8_lossy(&stderr);
-        let code = status.code().unwrap_or(if timed_out { 124 } else { -1 });
+        let code = if timed_out {
+            124
+        } else {
+            status.code().unwrap_or(-1)
+        };
 
         let mut content = String::new();
         content.push_str(&stdout_str);
@@ -172,5 +176,17 @@ mod tests {
         let res = tool.execute(&args).expect("must succeed without deadlocking");
         assert!(start.elapsed() < std::time::Duration::from_secs(5), "execution must be immediate, took {:?}", start.elapsed());
         assert!(!res.is_error);
+    }
+
+    #[test]
+    fn bash_timeout_returns_code_124() {
+        std::env::set_var("ONYX_BASH_TIMEOUT", "1");
+        let tool = Bash::new();
+        let args = json!({"command": "sleep 5"});
+        let res = tool.execute(&args).expect("must return output");
+        std::env::remove_var("ONYX_BASH_TIMEOUT");
+        assert!(res.is_error, "timed out command must report is_error");
+        assert!(res.content.contains("[exit 124]"), "content must indicate exit 124, got: {}", res.content);
+        assert!(res.content.contains("timed out"), "content must indicate timed out, got: {}", res.content);
     }
 }

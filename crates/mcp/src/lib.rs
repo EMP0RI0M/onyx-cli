@@ -98,6 +98,20 @@ impl McpClient {
             body.to_string()
         };
 
+        if let Some(status_line) = head.lines().next() {
+            let parts: Vec<&str> = status_line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                if let Ok(code) = parts[1].parse::<u16>() {
+                    if !(200..=299).contains(&code) {
+                        return Err(ToolError::Other(format!(
+                            "MCP server returned HTTP {code}: {}",
+                            decoded_body.trim()
+                        )));
+                    }
+                }
+            }
+        }
+
         let v: Value = serde_json::from_str(&decoded_body)
             .map_err(|e| ToolError::Other(format!("invalid JSON-RPC reply: {e}")))?;
 
@@ -397,6 +411,29 @@ mod tests {
         let client = McpClient::new("test_chunked", "127.0.0.1", port, "/");
         let res = client.initialize();
         assert!(res.is_ok(), "Expected successful initialization over chunked HTTP, got {:?}", res);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_mcp_client_handles_non_200_http_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf);
+
+                let http_resp = "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nAuthentication required";
+                sock.write_all(http_resp.as_bytes()).unwrap();
+            }
+        });
+
+        let client = McpClient::new("test_auth_fail", "127.0.0.1", port, "/");
+        let res = client.initialize();
+        assert!(res.is_err());
+        let err_msg = format!("{:?}", res.unwrap_err());
+        assert!(err_msg.contains("MCP server returned HTTP 401: Authentication required"), "Unexpected err: {err_msg}");
         let _ = handle.join();
     }
 }
