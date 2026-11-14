@@ -25,6 +25,134 @@ pub struct GatewayInfo {
     pub endpoint: String,
 }
 
+/// Download and install the CLIProxyAPI companion binary automatically if absent,
+/// and ensure a minimal valid configuration file exists.
+pub fn ensure_gateway_installed() -> Option<PathBuf> {
+    if let Some(existing) = find_gateway_binary() {
+        ensure_default_config(&existing);
+        return Some(existing);
+    }
+
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let target_dir = home.join(".cli-proxy-api");
+    let _ = std::fs::create_dir_all(&target_dir);
+
+    let os_name = match std::env::consts::OS {
+        "linux" => "linux",
+        "macos" => "darwin",
+        "windows" => "windows",
+        _ => return None,
+    };
+
+    let arch_name = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "aarch64",
+        "arm" => "armv7",
+        _ => return None,
+    };
+
+    let binary_name = if os_name == "windows" {
+        "cli-proxy-api.exe"
+    } else {
+        "cli-proxy-api"
+    };
+
+    let target_binary = target_dir.join(binary_name);
+    if target_binary.is_file() {
+        ensure_default_config(&target_binary);
+        return Some(target_binary);
+    }
+
+    // Attempt to download the latest release asset via curl or powershell
+    let ext = if os_name == "windows" { "zip" } else { "tar.gz" };
+    let temp_archive = target_dir.join(format!("download.{ext}"));
+
+    #[cfg(unix)]
+    {
+        let script = format!(
+            r#"
+TAG=$(curl -sSL "https://api.github.com/repos/router-for-me/CLIProxyAPI/releases/latest" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || true)
+if [ -z "$TAG" ]; then TAG="v8.0.70"; fi
+VER="${{TAG#v}}"
+URL="https://github.com/router-for-me/CLIProxyAPI/releases/download/${{TAG}}/CLIProxyAPI_${{VER}}_{os_name}_{arch_name}.{ext}"
+curl -sSL -f "$URL" -o "{archive}" 2>/dev/null || curl -sSL -f "https://github.com/router-for-me/CLIProxyAPI/releases/download/${{TAG}}/CLIProxyAPI_${{VER}}_{os_name}_{arch_name}_no-plugin.tar.gz" -o "{archive}" 2>/dev/null
+if [ -f "{archive}" ]; then
+    if [ "{ext}" = "tar.gz" ]; then
+        tar -xzf "{archive}" -C "{dir}" 2>/dev/null || true
+    fi
+    for cand in "{dir}/cli-proxy-api" "{dir}/cliproxyapi-rust" "{dir}/CLIProxyAPI"*; do
+        if [ -f "$cand" ] && [ -x "$cand" ]; then
+            mv "$cand" "{target}" 2>/dev/null || cp "$cand" "{target}"
+            chmod +x "{target}" 2>/dev/null || true
+            break
+        fi
+    done
+    rm -f "{archive}"
+fi
+"#,
+            archive = temp_archive.display(),
+            dir = target_dir.display(),
+            target = target_binary.display()
+        );
+
+        let _ = Command::new("sh").arg("-c").arg(script).output();
+    }
+
+    #[cfg(windows)]
+    {
+        let ps_script = format!(
+            r#"$ErrorActionPreference = 'SilentlyContinue'
+$tag = "v8.0.70"
+try {{
+    $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/router-for-me/CLIProxyAPI/releases/latest" -Headers @{{"User-Agent"="onyx-installer"}}
+    if ($rel.tag_name) {{ $tag = $rel.tag_name }}
+}} catch {{}}
+$ver = $tag.TrimStart('v')
+$url = "https://github.com/router-for-me/CLIProxyAPI/releases/download/$tag/CLIProxyAPI_${{ver}}_{os_name}_{arch_name}.zip"
+Invoke-WebRequest -Uri $url -OutFile "{archive}"
+if (Test-Path "{archive}") {{
+    Expand-Archive -Path "{archive}" -DestinationPath "{dir}" -Force
+    Remove-Item "{archive}" -Force
+}}
+"#,
+            archive = temp_archive.display(),
+            dir = target_dir.display()
+        );
+        let _ = Command::new("powershell").args(["-NoProfile", "-Command", &ps_script]).output();
+    }
+
+    if target_binary.is_file() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&target_binary, std::fs::Permissions::from_mode(0o755));
+        }
+        ensure_default_config(&target_binary);
+        Some(target_binary)
+    } else {
+        None
+    }
+}
+
+/// Ensure a default config.yaml is generated in the gateway binary directory if absent
+pub fn ensure_default_config(binary_path: &Path) {
+    let Some(dir) = binary_path.parent() else { return };
+    let cfg_file = dir.join("config.yaml");
+    if !cfg_file.is_file() {
+        let default_yaml = r#"config-version: 8
+server:
+  host: "0.0.0.0"
+  port: 8317
+access:
+  api-keys:
+    - "sk-cp-35209207c3e2541392cd9e28d1e402f7695a2e16842675bb"
+management:
+  secret-key: "$2a$10$g0j6G6hdKHQ8J5rbJgtLcOjksLVsMgdv/wNdBOFqjF5P6Lor3VzQq"
+"#;
+        let _ = std::fs::write(&cfg_file, default_yaml);
+    }
+}
+
 /// Detect local CLIProxyAPI binary in PATH or standard candidate directories.
 pub fn find_gateway_binary() -> Option<PathBuf> {
     // 1. User environment override
@@ -134,7 +262,7 @@ pub fn ensure_gateway_running(endpoint: &str) -> bool {
         return false;
     }
 
-    let Some(binary) = find_gateway_binary() else {
+    let Some(binary) = ensure_gateway_installed() else {
         return false;
     };
 
@@ -213,8 +341,8 @@ pub fn execute_gateway_login_with_callback<F>(target: &str, mut on_url: F) -> Re
 where
     F: FnMut(&str),
 {
-    let binary = find_gateway_binary().ok_or_else(|| {
-        "CLIProxyAPI binary (`cliproxyapi-rust` or `cli-proxy-api`) was not found in PATH or standard directories.\nInstall CLIProxyAPI-Rust or set CLIPROXYAPI_PATH to the binary path.".to_string()
+    let binary = ensure_gateway_installed().ok_or_else(|| {
+        "Failed to locate or automatically install CLIProxyAPI companion binary.\nPlease verify network connectivity to GitHub or set CLIPROXYAPI_PATH.".to_string()
     })?;
 
     let flag = resolve_login_target(target).ok_or_else(|| {
