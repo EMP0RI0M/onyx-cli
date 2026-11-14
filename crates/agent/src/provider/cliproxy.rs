@@ -33,7 +33,9 @@ pub fn ensure_gateway_installed() -> Option<PathBuf> {
         return Some(existing);
     }
 
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)?;
     let target_dir = home.join(".cli-proxy-api");
     let _ = std::fs::create_dir_all(&target_dir);
 
@@ -71,23 +73,26 @@ pub fn ensure_gateway_installed() -> Option<PathBuf> {
     {
         let script = format!(
             r#"
-TAG=$(curl -sSL "https://api.github.com/repos/router-for-me/CLIProxyAPI/releases/latest" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || true)
+TAG=$(curl -sSL --connect-timeout 10 --max-time 30 "https://api.github.com/repos/router-for-me/CLIProxyAPI/releases/latest" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || true)
 if [ -z "$TAG" ]; then TAG="v8.0.70"; fi
 VER="${{TAG#v}}"
 URL="https://github.com/router-for-me/CLIProxyAPI/releases/download/${{TAG}}/CLIProxyAPI_${{VER}}_{os_name}_{arch_name}.{ext}"
-curl -sSL -f "$URL" -o "{archive}" 2>/dev/null || curl -sSL -f "https://github.com/router-for-me/CLIProxyAPI/releases/download/${{TAG}}/CLIProxyAPI_${{VER}}_{os_name}_{arch_name}_no-plugin.tar.gz" -o "{archive}" 2>/dev/null
+curl -sSL -f --connect-timeout 10 --max-time 120 "$URL" -o "{archive}" 2>/dev/null || curl -sSL -f --connect-timeout 10 --max-time 120 "https://github.com/router-for-me/CLIProxyAPI/releases/download/${{TAG}}/CLIProxyAPI_${{VER}}_{os_name}_{arch_name}_no-plugin.tar.gz" -o "{archive}" 2>/dev/null
 if [ -f "{archive}" ]; then
+    TMP_STAGE="{dir}/.tmp_extract_$$"
+    mkdir -p "$TMP_STAGE"
     if [ "{ext}" = "tar.gz" ]; then
-        tar -xzf "{archive}" -C "{dir}" 2>/dev/null || true
-    fi
-    for cand in "{dir}/cli-proxy-api" "{dir}/cliproxyapi-rust" "{dir}/CLIProxyAPI"*; do
-        if [ -f "$cand" ] && [ -x "$cand" ]; then
-            mv "$cand" "{target}" 2>/dev/null || cp "$cand" "{target}"
-            chmod +x "{target}" 2>/dev/null || true
-            break
+        if tar -xzf "{archive}" -C "$TMP_STAGE" 2>/dev/null; then
+            for cand in "$TMP_STAGE/cli-proxy-api" "$TMP_STAGE/cliproxyapi-rust" "$TMP_STAGE/CLIProxyAPI"*; do
+                if [ -f "$cand" ]; then
+                    chmod +x "$cand" 2>/dev/null || true
+                    mv "$cand" "{target}" 2>/dev/null || cp "$cand" "{target}"
+                    break
+                fi
+            done
         fi
-    done
-    rm -f "{archive}"
+    fi
+    rm -rf "$TMP_STAGE" "{archive}"
 fi
 "#,
             archive = temp_archive.display(),
@@ -141,7 +146,7 @@ pub fn ensure_default_config(binary_path: &Path) {
     if !cfg_file.is_file() {
         let default_yaml = r#"config-version: 8
 server:
-  host: "0.0.0.0"
+  host: "127.0.0.1"
   port: 8317
 access:
   api-keys:
@@ -267,6 +272,9 @@ pub fn ensure_gateway_running(endpoint: &str) -> bool {
     };
 
     let mut cmd = Command::new(&binary);
+    if port != 0 {
+        cmd.arg("-port").arg(port.to_string());
+    }
     if let Some(parent) = binary.parent() {
         let cfg_path = parent.join("config.yaml");
         if cfg_path.is_file() {
@@ -400,6 +408,8 @@ where
 
     // Monitor stream for login URLs or device codes
     let mut url_found = false;
+    let mut code_found = false;
+    let is_codex = target.contains("codex");
     let start_time = std::time::Instant::now();
 
     while start_time.elapsed() < Duration::from_secs(120) {
@@ -411,11 +421,26 @@ where
                     url_found = true;
                 }
             }
-            if line.contains("Codex device code:") || line.contains("Enter code:") {
+            if line.contains("Codex device code:") || line.contains("Enter code:") || line.contains("device code:") {
                 on_url(&line);
+                code_found = true;
             }
-            // Once URL or code is displayed, return immediately so TUI never blocks or hangs!
-            if url_found {
+            // For flows with a device code (like codex), wait until both the URL and device code are delivered before returning.
+            if url_found && (!is_codex || code_found) {
+                std::thread::spawn(move || {
+                    let wait_start = std::time::Instant::now();
+                    while wait_start.elapsed() < Duration::from_secs(180) {
+                        if let Ok(l) = rx.recv_timeout(Duration::from_millis(500)) {
+                            if l.contains("successfully") || l.contains("Authenticated") {
+                                break;
+                            }
+                        }
+                        if let Ok(Some(_)) = child.try_wait() {
+                            break;
+                        }
+                    }
+                    let _ = child.kill();
+                });
                 return Ok(format!("OAuth link generated for `{target}`. Complete authorization in browser."));
             }
             if line.contains("successfully") || line.contains("Authenticated") {

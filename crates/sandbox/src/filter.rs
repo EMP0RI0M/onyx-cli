@@ -42,6 +42,7 @@ pub const NR_PRCTL: u32 = 172;
 const BPF_LD_ABS: u16 = 0x20; // BPF_LD | BPF_W | BPF_ABS
 const BPF_JMP: u16 = 0x05;
 const BPF_JEQ: u16 = 0x10;
+const BPF_JGE: u16 = 0x30;
 pub const BPF_JA: u16 = 0x00;
 const BPF_RET: u16 = 0x06;
 const BPF_K: u16 = 0x00;
@@ -63,6 +64,9 @@ const fn load(k: u32) -> Instr {
 }
 const fn jeq(k: u32, jt: u8, jf: u8) -> Instr {
     Instr { code: BPF_JMP | BPF_JEQ, jt, jf, k }
+}
+const fn jge(k: u32, jt: u8, jf: u8) -> Instr {
+    Instr { code: BPF_JMP | BPF_JGE, jt, jf, k }
 }
 pub const fn ja(k: u32) -> Instr {
     Instr { code: BPF_JMP | BPF_JA, jt: 0, jf: 0, k }
@@ -188,9 +192,14 @@ pub const DENY_SYSCALLS: &[u32] = &[
 /// Returns None if any branch outgrows 8-bit jump offsets (callers fail closed).
 pub fn build_deny_program() -> Option<Vec<Instr>> {
     let n = DENY_SYSCALLS.len();
-    // arch-check(2) + load-nr(1) + n tests + prctl test(1) + arg-load(1) + p option tests
+    #[cfg(target_arch = "x86_64")]
+    let x32_guard = 1;
+    #[cfg(not(target_arch = "x86_64"))]
+    let x32_guard = 0;
+
+    // arch-check(2) + load-nr(1) + x32_guard + n tests + prctl test(1) + arg-load(1) + p option tests
     // + allow(1) + deny(1)
-    let total = 2 + n + 1 + 1 + 1 + PRCTL_SECCOMP_OPTS.len() + 2;
+    let total = 2 + 1 + x32_guard + n + 1 + 1 + PRCTL_SECCOMP_OPTS.len() + 2;
     if total > u8::MAX as usize + 2 {
         return None;
     }
@@ -199,12 +208,19 @@ pub fn build_deny_program() -> Option<Vec<Instr>> {
     prog.push(load(OFF_ARCH));
     prog.push(jeq(ARCH_CURRENT, 0, (deny_idx - 2) as u8)); // [1]: mismatch → DENY
     prog.push(load(OFF_NR));
+    #[cfg(target_arch = "x86_64")]
+    {
+        // On x86_64 kernels with CONFIG_X86_X32_ABI, x32 ABI syscalls report AUDIT_ARCH_X86_64
+        // but have bit 0x40000000 set. Jump directly to DENY for any nr >= 0x40000000.
+        let idx = prog.len();
+        prog.push(jge(0x4000_0000, (deny_idx - idx - 1) as u8, 0));
+    }
     for (i, &nr) in DENY_SYSCALLS.iter().enumerate() {
-        let idx = 3 + i;
+        let idx = 3 + x32_guard + i;
         prog.push(jeq(nr, (deny_idx - idx - 1) as u8, 0));
     }
     // prctl(NR_PRCTL): match falls through to the arg check; miss skips it entirely.
-    let prctl_test_idx = 3 + n;
+    let prctl_test_idx = 3 + x32_guard + n;
     let arg_load_idx = prctl_test_idx + 1;
     let first_opt_idx = arg_load_idx + 1;
     let opts_n = PRCTL_SECCOMP_OPTS.len();
@@ -224,7 +240,11 @@ pub fn build_deny_program() -> Option<Vec<Instr>> {
 /// for tests that verify jump arithmetic positionally.
 pub fn prctl_block_range(_prog: &[Instr]) -> std::ops::Range<usize> {
     let n = DENY_SYSCALLS.len();
-    (3 + n)..(3 + n + 2 + PRCTL_SECCOMP_OPTS.len())
+    #[cfg(target_arch = "x86_64")]
+    let x32_guard = 1;
+    #[cfg(not(target_arch = "x86_64"))]
+    let x32_guard = 0;
+    (3 + x32_guard + n)..(3 + x32_guard + n + 2 + PRCTL_SECCOMP_OPTS.len())
 }
 
 /// A trivial always-allow program used only by the capability probe (install
@@ -246,7 +266,12 @@ pub fn permissive_prog(instrs: &mut [libc::sock_filter]) -> libc::sock_fprog {
 /// subsets; `build_deny_program` is the production entry point.
 pub fn build_prog_for(deny: &[u32]) -> Option<Vec<Instr>> {
     let n = deny.len();
-    let total = 2 + n + 2;
+    #[cfg(target_arch = "x86_64")]
+    let x32_guard = 1;
+    #[cfg(not(target_arch = "x86_64"))]
+    let x32_guard = 0;
+
+    let total = 2 + 1 + x32_guard + n + 2;
     if total > u8::MAX as usize + 2 {
         return None;
     }
@@ -255,8 +280,13 @@ pub fn build_prog_for(deny: &[u32]) -> Option<Vec<Instr>> {
     prog.push(load(OFF_ARCH));
     prog.push(jeq(ARCH_CURRENT, 0, (deny_idx - 2) as u8));
     prog.push(load(OFF_NR));
+    #[cfg(target_arch = "x86_64")]
+    {
+        let idx = prog.len();
+        prog.push(jge(0x4000_0000, (deny_idx - idx - 1) as u8, 0));
+    }
     for (i, &nr) in deny.iter().enumerate() {
-        let idx = 3 + i;
+        let idx = 3 + x32_guard + i;
         prog.push(jeq(nr, (deny_idx - idx - 1) as u8, 0));
     }
     prog.push(ret(SECCOMP_RET_ALLOW));
@@ -388,9 +418,19 @@ mod tests {
         // [1] jf lands exactly on the final RET EPERM
         assert_eq!(1 + 1 + p[1].jf as usize, deny_idx);
         assert_eq!(p[2], load(OFF_NR));
+        #[cfg(target_arch = "x86_64")]
+        let x32_guard = 1;
+        #[cfg(not(target_arch = "x86_64"))]
+        let x32_guard = 0;
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(p[3].code, BPF_JMP | BPF_JGE);
+            assert_eq!(p[3].k, 0x4000_0000);
+            assert_eq!(3 + 1 + p[3].jt as usize, deny_idx, "x32 guard jt");
+        }
         // each deny test's jt lands exactly on RET EPERM
         for i in 0..n {
-            let idx = 3 + i;
+            let idx = 3 + x32_guard + i;
             assert_eq!(p[idx].code, BPF_JMP | BPF_JEQ);
             assert_eq!(p[idx].k, DENY_SYSCALLS[i]);
             assert_eq!(idx + 1 + p[idx].jt as usize, deny_idx, "insn {idx} jt");

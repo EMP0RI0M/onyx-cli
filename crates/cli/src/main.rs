@@ -861,7 +861,7 @@ fn main() {
             std::thread::sleep(Duration::from_secs(3));
             let current_modified = std::fs::metadata(&mcp_path).and_then(|m| m.modified()).ok();
             if current_modified.is_some() && current_modified != last_modified {
-                last_modified = current_modified;
+                let mut all_succeeded = true;
                 if let Ok(content) = std::fs::read_to_string(&mcp_path) {
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
                         if let Some(servers) = val.get("mcpServers").and_then(|s| s.as_object()) {
@@ -872,17 +872,29 @@ fn main() {
                                 ) {
                                     let path = srv_obj.get("path").and_then(|p| p.as_str()).unwrap_or("/");
                                     let client = mcp::McpClient::new(srv_name, host, port as u16, path);
-                                    if let Ok(tools) = client.list_tools() {
-                                        if let Ok(mut lock) = trigger_toolkit.write() {
-                                            for t in tools {
-                                                lock.add(mcp::McpTool::new(client.clone(), t));
+                                    match client.list_tools() {
+                                        Ok(tools) => {
+                                            if let Ok(mut lock) = trigger_toolkit.write() {
+                                                for t in tools {
+                                                    lock.add(mcp::McpTool::new(client.clone(), t));
+                                                }
                                             }
+                                        }
+                                        Err(_) => {
+                                            all_succeeded = false;
                                         }
                                     }
                                 }
                             }
                         }
+                    } else {
+                        all_succeeded = false;
                     }
+                } else {
+                    all_succeeded = false;
+                }
+                if all_succeeded {
+                    last_modified = current_modified;
                 }
             }
         }

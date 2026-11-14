@@ -85,17 +85,16 @@ impl McpClient {
         sock.read_to_end(&mut buf)
             .map_err(|e| ToolError::Other(format!("read error: {e}")))?;
 
-        let response = String::from_utf8_lossy(&buf);
-        let (head, body) = match response.split_once("\r\n\r\n") {
-            Some((h, b)) => (h, b),
-            None => ("", response.as_ref()),
+        let (head_bytes, body_bytes) = match find_subslice(&buf, b"\r\n\r\n") {
+            Some(i) => (&buf[..i], &buf[i + 4..]),
+            None => (&[][..], &buf[..]),
         };
+        let head = String::from_utf8_lossy(head_bytes);
 
-        let decoded_body = if head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
-            let decoded_bytes = decode_chunked(body.as_bytes());
-            String::from_utf8_lossy(&decoded_bytes).to_string()
+        let decoded_bytes = if head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+            decode_chunked(body_bytes)
         } else {
-            body.to_string()
+            body_bytes.to_vec()
         };
 
         if let Some(status_line) = head.lines().next() {
@@ -103,16 +102,17 @@ impl McpClient {
             if parts.len() >= 2 {
                 if let Ok(code) = parts[1].parse::<u16>() {
                     if !(200..=299).contains(&code) {
+                        let err_text = String::from_utf8_lossy(&decoded_bytes);
                         return Err(ToolError::Other(format!(
                             "MCP server returned HTTP {code}: {}",
-                            decoded_body.trim()
+                            err_text.trim()
                         )));
                     }
                 }
             }
         }
 
-        let v: Value = serde_json::from_str(&decoded_body)
+        let v: Value = serde_json::from_slice(&decoded_bytes)
             .map_err(|e| ToolError::Other(format!("invalid JSON-RPC reply: {e}")))?;
 
         if let Some(err) = v.get("error") {
@@ -257,7 +257,13 @@ pub fn decode_chunked(mut body: &[u8]) -> Vec<u8> {
             break;
         }
         let start = nl + 2;
-        let end = start + size;
+        let end = match start.checked_add(size) {
+            Some(e) => e,
+            None => break,
+        };
+        if start > body.len() {
+            break;
+        }
         if body.len() < end {
             out.extend_from_slice(&body[start..]);
             break;
@@ -435,5 +441,18 @@ mod tests {
         let err_msg = format!("{:?}", res.unwrap_err());
         assert!(err_msg.contains("MCP server returned HTTP 401: Authentication required"), "Unexpected err: {err_msg}");
         let _ = handle.join();
+    }
+
+    #[test]
+    fn test_decode_chunked_overflow_protection_and_split_utf8() {
+        // Overflow test: size is usize::MAX
+        let bad_raw = b"ffffffffffffffff\r\n";
+        let out = decode_chunked(bad_raw);
+        assert!(out.is_empty(), "Should not panic or overflow on huge size");
+
+        // Split UTF-8 test: 'é' is \xc3\xa9, split across chunks
+        let split_utf8 = b"1\r\n\xc3\r\n1\r\n\xa9\r\n0\r\n\r\n";
+        let decoded = decode_chunked(split_utf8);
+        assert_eq!(std::str::from_utf8(&decoded).unwrap(), "é");
     }
 }

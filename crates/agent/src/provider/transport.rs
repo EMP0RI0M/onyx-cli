@@ -342,7 +342,13 @@ pub(crate) fn decode_chunked(mut body: &[u8]) -> Vec<u8> {
             break;
         }
         let start = nl + 2;
-        let end = start + size;
+        let end = match start.checked_add(size) {
+            Some(e) => e,
+            None => break,
+        };
+        if start > body.len() {
+            break;
+        }
         if body.len() < end {
             out.extend_from_slice(&body[start..]);
             break;

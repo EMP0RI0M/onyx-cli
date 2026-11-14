@@ -2,77 +2,12 @@ use crate::simd::Simd;
 
 #[inline(always)]
 pub fn quick_zero<T: Copy>(slice: &mut [core::mem::MaybeUninit<T>]) {
-    let n = slice.len();
-    match n {
-        1 => unsafe { *(slice.as_mut_ptr() as *mut [T; 1]) = core::mem::zeroed() },
-        2 => unsafe { *(slice.as_mut_ptr() as *mut [T; 2]) = core::mem::zeroed() },
-        3 => unsafe { *(slice.as_mut_ptr() as *mut [T; 3]) = core::mem::zeroed() },
-        4 => unsafe { *(slice.as_mut_ptr() as *mut [T; 4]) = core::mem::zeroed() },
-        5 => unsafe { *(slice.as_mut_ptr() as *mut [T; 5]) = core::mem::zeroed() },
-        6 => unsafe { *(slice.as_mut_ptr() as *mut [T; 6]) = core::mem::zeroed() },
-        7 => unsafe { *(slice.as_mut_ptr() as *mut [T; 7]) = core::mem::zeroed() },
-        8 => unsafe { *(slice.as_mut_ptr() as *mut [T; 8]) = core::mem::zeroed() },
-        9 => unsafe { *(slice.as_mut_ptr() as *mut [T; 9]) = core::mem::zeroed() },
-        10 => unsafe { *(slice.as_mut_ptr() as *mut [T; 10]) = core::mem::zeroed() },
-        11 => unsafe { *(slice.as_mut_ptr() as *mut [T; 11]) = core::mem::zeroed() },
-        12 => unsafe { *(slice.as_mut_ptr() as *mut [T; 12]) = core::mem::zeroed() },
-        13 => unsafe { *(slice.as_mut_ptr() as *mut [T; 13]) = core::mem::zeroed() },
-        14 => unsafe { *(slice.as_mut_ptr() as *mut [T; 14]) = core::mem::zeroed() },
-        15 => unsafe { *(slice.as_mut_ptr() as *mut [T; 15]) = core::mem::zeroed() },
-        16 => unsafe { *(slice.as_mut_ptr() as *mut [T; 16]) = core::mem::zeroed() },
-        17 => unsafe { *(slice.as_mut_ptr() as *mut [T; 17]) = core::mem::zeroed() },
-        18 => unsafe { *(slice.as_mut_ptr() as *mut [T; 18]) = core::mem::zeroed() },
-        19 => unsafe { *(slice.as_mut_ptr() as *mut [T; 19]) = core::mem::zeroed() },
-        20 => unsafe { *(slice.as_mut_ptr() as *mut [T; 20]) = core::mem::zeroed() },
-        21 => unsafe { *(slice.as_mut_ptr() as *mut [T; 21]) = core::mem::zeroed() },
-        22 => unsafe { *(slice.as_mut_ptr() as *mut [T; 22]) = core::mem::zeroed() },
-        23 => unsafe { *(slice.as_mut_ptr() as *mut [T; 23]) = core::mem::zeroed() },
-        24 => unsafe { *(slice.as_mut_ptr() as *mut [T; 24]) = core::mem::zeroed() },
-        25 => unsafe { *(slice.as_mut_ptr() as *mut [T; 25]) = core::mem::zeroed() },
-        26 => unsafe { *(slice.as_mut_ptr() as *mut [T; 26]) = core::mem::zeroed() },
-        27 => unsafe { *(slice.as_mut_ptr() as *mut [T; 27]) = core::mem::zeroed() },
-        28 => unsafe { *(slice.as_mut_ptr() as *mut [T; 28]) = core::mem::zeroed() },
-        29 => unsafe { *(slice.as_mut_ptr() as *mut [T; 29]) = core::mem::zeroed() },
-        30 => unsafe { *(slice.as_mut_ptr() as *mut [T; 30]) = core::mem::zeroed() },
-        31 => unsafe { *(slice.as_mut_ptr() as *mut [T; 31]) = core::mem::zeroed() },
-        32 => unsafe { *(slice.as_mut_ptr() as *mut [T; 32]) = core::mem::zeroed() },
-        33 => unsafe { *(slice.as_mut_ptr() as *mut [T; 33]) = core::mem::zeroed() },
-        34 => unsafe { *(slice.as_mut_ptr() as *mut [T; 34]) = core::mem::zeroed() },
-        35 => unsafe { *(slice.as_mut_ptr() as *mut [T; 35]) = core::mem::zeroed() },
-        36 => unsafe { *(slice.as_mut_ptr() as *mut [T; 36]) = core::mem::zeroed() },
-        37 => unsafe { *(slice.as_mut_ptr() as *mut [T; 37]) = core::mem::zeroed() },
-        38 => unsafe { *(slice.as_mut_ptr() as *mut [T; 38]) = core::mem::zeroed() },
-        39 => unsafe { *(slice.as_mut_ptr() as *mut [T; 39]) = core::mem::zeroed() },
-        40 => unsafe { *(slice.as_mut_ptr() as *mut [T; 40]) = core::mem::zeroed() },
-        41 => unsafe { *(slice.as_mut_ptr() as *mut [T; 41]) = core::mem::zeroed() },
-        42 => unsafe { *(slice.as_mut_ptr() as *mut [T; 42]) = core::mem::zeroed() },
-        43 => unsafe { *(slice.as_mut_ptr() as *mut [T; 43]) = core::mem::zeroed() },
-        44 => unsafe { *(slice.as_mut_ptr() as *mut [T; 44]) = core::mem::zeroed() },
-        45 => unsafe { *(slice.as_mut_ptr() as *mut [T; 45]) = core::mem::zeroed() },
-        46 => unsafe { *(slice.as_mut_ptr() as *mut [T; 46]) = core::mem::zeroed() },
-        47 => unsafe { *(slice.as_mut_ptr() as *mut [T; 47]) = core::mem::zeroed() },
-        48 => unsafe { *(slice.as_mut_ptr() as *mut [T; 48]) = core::mem::zeroed() },
-        49 => unsafe { *(slice.as_mut_ptr() as *mut [T; 49]) = core::mem::zeroed() },
-        50 => unsafe { *(slice.as_mut_ptr() as *mut [T; 50]) = core::mem::zeroed() },
-        51 => unsafe { *(slice.as_mut_ptr() as *mut [T; 51]) = core::mem::zeroed() },
-        52 => unsafe { *(slice.as_mut_ptr() as *mut [T; 52]) = core::mem::zeroed() },
-        53 => unsafe { *(slice.as_mut_ptr() as *mut [T; 53]) = core::mem::zeroed() },
-        54 => unsafe { *(slice.as_mut_ptr() as *mut [T; 54]) = core::mem::zeroed() },
-        55 => unsafe { *(slice.as_mut_ptr() as *mut [T; 55]) = core::mem::zeroed() },
-        56 => unsafe { *(slice.as_mut_ptr() as *mut [T; 56]) = core::mem::zeroed() },
-        57 => unsafe { *(slice.as_mut_ptr() as *mut [T; 57]) = core::mem::zeroed() },
-        58 => unsafe { *(slice.as_mut_ptr() as *mut [T; 58]) = core::mem::zeroed() },
-        59 => unsafe { *(slice.as_mut_ptr() as *mut [T; 59]) = core::mem::zeroed() },
-        60 => unsafe { *(slice.as_mut_ptr() as *mut [T; 60]) = core::mem::zeroed() },
-        61 => unsafe { *(slice.as_mut_ptr() as *mut [T; 61]) = core::mem::zeroed() },
-        62 => unsafe { *(slice.as_mut_ptr() as *mut [T; 62]) = core::mem::zeroed() },
-        63 => unsafe { *(slice.as_mut_ptr() as *mut [T; 63]) = core::mem::zeroed() },
-        64 => unsafe { *(slice.as_mut_ptr() as *mut [T; 64]) = core::mem::zeroed() },
-        _ => {
-            for value in slice {
-                *value = unsafe { core::mem::zeroed() };
-            }
-        }
+    unsafe {
+        core::ptr::write_bytes(
+            slice.as_mut_ptr() as *mut u8,
+            0,
+            core::mem::size_of_val(slice),
+        );
     }
 }
 
