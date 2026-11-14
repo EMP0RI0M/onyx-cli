@@ -98,7 +98,17 @@ pub fn http_request_tls(
         format!("{scheme}://{host}:{port}{path}")
     };
     let mut cmd = std::process::Command::new("curl");
-    cmd.args(["-s", "-S", "-X", method, &url]);
+    cmd.args([
+        "--connect-timeout",
+        "10",
+        "--max-time",
+        "120",
+        "-s",
+        "-S",
+        "-X",
+        method,
+        &url,
+    ]);
     cmd.args(["-H", "accept: application/json"]);
     cmd.args(["-H", "content-type: application/json"]);
     if let Some(a) = auth {
@@ -1216,7 +1226,16 @@ pub fn http_sse_curl(
         format!("{scheme}://{host}:{port}{path}")
     };
     let mut cmd = std::process::Command::new("curl");
-    cmd.args(["-N", "-s", "-S", "-X", method, &url]);
+    cmd.args([
+        "--connect-timeout",
+        "10",
+        "-N",
+        "-s",
+        "-S",
+        "-X",
+        method,
+        &url,
+    ]);
     cmd.args(["-H", "accept: text/event-stream"]);
     cmd.args(["-H", "content-type: application/json"]);
     if let Some(a) = auth {
@@ -1471,6 +1490,17 @@ mod tests {
             }
             Step::Final(f) => panic!("Expected Step::Calls, got Step::Final: {f}"),
         }
+    }
+
+    #[test]
+    fn http_request_tls_fails_fast_on_unreachable_endpoint() {
+        let start = std::time::Instant::now();
+        // 192.0.2.1 is TEST-NET-1 (RFC 5737), non-routable blackhole IP.
+        // It triggers curl's --connect-timeout 10 and returns an error quickly.
+        let res = http_request_tls("GET", "192.0.2.1", 443, "/v1/models", None, None);
+        assert!(res.is_err(), "Expected connection failure to TEST-NET blackhole IP");
+        let elapsed = start.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(15), "Request took {elapsed:?}, expected <15s");
     }
 }
 
