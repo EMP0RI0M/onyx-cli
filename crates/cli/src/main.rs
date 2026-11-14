@@ -20,6 +20,7 @@ use std::io::{self, BufRead, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::exit;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tools::audit::{Approval, Gateway};
 use guardian::HttpJudge;
@@ -790,10 +791,6 @@ fn main() {
         tool_col.add(sandbox::SandboxedBash::new(lvl, Some(workdir.display().to_string())));
     }
 
-    let subagent_model = build_model(&cfg, &opts, String::new(), Vec::new());
-    tool_col.add(subagent::SpawnSubagentTool::new(subagent_model.clone(), tool_col.clone(), opts.max_steps));
-    tool_col.add(subagent::SwarmTool::new(subagent_model, tool_col.clone(), opts.max_steps, 2));
-
     // Discover MCP tools configured in ~/.onyx/mcp.json (if present)
     if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
         let mcp_cfg = home.join(".onyx/mcp.json");
@@ -832,6 +829,76 @@ fn main() {
             exit(1);
         }
     }
+
+    // Shared thread-safe toolkit for subagents and swarms:
+    // Ensures subagents inherit all discovered MCP tools and active skills.
+    let shared_subagent_tools = Arc::new(RwLock::new(tool_col.clone()));
+
+    let subagent_model = build_model(&cfg, &opts, String::new(), Vec::new());
+    tool_col.add(subagent::SpawnSubagentTool::with_shared_tools(
+        subagent_model.clone(),
+        shared_subagent_tools.clone(),
+        opts.max_steps,
+    ));
+    tool_col.add(subagent::SwarmTool::with_shared_tools(
+        subagent_model,
+        shared_subagent_tools.clone(),
+        opts.max_steps,
+        2,
+    ));
+
+    // Asynchronous dynamic toolkit synchronization trigger:
+    // Watches ~/.onyx/mcp.json in the background. If new MCP tools are added
+    // in another session or dynamically configured, updates the subagent toolkit safely.
+    let trigger_toolkit = shared_subagent_tools.clone();
+    std::thread::spawn(move || {
+        let mcp_path = match env::var_os("HOME").map(PathBuf::from) {
+            Some(h) => h.join(".onyx/mcp.json"),
+            None => return,
+        };
+        let mut last_modified = std::fs::metadata(&mcp_path).and_then(|m| m.modified()).ok();
+        loop {
+            std::thread::sleep(Duration::from_secs(3));
+            let current_modified = std::fs::metadata(&mcp_path).and_then(|m| m.modified()).ok();
+            if current_modified.is_some() && current_modified != last_modified {
+                let mut all_succeeded = true;
+                if let Ok(content) = std::fs::read_to_string(&mcp_path) {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                        if let Some(servers) = val.get("mcpServers").and_then(|s| s.as_object()) {
+                            for (srv_name, srv_obj) in servers {
+                                if let (Some(host), Some(port)) = (
+                                    srv_obj.get("host").and_then(|h| h.as_str()),
+                                    srv_obj.get("port").and_then(|p| p.as_u64()),
+                                ) {
+                                    let path = srv_obj.get("path").and_then(|p| p.as_str()).unwrap_or("/");
+                                    let client = mcp::McpClient::new(srv_name, host, port as u16, path);
+                                    match client.list_tools() {
+                                        Ok(tools) => {
+                                            if let Ok(mut lock) = trigger_toolkit.write() {
+                                                for t in tools {
+                                                    lock.add(mcp::McpTool::new(client.clone(), t));
+                                                }
+                                            }
+                                        }
+                                        Err(_) => {
+                                            all_succeeded = false;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        all_succeeded = false;
+                    }
+                } else {
+                    all_succeeded = false;
+                }
+                if all_succeeded {
+                    last_modified = current_modified;
+                }
+            }
+        }
+    });
 
     // One type-erased gateway for every policy arm: `Gateway<dyn Policy>` is
     // Sized (the policy field is boxed), so all three arms converge on the same

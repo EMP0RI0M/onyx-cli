@@ -139,7 +139,7 @@ fn test_run_controlled_benchmark() {
     }
 
     // Serialize to JSON for persistent audit report
-    let out_dir = PathBuf::from("/root/tektile-core/benchmark_results");
+    let out_dir = std::env::temp_dir().join("tektile-benchmark_results");
     fs::create_dir_all(&out_dir).unwrap();
 
     let json = serde_json::to_string_pretty(&results).unwrap();

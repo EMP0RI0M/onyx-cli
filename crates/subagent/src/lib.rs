@@ -14,7 +14,7 @@
 //! is never borrowed across threads.
 
 use agent::{AgentError, Model, ToolCallAgent};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use tools::audit::{AuditEntry, Gateway};
 use tools::policy::AllowAll;
@@ -149,13 +149,36 @@ pub fn swarm<M: Model + Clone + Send + 'static>(
 /// Tool implementation: `spawn_subagent`
 pub struct SpawnSubagentTool<M: Model + Clone + Send + 'static> {
     pub model: M,
-    pub tools: ToolCollection,
+    pub tools: Arc<RwLock<ToolCollection>>,
     pub max_steps: usize,
 }
 
 impl<M: Model + Clone + Send + 'static> SpawnSubagentTool<M> {
     pub fn new(model: M, tools: ToolCollection, max_steps: usize) -> Self {
-        Self { model, tools, max_steps }
+        Self {
+            model,
+            tools: Arc::new(RwLock::new(tools)),
+            max_steps,
+        }
+    }
+
+    pub fn with_shared_tools(
+        model: M,
+        tools: Arc<RwLock<ToolCollection>>,
+        max_steps: usize,
+    ) -> Self {
+        Self {
+            model,
+            tools,
+            max_steps,
+        }
+    }
+
+    /// Update the shared toolkit atomically so subagents immediately see new/updated tools
+    pub fn update_tools(&self, new_tools: ToolCollection) {
+        if let Ok(mut lock) = self.tools.write() {
+            *lock = new_tools;
+        }
     }
 }
 
@@ -183,7 +206,8 @@ impl<M: Model + Clone + Send + 'static> Tool for SpawnSubagentTool<M> {
         });
         let subset_refs: Option<Vec<&str>> = subset_storage.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
 
-        match spawn_subagent(task, self.model.clone(), &self.tools, subset_refs.as_deref(), self.max_steps) {
+        let current_tools = self.tools.read().map(|t| t.clone()).unwrap_or_default();
+        match spawn_subagent(task, self.model.clone(), &current_tools, subset_refs.as_deref(), self.max_steps) {
             Ok(res) => Ok(Output::ok(format!(
                 "Subagent completed task: {}\nAnswer:\n{}\n[steps: {}, sub-actions: {}]",
                 res.task,
@@ -199,7 +223,7 @@ impl<M: Model + Clone + Send + 'static> Tool for SpawnSubagentTool<M> {
 /// Tool implementation: `swarm` (parallel subagents)
 pub struct SwarmTool<M: Model + Clone + Send + 'static> {
     pub model: M,
-    pub tools: ToolCollection,
+    pub tools: Arc<RwLock<ToolCollection>>,
     pub max_steps: usize,
     pub max_workers: usize,
 }
@@ -208,9 +232,30 @@ impl<M: Model + Clone + Send + 'static> SwarmTool<M> {
     pub fn new(model: M, tools: ToolCollection, max_steps: usize, max_workers: usize) -> Self {
         Self {
             model,
+            tools: Arc::new(RwLock::new(tools)),
+            max_steps,
+            max_workers,
+        }
+    }
+
+    pub fn with_shared_tools(
+        model: M,
+        tools: Arc<RwLock<ToolCollection>>,
+        max_steps: usize,
+        max_workers: usize,
+    ) -> Self {
+        Self {
+            model,
             tools,
             max_steps,
             max_workers,
+        }
+    }
+
+    /// Update the shared toolkit atomically so swarm workers immediately see new/updated tools
+    pub fn update_tools(&self, new_tools: ToolCollection) {
+        if let Ok(mut lock) = self.tools.write() {
+            *lock = new_tools;
         }
     }
 }
@@ -248,10 +293,11 @@ impl<M: Model + Clone + Send + 'static> Tool for SwarmTool<M> {
         });
         let subset_refs: Option<Vec<&str>> = subset_storage.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
 
+        let current_tools = self.tools.read().map(|t| t.clone()).unwrap_or_default();
         let results = swarm(
             &tasks,
             self.model.clone(),
-            &self.tools,
+            &current_tools,
             subset_refs.as_deref(),
             self.max_steps,
             self.max_workers,
@@ -363,7 +409,13 @@ mod tests {
         assert!(tools.get("spawn_subagent").is_some());
         assert!(tools.get("swarm").is_some());
 
-        // Now spawn subagent and check that within the subagent, spawn_subagent cannot be called
+        // Verify that build_child_tools strips spawn_subagent and swarm
+        let child_tools = build_child_tools(&tools, None);
+        assert!(child_tools.get("spawn_subagent").is_none());
+        assert!(child_tools.get("swarm").is_none());
+
+        // Now spawn subagent and check that when the subagent attempts recursive spawning,
+        // it fails at the gateway and is recorded as an error in audit.
         let model = ScriptedModel::new(
             vec![
                 Step::call("spawn_subagent", json!({"task": "recursive"})),
@@ -372,8 +424,11 @@ mod tests {
             "never reached either",
         );
 
-        let res = spawn_subagent("test depth", model, &tools, None, 4);
-        assert!(res.is_err(), "Calling spawn_subagent from child must fail at gateway");
+        let res = spawn_subagent("test depth", model, &tools, None, 4).unwrap();
+        // spawn_subagent was stripped by the depth guard, so it was never executed
+        assert!(res.audit.iter().all(|a| a.tool != "spawn_subagent"));
+        assert_eq!(res.audit.len(), 1);
+        assert_eq!(res.audit[0].tool, "terminate");
     }
 
     #[test]
@@ -394,6 +449,22 @@ mod tests {
             let r = res.unwrap();
             assert_eq!(r.answer, "all good");
         }
+    }
+
+    #[test]
+    fn shared_tools_dynamic_update() {
+        let tools = Arc::new(RwLock::new(base_tools()));
+        let dummy_model = ScriptedModel::new(vec![], "never");
+        let tool = SpawnSubagentTool::with_shared_tools(dummy_model, tools.clone(), 4);
+
+        assert!(tools.read().unwrap().get("echo").is_some());
+        assert!(tools.read().unwrap().get("custom_tool").is_none());
+
+        // Update shared toolkit safely
+        let mut new_col = base_tools();
+        new_col.add(SimpleEcho);
+        tool.update_tools(new_col);
+        assert!(tools.read().unwrap().get("echo").is_some());
     }
 
     #[test]

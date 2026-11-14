@@ -98,7 +98,17 @@ pub fn http_request_tls(
         format!("{scheme}://{host}:{port}{path}")
     };
     let mut cmd = std::process::Command::new("curl");
-    cmd.args(["-s", "-S", "-X", method, &url]);
+    cmd.args([
+        "--connect-timeout",
+        "10",
+        "--max-time",
+        "120",
+        "-s",
+        "-S",
+        "-X",
+        method,
+        &url,
+    ]);
     cmd.args(["-H", "accept: application/json"]);
     cmd.args(["-H", "content-type: application/json"]);
     if let Some(a) = auth {
@@ -155,7 +165,8 @@ fn decode_chunked(mut body: &[u8]) -> Vec<u8> {
             None => break,
         };
         let line = String::from_utf8_lossy(&body[..nl]);
-        let size = match usize::from_str_radix(line.trim(), 16) {
+        let hex_part = line.split(';').next().unwrap_or("").trim();
+        let size = match usize::from_str_radix(hex_part, 16) {
             Ok(s) => s,
             Err(_) => break,
         };
@@ -163,7 +174,13 @@ fn decode_chunked(mut body: &[u8]) -> Vec<u8> {
             break;
         }
         let start = nl + 2;
-        let end = start + size;
+        let end = match start.checked_add(size) {
+            Some(e) => e,
+            None => break,
+        };
+        if start > body.len() {
+            break;
+        }
         if body.len() < end {
             out.extend_from_slice(&body[start..]);
             break;
@@ -684,15 +701,12 @@ impl HttpModel {
             &extra,
             Some(&body_str),
             "text/event-stream",
-            &mut |data| proto.parse_stream_event(data, &mut acc, on_reasoning),
+            &mut |data| proto.parse_stream_event(data, &mut acc, on_delta, on_reasoning),
         );
         if let Err(e) = result {
             return Step::Final(format!("[model stream error: {e}]"));
         }
         let parsed = acc.into_parsed();
-        // Reasoning already streamed live via on_reasoning; do NOT re-emit it into
-        // the answer tail. Only the visible answer text goes to on_delta.
-        on_delta(&parsed.content);
         self.step_from_parsed(parsed)
     }
 
@@ -1156,7 +1170,8 @@ pub fn http_sse(
     sock.set_read_timeout(Some(Duration::from_secs(220))).ok();
 
     let mut req = String::new();
-    req.push_str(&format!("{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nAccept: text/event-stream\r\n"));
+    let host_hdr = crate::provider::transport::format_host_header(host, port);
+    req.push_str(&format!("{method} {path} HTTP/1.1\r\nHost: {host_hdr}\r\nAccept: text/event-stream\r\n"));
     if let Some(a) = auth {
         req.push_str(&format!("Authorization: Bearer {a}\r\n"));
     }
@@ -1219,7 +1234,16 @@ pub fn http_sse_curl(
         format!("{scheme}://{host}:{port}{path}")
     };
     let mut cmd = std::process::Command::new("curl");
-    cmd.args(["-N", "-s", "-S", "-X", method, &url]);
+    cmd.args([
+        "--connect-timeout",
+        "10",
+        "-N",
+        "-s",
+        "-S",
+        "-X",
+        method,
+        &url,
+    ]);
     cmd.args(["-H", "accept: text/event-stream"]);
     cmd.args(["-H", "content-type: application/json"]);
     if let Some(a) = auth {
@@ -1474,6 +1498,24 @@ mod tests {
             }
             Step::Final(f) => panic!("Expected Step::Calls, got Step::Final: {f}"),
         }
+    }
+
+    #[test]
+    fn http_request_tls_fails_fast_on_unreachable_endpoint() {
+        let start = std::time::Instant::now();
+        // 192.0.2.1 is TEST-NET-1 (RFC 5737), non-routable blackhole IP.
+        // It triggers curl's --connect-timeout 10 and returns an error quickly.
+        let res = http_request_tls("GET", "192.0.2.1", 443, "/v1/models", None, None);
+        assert!(res.is_err(), "Expected connection failure to TEST-NET blackhole IP");
+        let elapsed = start.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(15), "Request took {elapsed:?}, expected <15s");
+    }
+
+    #[test]
+    fn test_decode_chunked_extensions() {
+        let raw = b"5;foo=bar\r\nhello\r\n6;ext1=val1;ext2\r\n world\r\n0\r\n\r\n";
+        let decoded = decode_chunked(raw);
+        assert_eq!(String::from_utf8_lossy(&decoded), "hello world");
     }
 }
 

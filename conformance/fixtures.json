@@ -1,0 +1,20 @@
+{
+  "catalog_definition_canonicalization": {
+    "canonicalizer_only_vectors": [],
+    "vectors": [],
+    "rejected_vectors": [
+      {
+        "input": {
+          "id": "unsafe_tool",
+          "name": "unsafe_tool",
+          "description": "Unsafe integer tool",
+          "input_schema": {
+            "type": "integer",
+            "maximum": 9007199254740992
+          },
+          "output_schema": {}
+        }
+      }
+    ]
+  }
+}

@@ -35,7 +35,8 @@ fn spawn_scripted_gateway() -> u16 {
                 "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_call\"}]}".into(),
             ],
         ];
-        for (i, stream) in listener.incoming().enumerate() {
+        let mut turn_idx = 0;
+        for (_i, stream) in listener.incoming().enumerate() {
             let mut sock = stream.unwrap();
             let mut buf = vec![0u8; 8192];
             let mut raw = Vec::new();
@@ -44,14 +45,27 @@ fn spawn_scripted_gateway() -> u16 {
                     Ok(0) => break,
                     Ok(n) => {
                         raw.extend_from_slice(&buf[..n]);
-                        if find(&raw, b"\r\n\r\n").is_some() && raw.len() > 200 {
+                        if find(&raw, b"\r\n\r\n").is_some() && (raw.starts_with(b"GET ") || raw.len() > 200) {
                             break;
                         }
                     }
                     Err(_) => break,
                 }
             }
-            let events = &sse[i % sse.len()];
+            if raw.is_empty() {
+                continue;
+            }
+            if raw.starts_with(b"GET ") {
+                let body = "{\"data\":[{\"id\":\"mock-model\"}]}";
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                let _ = sock.write_all(head.as_bytes());
+                let _ = sock.write_all(body.as_bytes());
+                let _ = sock.flush();
+                drop(sock);
+                continue;
+            }
+            let events = &sse[turn_idx % sse.len()];
+            turn_idx += 1;
             let body: String = events.iter().map(|e| format!("data: {e}\n\n")).collect::<Vec<_>>().join("") + "data: [DONE]\n\n";
             let head = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
             let _ = sock.write_all(head.as_bytes());

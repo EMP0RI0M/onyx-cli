@@ -68,9 +68,14 @@ impl McpClient {
         sock.set_write_timeout(Some(Duration::from_secs(10))).ok();
         sock.set_read_timeout(Some(Duration::from_secs(30))).ok();
 
+        let host_header = if self.port == 80 || self.port == 443 {
+            self.host.clone()
+        } else {
+            format!("{}:{}", self.host, self.port)
+        };
         let req = format!(
-            "POST {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            self.path, self.host, self.port, req_body.len(), req_body
+            "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            self.path, host_header, req_body.len(), req_body
         );
 
         sock.write_all(req.as_bytes())
@@ -80,10 +85,34 @@ impl McpClient {
         sock.read_to_end(&mut buf)
             .map_err(|e| ToolError::Other(format!("read error: {e}")))?;
 
-        let response = String::from_utf8_lossy(&buf);
-        let body = response.split("\r\n\r\n").nth(1).unwrap_or(&response);
+        let (head_bytes, body_bytes) = match find_subslice(&buf, b"\r\n\r\n") {
+            Some(i) => (&buf[..i], &buf[i + 4..]),
+            None => (&[][..], &buf[..]),
+        };
+        let head = String::from_utf8_lossy(head_bytes);
 
-        let v: Value = serde_json::from_str(body)
+        let decoded_bytes = if head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+            decode_chunked(body_bytes)
+        } else {
+            body_bytes.to_vec()
+        };
+
+        if let Some(status_line) = head.lines().next() {
+            let parts: Vec<&str> = status_line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                if let Ok(code) = parts[1].parse::<u16>() {
+                    if !(200..=299).contains(&code) {
+                        let err_text = String::from_utf8_lossy(&decoded_bytes);
+                        return Err(ToolError::Other(format!(
+                            "MCP server returned HTTP {code}: {}",
+                            err_text.trim()
+                        )));
+                    }
+                }
+            }
+        }
+
+        let v: Value = serde_json::from_slice(&decoded_bytes)
             .map_err(|e| ToolError::Other(format!("invalid JSON-RPC reply: {e}")))?;
 
         if let Some(err) = v.get("error") {
@@ -208,6 +237,53 @@ impl Tool for McpTool {
     }
 }
 
+/// Decode HTTP chunked transfer encoding (RFC 9112 Section 7.1).
+/// Safely parses hex chunk sizes, handles chunk extensions (e.g. `;ext=val`),
+/// and concatenates chunk payloads into a contiguous buffer.
+pub fn decode_chunked(mut body: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        let nl = match find_subslice(body, b"\r\n") {
+            Some(i) => i,
+            None => break,
+        };
+        let line = String::from_utf8_lossy(&body[..nl]);
+        let hex_part = line.split(';').next().unwrap_or("").trim();
+        let size = match usize::from_str_radix(hex_part, 16) {
+            Ok(s) => s,
+            Err(_) => break,
+        };
+        if size == 0 {
+            break;
+        }
+        let start = nl + 2;
+        let end = match start.checked_add(size) {
+            Some(e) => e,
+            None => break,
+        };
+        if start > body.len() {
+            break;
+        }
+        if body.len() < end {
+            out.extend_from_slice(&body[start..]);
+            break;
+        }
+        out.extend_from_slice(&body[start..end]);
+        body = &body[end..];
+        if body.len() >= 2 && &body[..2] == b"\r\n" {
+            body = &body[2..];
+        }
+    }
+    out
+}
+
+fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,5 +370,89 @@ mod tests {
         assert!(!out.is_error);
 
         let _ = handle.join();
+    }
+
+    #[test]
+    fn test_decode_chunked_framing_and_extensions() {
+        let chunked_raw = b"7\r\nMozilla\r\n9\r\nDeveloper\r\n7;ext=foo\r\nNetwork\r\n0\r\n\r\n";
+        let decoded = decode_chunked(chunked_raw);
+        assert_eq!(String::from_utf8_lossy(&decoded), "MozillaDeveloperNetwork");
+    }
+
+    #[test]
+    fn test_mcp_client_handles_chunked_json_rpc_reply() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf);
+
+                let json_data = json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": { "capabilities": { "tools": {} } }
+                }).to_string();
+
+                let part1 = &json_data[..json_data.len() / 2];
+                let part2 = &json_data[json_data.len() / 2..];
+
+                let body = format!(
+                    "{:x}\r\n{}\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+                    part1.len(),
+                    part1,
+                    part2.len(),
+                    part2
+                );
+
+                let http_resp = format!(
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+                    body
+                );
+                sock.write_all(http_resp.as_bytes()).unwrap();
+            }
+        });
+
+        let client = McpClient::new("test_chunked", "127.0.0.1", port, "/");
+        let res = client.initialize();
+        assert!(res.is_ok(), "Expected successful initialization over chunked HTTP, got {:?}", res);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_mcp_client_handles_non_200_http_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf);
+
+                let http_resp = "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nAuthentication required";
+                sock.write_all(http_resp.as_bytes()).unwrap();
+            }
+        });
+
+        let client = McpClient::new("test_auth_fail", "127.0.0.1", port, "/");
+        let res = client.initialize();
+        assert!(res.is_err());
+        let err_msg = format!("{:?}", res.unwrap_err());
+        assert!(err_msg.contains("MCP server returned HTTP 401: Authentication required"), "Unexpected err: {err_msg}");
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_decode_chunked_overflow_protection_and_split_utf8() {
+        // Overflow test: size is usize::MAX
+        let bad_raw = b"ffffffffffffffff\r\n";
+        let out = decode_chunked(bad_raw);
+        assert!(out.is_empty(), "Should not panic or overflow on huge size");
+
+        // Split UTF-8 test: 'é' is \xc3\xa9, split across chunks
+        let split_utf8 = b"1\r\n\xc3\r\n1\r\n\xa9\r\n0\r\n\r\n";
+        let decoded = decode_chunked(split_utf8);
+        assert_eq!(std::str::from_utf8(&decoded).unwrap(), "é");
     }
 }

@@ -175,8 +175,10 @@ fn test_performance_benchmark() {
         let c_p95 = batch_latencies[(iters * 95) / 100];
         println!("{:<48} | p50: {:>4} ns ({:.3} µs) | p95: {:>4} ns ({:.3} µs)", cmd, c_p50, c_p50 as f64 / 1000.0, c_p95, c_p95 as f64 / 1000.0);
 
-        // Target: p50 under 2 µs, p95 under 5 µs
-        assert!(c_p50 < 2000, "Single command p50 must be under 2000 ns (2 µs), got {} ns", c_p50);
-        assert!(c_p95 < 5000, "Single command p95 must be under 5000 ns (5 µs), got {} ns", c_p95);
+        // Target: p50 under 2 µs (release) or 10 µs (debug), p95 under 5 µs (release) or 20 µs (debug)
+        let max_p50 = if cfg!(debug_assertions) { 10_000 } else { 2_000 };
+        let max_p95 = if cfg!(debug_assertions) { 20_000 } else { 5_000 };
+        assert!(c_p50 < max_p50, "Single command p50 must be under {max_p50} ns, got {} ns", c_p50);
+        assert!(c_p95 < max_p95, "Single command p95 must be under {max_p95} ns, got {} ns", c_p95);
     }
 }

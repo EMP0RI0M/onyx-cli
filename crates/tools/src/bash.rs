@@ -80,11 +80,48 @@ impl Tool for Bash {
         c.arg("-c").arg(cmd);
         c.stdout(std::process::Stdio::piped());
         c.stderr(std::process::Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            c.process_group(0);
+        }
         if let Some(dir) = &self.cwd {
             c.current_dir(dir);
         }
 
         let mut child = c.spawn().map_err(ToolError::Io)?;
+
+        // Immediately start background readers triggered by OS kernel when data arrives,
+        // draining stdout/stderr pipes so the 64KB pipe buffer is freed up instantly.
+        // Stream chunks over mpsc channels with bounded recv_timeout after exit to prevent hanging
+        // if a background process (e.g. `sleep 300 &`) inherited the pipe.
+        let (tx_out, rx_out) = std::sync::mpsc::channel();
+        let mut stdout_pipe = child.stdout.take();
+        std::thread::spawn(move || {
+            if let Some(mut pipe) = stdout_pipe.take() {
+                let mut buf = [0u8; 8192];
+                while let Ok(n) = std::io::Read::read(&mut pipe, &mut buf) {
+                    if n == 0 { break; }
+                    if tx_out.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let (tx_err, rx_err) = std::sync::mpsc::channel();
+        let mut stderr_pipe = child.stderr.take();
+        std::thread::spawn(move || {
+            if let Some(mut pipe) = stderr_pipe.take() {
+                let mut buf = [0u8; 8192];
+                while let Ok(n) = std::io::Read::read(&mut pipe, &mut buf) {
+                    if n == 0 { break; }
+                    if tx_err.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
 
         // Default command timeout: 60 seconds (prevents hanging indefinitely on dev servers like `npm run dev`)
         let timeout_secs = std::env::var("ONYX_BASH_TIMEOUT")
@@ -100,9 +137,16 @@ impl Tool for Bash {
                 None => {
                     if start.elapsed() > std::time::Duration::from_secs(timeout_secs) {
                         timed_out = true;
+                        #[cfg(unix)]
+                        {
+                            let pid = child.id() as libc::pid_t;
+                            unsafe {
+                                libc::kill(-pid, libc::SIGKILL);
+                            }
+                        }
                         let _ = child.kill();
-                        let _ = child.wait();
-                        break std::process::ExitStatus::default();
+                        let term_status = child.wait().ok();
+                        break term_status.unwrap_or_default();
                     }
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
@@ -110,17 +154,30 @@ impl Tool for Bash {
         };
 
         let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        if let Some(mut out) = child.stdout.take() {
-            let _ = std::io::Read::read_to_end(&mut out, &mut stdout);
+        while let Ok(chunk) = rx_out.try_recv() {
+            stdout.extend_from_slice(&chunk);
         }
-        if let Some(mut err) = child.stderr.take() {
-            let _ = std::io::Read::read_to_end(&mut err, &mut stderr);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(150);
+        while let Ok(chunk) = rx_out.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            stdout.extend_from_slice(&chunk);
+        }
+
+        let mut stderr = Vec::new();
+        while let Ok(chunk) = rx_err.try_recv() {
+            stderr.extend_from_slice(&chunk);
+        }
+        let deadline_err = std::time::Instant::now() + std::time::Duration::from_millis(150);
+        while let Ok(chunk) = rx_err.recv_timeout(deadline_err.saturating_duration_since(std::time::Instant::now())) {
+            stderr.extend_from_slice(&chunk);
         }
 
         let stdout_str = String::from_utf8_lossy(&stdout);
         let stderr_str = String::from_utf8_lossy(&stderr);
-        let code = status.code().unwrap_or(if timed_out { 124 } else { -1 });
+        let code = if timed_out {
+            124
+        } else {
+            status.code().unwrap_or(-1)
+        };
 
         let mut content = String::new();
         content.push_str(&stdout_str);
@@ -140,5 +197,46 @@ impl Tool for Bash {
         let is_success = status.success() && !timed_out;
 
         Ok(format_command_output(cmd, &content, code, is_success))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn bash_large_output_does_not_deadlock() {
+        let tool = Bash::new();
+        // 200,000 bytes > 64KB OS pipe buffer
+        let args = json!({"command": "python3 -c \"print('A' * 200000)\""});
+        let start = std::time::Instant::now();
+        let res = tool.execute(&args).expect("must succeed without deadlocking");
+        assert!(start.elapsed() < std::time::Duration::from_secs(5), "execution must be immediate, took {:?}", start.elapsed());
+        assert!(!res.is_error);
+    }
+
+    #[test]
+    fn bash_timeout_returns_code_124() {
+        std::env::set_var("ONYX_BASH_TIMEOUT", "1");
+        let tool = Bash::new();
+        let args = json!({"command": "sleep 5"});
+        let res = tool.execute(&args).expect("must return output");
+        std::env::remove_var("ONYX_BASH_TIMEOUT");
+        assert!(res.is_error, "timed out command must report is_error");
+        assert!(res.content.contains("[exit 124]"), "content must indicate exit 124, got: {}", res.content);
+        assert!(res.content.contains("timed out"), "content must indicate timed out, got: {}", res.content);
+    }
+
+    #[test]
+    fn bash_background_grandchild_does_not_hang() {
+        let tool = Bash::new();
+        // Spawns a background sleep holding inherited file descriptors, but shell exits immediately.
+        let args = json!({"command": "sleep 10 & echo done"});
+        let start = std::time::Instant::now();
+        let res = tool.execute(&args).expect("must return output");
+        assert!(start.elapsed() < std::time::Duration::from_secs(3), "must not block on background process, took {:?}", start.elapsed());
+        assert!(!res.is_error);
+        assert!(res.content.contains("done"));
     }
 }

@@ -40,6 +40,16 @@ fn is_local_host(host: &str) -> bool {
         || host.starts_with("[::1]")
 }
 
+/// Format the HTTP Host header per RFC 7230 / RFC 9110: standard ports (80 for HTTP, 443 for HTTPS)
+/// must omit the port component, while non-standard ports retain it.
+pub fn format_host_header(host: &str, port: u16) -> String {
+    if port == 80 || port == 443 {
+        host.to_string()
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 /// Build a rustls client config with the webpki root bundle and the ring
 /// provider installed once (idempotent). Returns an Arc usable across calls.
 fn tls_config() -> Result<Arc<ClientConfig>, String> {
@@ -135,8 +145,9 @@ pub fn sse(
     let tls = use_tls(host, port);
     let mut sock = open_stream(host, port, tls)?;
     let mut head = String::new();
+    let host_hdr = format_host_header(host, port);
     head.push_str(&format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nAccept: {accept}\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: {host_hdr}\r\nAccept: {accept}\r\n"
     ));
     apply_auth_and_extra(&mut head, auth, extra);
     match body {
@@ -234,8 +245,9 @@ fn build_head(
     body: Option<&str>,
 ) -> String {
     let mut req = String::new();
+    let host_hdr = format_host_header(host, port);
     req.push_str(&format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nAccept: application/json\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: {host_hdr}\r\nAccept: application/json\r\n"
     ));
     apply_auth_and_extra(&mut req, auth, extra);
     match body {
@@ -321,7 +333,8 @@ pub(crate) fn decode_chunked(mut body: &[u8]) -> Vec<u8> {
             None => break,
         };
         let line = String::from_utf8_lossy(&body[..nl]);
-        let size = match usize::from_str_radix(line.trim(), 16) {
+        let hex_part = line.split(';').next().unwrap_or("").trim();
+        let size = match usize::from_str_radix(hex_part, 16) {
             Ok(s) => s,
             Err(_) => break,
         };
@@ -329,7 +342,13 @@ pub(crate) fn decode_chunked(mut body: &[u8]) -> Vec<u8> {
             break;
         }
         let start = nl + 2;
-        let end = start + size;
+        let end = match start.checked_add(size) {
+            Some(e) => e,
+            None => break,
+        };
+        if start > body.len() {
+            break;
+        }
         if body.len() < end {
             out.extend_from_slice(&body[start..]);
             break;
@@ -341,4 +360,33 @@ pub(crate) fn decode_chunked(mut body: &[u8]) -> Vec<u8> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_host_header_omits_default_ports_and_retains_custom() {
+        assert_eq!(format_host_header("api.openai.com", 443), "api.openai.com");
+        assert_eq!(format_host_header("api.anthropic.com", 80), "api.anthropic.com");
+        assert_eq!(format_host_header("localhost", 8080), "localhost:8080");
+        assert_eq!(format_host_header("127.0.0.1", 11434), "127.0.0.1:11434");
+    }
+
+    #[test]
+    fn build_head_normalizes_host_header() {
+        let head_443 = build_head("POST", "api.openai.com", 443, "/v1/chat", None, &[], None);
+        assert!(head_443.contains("Host: api.openai.com\r\n"), "got: {head_443}");
+
+        let head_custom = build_head("POST", "localhost", 11434, "/v1/chat", None, &[], None);
+        assert!(head_custom.contains("Host: localhost:11434\r\n"), "got: {head_custom}");
+    }
+
+    #[test]
+    fn test_decode_chunked_with_extensions() {
+        let raw = b"5;foo=bar\r\nhello\r\n6;ext1=val1;ext2\r\n world\r\n0\r\n\r\n";
+        let decoded = decode_chunked(raw);
+        assert_eq!(String::from_utf8_lossy(&decoded), "hello world");
+    }
 }

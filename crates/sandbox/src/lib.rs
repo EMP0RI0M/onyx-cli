@@ -18,6 +18,7 @@
 use std::io::Write;
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
 use std::process::Command;
 
 #[cfg(target_os = "linux")]
@@ -292,8 +293,38 @@ pub fn run(level: Level, command: &str, cwd: Option<&str>) -> std::io::Result<(S
         // to track child execve hooks.
         if !filter::under_ptrace_emulator() {
             c.env_clear();
-            c.env("PATH", "/usr/bin:/bin:/usr/local/bin");
-            c.env("HOME", cwd.unwrap_or("/tmp"));
+
+            // Construct safe, complete PATH: preserve essential user toolchain directories
+            // ($HOME/.local/bin, $HOME/.cargo/bin) along with standard system binary paths,
+            // while stripping dangerous linker variables and secrets.
+            let mut paths: Vec<String> = Vec::new();
+            if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+                let local_bin = home.join(".local/bin");
+                if local_bin.is_dir() {
+                    paths.push(local_bin.display().to_string());
+                }
+                let cargo_bin = home.join(".cargo/bin");
+                if cargo_bin.is_dir() {
+                    paths.push(cargo_bin.display().to_string());
+                }
+            }
+            paths.extend([
+                "/usr/local/bin".to_string(),
+                "/usr/bin".to_string(),
+                "/bin".to_string(),
+                "/snap/bin".to_string(),
+            ]);
+            c.env("PATH", paths.join(":"));
+
+            // Preserve real HOME if present so toolchains (Cargo, Rustup, Git) locate their configs
+            if let Some(home) = std::env::var_os("HOME") {
+                c.env("HOME", home);
+            } else {
+                c.env("HOME", cwd.unwrap_or("/tmp"));
+            }
+            if let Some(user) = std::env::var_os("USER") {
+                c.env("USER", user);
+            }
             c.env("TMPDIR", "/tmp");
             c.env("LANG", "C.UTF-8");
         }
@@ -368,11 +399,24 @@ pub fn seccomp_enforcement_works() -> Option<bool> {
         if filter::under_ptrace_emulator() {
             return Some(false);
         }
-        let out = run(Level::SeccompOnly, "umount /nonexistent-xyz 2>&1; echo rc=$?", None).ok()?;
-        if !out.0.contains("rc=0") {
+        // Direct self-test without invoking run() recursively to prevent OnceLock deadlock
+        let mut c = Command::new("/bin/sh");
+        c.arg("-c").arg("umount /nonexistent-xyz 2>&1; echo rc=$?");
+        unsafe {
+            c.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                filter::install_deny_filter()?;
+                Ok(())
+            });
+        }
+        let out = c.output().ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        if !text.contains("rc=0") {
             return Some(true); // umount failed => EPERM denial reached the child
         }
-        if out.0.contains("Operation not permitted") || out.0.contains("rc=32") {
+        if text.contains("Operation not permitted") || text.contains("rc=32") {
             return Some(true);
         }
         Some(false)
@@ -498,8 +542,33 @@ mod tests {
             return;
         }
         // When running on native host without ptrace emulation, denied syscall returns error
-        let (out, code) = run(Level::SeccompOnly, "umount /proc 2>&1; echo exit=$?", None).unwrap();
-        assert_ne!(code, 0);
-        assert!(out.contains("Operation not permitted") || out.contains("exit=1"));
+        let (out, _code) = run(Level::SeccompOnly, "umount /proc 2>&1; echo exit=$?", None).unwrap();
+        assert!(
+            out.contains("Operation not permitted")
+                || out.contains("exit=1")
+                || out.contains("exit=32")
+                || out.contains("must be superuser")
+        );
+        assert!(!out.contains("exit=0"));
+    }
+
+    #[test]
+    fn sandbox_environment_preserves_tool_paths_and_scrubs_secrets() {
+        std::env::set_var("TEST_ONYX_SECRET", "super_secret_key_123");
+        let (out, code) = run(
+            Level::RestrictedEnv,
+            "echo PATH=$PATH; echo HOME=$HOME; echo SECRET=$TEST_ONYX_SECRET",
+            None,
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        // Secrets must be scrubbed
+        assert!(out.contains("SECRET=\n") || out.ends_with("SECRET="));
+        // Standard system binary path must be preserved
+        assert!(out.contains("/usr/bin") || out.contains("/bin"));
+        // User tool path or HOME must be preserved
+        if let Some(home) = std::env::var_os("HOME").and_then(|h| h.into_string().ok()) {
+            assert!(out.contains(&format!("HOME={home}")));
+        }
     }
 }

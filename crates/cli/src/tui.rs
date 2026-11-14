@@ -99,58 +99,6 @@ mod glyphs {
     pub const THUMB_CHAR: char = '█';
 }
 
-/// Raw-mode guard: restores termios on drop, including panic unwind.
-#[cfg(unix)]
-struct RawMode(libc::termios);
-
-#[cfg(unix)]
-impl RawMode {
-    fn enter() -> Option<Self> {
-        let mut t: libc::termios = unsafe { std::mem::zeroed() };
-        if unsafe { libc::tcgetattr(0, &mut t) } != 0 {
-            return None;
-        }
-        let mut raw = t;
-        unsafe { libc::cfmakeraw(&mut raw) };
-        // Retain standard post-processing (OPOST and ONLCR) so \n translates
-        // to CR+LF (\r\n) on output and doesn't stair-step across the screen.
-        raw.c_oflag |= libc::OPOST | libc::ONLCR;
-        // Keep signals we want delivered as BYTES off the signal path: ISIG
-        // would turn ctrl+c into SIGINT and kill us before the reader sees it.
-        raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
-        raw.c_cc[libc::VMIN] = 1;
-        raw.c_cc[libc::VTIME] = 0;
-        if unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw) } != 0 {
-            return None;
-        }
-        Some(Self(t))
-    }
-}
-
-#[cfg(unix)]
-impl Drop for RawMode {
-    fn drop(&mut self) {
-        unsafe { libc::tcsetattr(0, libc::TCSANOW, &self.0) };
-    }
-}
-
-#[cfg(not(unix))]
-struct RawMode;
-
-#[cfg(not(unix))]
-impl RawMode {
-    fn enter() -> Option<Self> {
-        let _ = crossterm::terminal::enable_raw_mode();
-        Some(Self)
-    }
-}
-
-#[cfg(not(unix))]
-impl Drop for RawMode {
-    fn drop(&mut self) {
-        let _ = crossterm::terminal::disable_raw_mode();
-    }
-}
 
 fn term_size() -> (u16, u16) {
     #[cfg(unix)]
@@ -405,7 +353,7 @@ fn decode_key(buf: &[u8]) -> (Vec<char>, u32) {
 /// Background stdin pump: reads raw bytes, splits them into key events, and
 /// forwards each event over an mpsc channel. On exit the joiner drops the
 /// sender, the thread sees send() fail and exits, cooked mode is restored by
-/// RawMode's Drop, and any unread keystrokes flush to the shell afterwards.
+/// AltScreenGuard's Drop, and any unread keystrokes flush to the shell afterwards.
 struct InputPump {
     rx: Receiver<Vec<u8>>,
     stop: Arc<Mutex<bool>>,
@@ -628,6 +576,8 @@ enum UiOut {
     /// (message count, total content bytes) — mirrors the worker-owned history
     /// so `/usage` can report without touching it.
     History(usize, usize),
+    /// Asynchronous model discovery outcome
+    ModelsDiscovered(Result<Vec<String>, String>),
 }
 
 /// Per-turn item identity for the CoreEvent stream the worker emits. The host
@@ -1141,6 +1091,8 @@ pub struct Tui<'a> {
     last_browser_height: usize,
     cached_diff_stat: Option<String>,
     last_diff_check: Option<std::time::Instant>,
+    diff_stat_rx: Option<std::sync::mpsc::Receiver<Option<String>>>,
+    diff_stat_in_flight: bool,
 }
 
 /// Full-screen "Chat Sessions" picker opened by bare `/resume`. Complements —
@@ -1702,7 +1654,13 @@ impl<'a> Tui<'a> {
         opts: &'a mut Opts,
         sel: Option<&'a agent::retrieval::CapabilitySelector>,
     ) -> Self {
-        let cached_models = hm.list_models().unwrap_or_default();
+        // Fast local initialization: do not block startup with synchronous network requests.
+        // Asynchronous background discovery will populate the complete catalog via worker thread.
+        let cached_models = if !hm.model.is_empty() && hm.model != "auto" {
+            vec![hm.model.clone()]
+        } else {
+            Vec::new()
+        };
         let mcp_count = if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
             let mcp_cfg = home.join(".onyx/mcp.json");
             if let Ok(content) = std::fs::read_to_string(mcp_cfg) {
@@ -1812,6 +1770,8 @@ impl<'a> Tui<'a> {
             last_browser_height: 10,
             cached_diff_stat: None,
             last_diff_check: None,
+            diff_stat_rx: None,
+            diff_stat_in_flight: false,
             workspace_dir: std::env::current_dir()
                 .map(|p| {
                     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
@@ -1857,6 +1817,15 @@ impl<'a> Tui<'a> {
         let (ut, ur) = channel::<UiOut>();
         self.ui_rx = Some(ur);
         self.ctl_tx = Some(ct);
+
+        // Asynchronous model discovery thread: fetches models in the background
+        // without disturbing the TUI loader or initial startup speed.
+        let ut_models = ut.clone();
+        let hm_clone = self.hm.clone();
+        std::thread::spawn(move || {
+            let res = hm_clone.list_models();
+            let _ = ut_models.send(UiOut::ModelsDiscovered(res));
+        });
 
         // Open or resume a durable transcript for this run.
         // Start a fresh, clean session by default. Only resume previous history
@@ -3631,7 +3600,8 @@ impl<'a> Tui<'a> {
         match std::net::TcpStream::connect((host.as_str(), port)) {
             Ok(mut s) => {
                 use std::io::{Read, Write};
-                let req = format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
+                let host_hdr = if port == 80 || port == 443 { host.clone() } else { format!("{host}:{port}") };
+                let req = format!("GET {path} HTTP/1.1\r\nHost: {host_hdr}\r\nConnection: close\r\n\r\n");
                 let _ = s.write_all(req.as_bytes());
                 let mut buf = [0u8; 16];
                 let _ = s.read(&mut buf);
@@ -5126,56 +5096,68 @@ impl<'a> Tui<'a> {
         Some(base.join("skills"))
     }
 
-    /// Git diff short summary (+lines -lines) for the current workspace (cached for 5 seconds)
+    /// Git diff short summary (+lines -lines) for the current workspace (asynchronous non-blocking background query, cached for 5 seconds)
     fn git_diff_summary(&mut self) -> Option<String> {
+        // Collect any finished background result
+        if let Some(ref rx) = self.diff_stat_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.cached_diff_stat = res;
+                self.diff_stat_in_flight = false;
+                self.diff_stat_rx = None;
+            }
+        }
+
         let now = std::time::Instant::now();
-        if let (Some(last), Some(cached)) = (self.last_diff_check, &self.cached_diff_stat) {
-            if now.duration_since(last) < Duration::from_secs(5) {
-                return Some(cached.clone());
-            }
-        } else if let Some(last) = self.last_diff_check {
-            if now.duration_since(last) < Duration::from_secs(5) {
-                return None;
-            }
+        let should_spawn = !self.diff_stat_in_flight
+            && match self.last_diff_check {
+                Some(last) => now.duration_since(last) >= Duration::from_secs(5),
+                None => true,
+            };
+
+        if should_spawn {
+            self.last_diff_check = Some(now);
+            self.diff_stat_in_flight = true;
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.diff_stat_rx = Some(rx);
+
+            std::thread::spawn(move || {
+                let out = std::process::Command::new("git")
+                    .args(["diff", "--shortstat"])
+                    .output()
+                    .ok();
+                let res = out.and_then(|o| {
+                    if !o.status.success() {
+                        return None;
+                    }
+                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if s.is_empty() {
+                        return None;
+                    }
+                    let mut ins = 0;
+                    let mut del = 0;
+                    for part in s.split(',') {
+                        let part = part.trim();
+                        if part.contains("insertion") {
+                            if let Some(num) = part.split_whitespace().next().and_then(|n| n.parse::<usize>().ok()) {
+                                ins = num;
+                            }
+                        } else if part.contains("deletion") {
+                            if let Some(num) = part.split_whitespace().next().and_then(|n| n.parse::<usize>().ok()) {
+                                del = num;
+                            }
+                        }
+                    }
+                    if ins > 0 || del > 0 {
+                        Some(format!("+{ins} -{del}"))
+                    } else {
+                        None
+                    }
+                });
+                let _ = tx.send(res);
+            });
         }
 
-        self.last_diff_check = Some(now);
-
-        let out = std::process::Command::new("git")
-            .args(["diff", "--shortstat"])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            self.cached_diff_stat = None;
-            return None;
-        }
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if s.is_empty() {
-            self.cached_diff_stat = None;
-            return None;
-        }
-        // Example output: "6 files changed, 331 insertions(+), 76 deletions(-)"
-        let mut ins = 0;
-        let mut del = 0;
-        for part in s.split(',') {
-            let part = part.trim();
-            if part.contains("insertion") {
-                if let Some(num) = part.split_whitespace().next().and_then(|n| n.parse::<usize>().ok()) {
-                    ins = num;
-                }
-            } else if part.contains("deletion") {
-                if let Some(num) = part.split_whitespace().next().and_then(|n| n.parse::<usize>().ok()) {
-                    del = num;
-                }
-            }
-        }
-        let res = if ins > 0 || del > 0 {
-            Some(format!("+{ins} -{del}"))
-        } else {
-            None
-        };
-        self.cached_diff_stat = res.clone();
-        res
+        self.cached_diff_stat.clone()
     }
 
     /// Run the SkillOpt-Sleep offline cycle over saved transcripts and gate the
@@ -5485,6 +5467,18 @@ impl<'a> Tui<'a> {
                     UiOut::History(len, bytes) => {
                         self.history_len = len;
                         self.history_bytes = bytes;
+                    }
+                    UiOut::ModelsDiscovered(res) => {
+                        match res {
+                            Ok(models) => {
+                                if !models.is_empty() {
+                                    self.cached_models = models;
+                                }
+                            }
+                            Err(_) => {
+                                // Failsafe: keep existing cached_models without disturbing UI
+                            }
+                        }
                     }
                 }
                 event_seen = true;
@@ -6012,7 +6006,10 @@ impl<'a> Tui<'a> {
     fn draw_ratatui(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) {
         self.sync_size();
         let diff_stat = self.git_diff_summary();
-        let _ = terminal.draw(|f| self.render(f, diff_stat.as_deref()));
+        if terminal.draw(|f| self.render(f, diff_stat.as_deref())).is_err() {
+            let _ = terminal.clear();
+            let _ = terminal.draw(|f| self.render(f, None));
+        }
     }
 
     /// Convert a legacy styled-ANSI string into a ratatui `Line`. We keep the
@@ -6157,7 +6154,7 @@ impl<'a> Tui<'a> {
 
         // ── header (centered block-glyph ONYX banner + tagline) ──
         let account = std::env::var("ONYX_ACCOUNT").unwrap_or_else(|_| "local".to_string());
-        let wide_header = w >= 40 && area.height >= 12;
+        let wide_header = w >= 60 && area.height >= 24;
         const BANNER_ROWS: [&'static str; 6] = [
             "██████╗ ███╗   ██╗██╗   ██╗██╗  ██╗",
             "██╔═══██╗████╗  ██║╚██╗ ██╔╝╚██╗██╔╝",
@@ -6184,13 +6181,17 @@ impl<'a> Tui<'a> {
             RuSpan::styled("ONYX ", theme::strong()),
             RuSpan::styled(account.clone(), theme::rgb(theme::INFO)),
             RuSpan::styled(" · ", theme::dim()),
-            RuSpan::styled(model_title, theme::dim()),
+            RuSpan::styled(model_title.clone(), theme::dim()),
         ]);
-        // Header: 7 rows (banner + tagline) when wide, 1 compact row otherwise.
+        // Header: 7 rows (banner + tagline) when wide (h >= 24, w >= 60), 1 compact row otherwise.
         let header_h = if wide_header { 8u16 } else { 1u16 };
         let compact_mark = RuLine::from(vec![
             RuSpan::styled("◆ ", theme::accent_bold()),
             RuSpan::styled("ONYX · INTELLIGENCE ENGINE", theme::strong()),
+            RuSpan::styled("  ", theme::dim()),
+            RuSpan::styled(account.clone(), theme::rgb(theme::INFO)),
+            RuSpan::styled(" · ", theme::dim()),
+            RuSpan::styled(model_title, theme::dim()),
         ]);
 
         // ── status/context strip (session id · model · ctx sparkline · pct) ──
@@ -6807,21 +6808,10 @@ pub fn tui_session(
     opts: &mut Opts,
     sel: Option<&agent::retrieval::CapabilitySelector>,
 ) {
-    // termios raw-mode guard drives the byte-level InputPump (VMIN=1 blocking
-    // read with ISIG/ECHO off). Kept alongside crossterm's raw mode so key
-    // decoding and the tick cadence are unchanged from the ANSI renderer.
-    let _raw = match RawMode::enter() {
-        Some(r) => r,
-        None => {
-            eprintln!("onyx: cannot enter raw mode — stdin is not a tty?");
-            return;
-        }
-    };
-
-    // Crossterm owns the alternate-screen buffer + cursor visibility that the
-    // ratatui renderer draws into. RAII guard restores on every exit path.
+    // Crossterm manages raw mode (disabling ICANON/ECHO/ISIG with VMIN=1) and snapshots
+    // the true cooked terminal state cleanly. RAII AltScreenGuard restores it on all exit paths.
     if ct_enable_raw().is_err() {
-        eprintln!("onyx: cannot enable crossterm raw mode");
+        eprintln!("onyx: cannot enter raw mode — stdin is not a tty?");
         return;
     }
     {
@@ -6837,21 +6827,30 @@ pub fn tui_session(
     }
     let _guard = AltScreenGuard;
 
-    let pump = InputPump::start();
     let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal = Terminal::new(backend).expect("ratatui terminal");
-    terminal
-        .hide_cursor()
-        .ok();
+    let mut terminal = match Terminal::new(backend) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("onyx: cannot initialize ratatui terminal: {e}");
+            return;
+        }
+    };
+    terminal.hide_cursor().ok();
     terminal.clear().ok();
 
     {
         let mut tui = Tui::new(gw, hm, opts, sel);
+        // Instant visual load: render immediately before starting worker and pump
+        tui.draw_ratatui(&mut terminal);
         tui.start_worker();
+
+        // Keyboard reader (InputPump) starts strictly after ratatui terminal
+        // has completely initialized and performed its first draw
+        let pump = InputPump::start();
         tui.run_ratatui(&pump, &mut terminal);
+        pump.shutdown();
         tui.finish();
     }
-    pump.shutdown();
     // _guard drops here → Show + LeaveAlternateScreen + disable_raw_mode.
     // Final newline so the shell prompt starts clean.
     println!();
@@ -6977,5 +6976,84 @@ mod tests {
         assert_eq!(code, 2000);
         let s: String = chars.into_iter().collect();
         assert_eq!(s, "hello\nworld");
+    }
+
+    #[test]
+    fn ui_out_models_discovered_updates_cache_or_failsafe() {
+        let mut cached = vec!["initial-model".to_string()];
+
+        let outcome_err: Result<Vec<String>, String> = Err("network down".to_string());
+        match outcome_err {
+            Ok(models) if !models.is_empty() => cached = models,
+            _ => {}
+        }
+        assert_eq!(cached, vec!["initial-model"]);
+
+        let outcome_ok: Result<Vec<String>, String> = Ok(vec!["model-a".to_string(), "model-b".to_string()]);
+        match outcome_ok {
+            Ok(models) if !models.is_empty() => cached = models,
+            _ => {}
+        }
+        assert_eq!(cached, vec!["model-a", "model-b"]);
+    }
+
+    #[test]
+    fn test_adaptive_header_rendering_for_small_and_large_terminals() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use tools::ToolCollection;
+        use tools::policy::{AllowAll, Policy};
+
+        let tool_col = ToolCollection::new();
+        let mut gw = tools::audit::Gateway::<dyn Policy>::from_boxed(tool_col, Box::new(AllowAll));
+        let mut hm = agent::model::HttpModel::new(
+            "localhost".into(),
+            8080,
+            "test-model".into(),
+            "key".into(),
+            "".into(),
+        );
+        let mut opts = crate::Opts {
+            doctor: false,
+            update: false,
+            provider_cmd: None,
+            model: None,
+            max_steps: 10,
+            allow_all: true,
+            guardian: false,
+            sandbox: false,
+            skill: None,
+            resume: None,
+            fresh: false,
+            print: None,
+            legacy: false,
+        };
+
+        let tui = Tui::new(&mut gw, &mut hm, &mut opts, None);
+
+        // 1. Small terminal (80 cols x 16 rows) -> must use compact 1-line header
+        let backend = TestBackend::new(80, 16);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| tui.render(f, None)).unwrap();
+
+        let buffer = term.backend().buffer();
+        let line0: String = (0..80).map(|x| buffer[(x, 0)].symbol().chars().next().unwrap_or(' ')).collect();
+        assert!(line0.contains("ONYX · INTELLIGENCE ENGINE"), "Expected compact header on small terminal, got: {line0}");
+
+        // 2. Large terminal (80 cols x 30 rows) -> must use wide block-glyph banner
+        let backend_large = TestBackend::new(80, 30);
+        let mut term_large = Terminal::new(backend_large).unwrap();
+        term_large.draw(|f| tui.render(f, None)).unwrap();
+
+        let buffer_large = term_large.backend().buffer();
+        let mut found_glyph = false;
+        for y in 0..7 {
+            let row: String = (0..80).map(|x| buffer_large[(x, y)].symbol().chars().next().unwrap_or(' ')).collect();
+            if row.contains('█') {
+                found_glyph = true;
+                break;
+            }
+        }
+        assert!(found_glyph, "Expected full block banner on large terminal");
     }
 }

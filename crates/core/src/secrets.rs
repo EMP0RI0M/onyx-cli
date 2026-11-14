@@ -351,6 +351,18 @@ fn write_secret_file(path: &PathBuf, contents: &str) -> Result<(), String> {
     let mut f = opts
         .open(path)
         .map_err(|e| format!("open {}: {e}", path.display()))?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        if let Ok(user) = std::env::var("USERNAME") {
+            let _ = std::process::Command::new("icacls")
+                .arg(path.as_os_str())
+                .arg("/inheritance:r")
+                .arg(format!("{user}:(R,W)"))
+                .creation_flags(0x08000000)
+                .output();
+        }
+    }
     std::io::Write::write_all(&mut f, contents.as_bytes()).map_err(|e| format!("write: {e}"))?;
     f.sync_data().ok();
     Ok(())

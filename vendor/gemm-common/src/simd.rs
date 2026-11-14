@@ -664,7 +664,7 @@ mod x86 {
 
         #[inline]
         fn try_new() -> Option<Self> {
-            Some(Self { __private: () })
+            None
         }
 
         #[inline(always)]
