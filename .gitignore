@@ -3,4 +3,3 @@
 *.log
 .onyx/
 benchmark_results/
-conformance/

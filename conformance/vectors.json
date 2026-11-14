@@ -1,0 +1,44 @@
+{
+  "graph": {
+    "invalid": [
+      {
+        "name": "empty_members",
+        "doc": {
+          "v": 1,
+          "built_from_ts": 100,
+          "rev": 1,
+          "intents": [
+            {
+              "id": "i0",
+              "label": "empty",
+              "members": [],
+              "support": 1,
+              "tools": {},
+              "skills": {}
+            }
+          ]
+        }
+      }
+    ],
+    "valid": [
+      {
+        "name": "basic_graph",
+        "doc": {
+          "v": 1,
+          "built_from_ts": 100,
+          "rev": 1,
+          "intents": [
+            {
+              "id": "i0",
+              "label": "intent zero",
+              "members": ["intent zero"],
+              "support": 1,
+              "tools": {},
+              "skills": {}
+            }
+          ]
+        }
+      }
+    ]
+  }
+}
